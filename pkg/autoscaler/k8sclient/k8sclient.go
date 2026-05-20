@@ -29,6 +29,7 @@ import (
 	"github.com/golang/glog"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
@@ -43,14 +44,17 @@ type K8sClient interface {
 	GetClusterSize() (*ClusterSize, error)
 	// UpdateResources updates the resource needs for the containers in the target
 	UpdateResources(resources map[string]apiv1.ResourceRequirements) error
+	// UpdatePodResources patches running pods with updated container resources
+	UpdatePodResources(resources map[string]apiv1.ResourceRequirements) error
 }
 
 // k8sClient - Wraps all Kubernetes API client functionality.
 type k8sClient struct {
-	target        *targetSpec
-	clientset     kubernetes.Interface
-	clusterStatus *ClusterSize
-	dryRun        bool
+	target           *targetSpec
+	clientset        kubernetes.Interface
+	clusterStatus    *ClusterSize
+	dryRun           bool
+	inPlaceAvailable *bool // nil = unknown; set once on first UpdatePodResources call
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
@@ -363,4 +367,130 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 	}
 
 	return nil
+}
+
+func (k *k8sClient) UpdatePodResources(resources map[string]apiv1.ResourceRequirements) error {
+	if k.dryRun {
+		glog.Infof("Performing dry-run for pod updates, no updates will take effect.")
+		return nil
+	}
+
+	// If we already determined the cluster does not support in-place resizing,
+	// skip silently.  The template patch already ensures new pods get the
+	// correct resources.
+	if k.inPlaceAvailable != nil && !*k.inPlaceAvailable {
+		glog.V(2).Infof("In-place resizing not available on this cluster, skipping")
+		return nil
+	}
+
+	selector, err := k.getTargetSelector()
+	if err != nil {
+		return fmt.Errorf("failed to get target selector: %v", err)
+	}
+
+	ctrs := []interface{}{}
+	for ctrName, res := range resources {
+		ctrs = append(ctrs, map[string]interface{}{
+			"name":      ctrName,
+			"resources": res,
+		})
+	}
+	patch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"containers": ctrs,
+		},
+	}
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("can't marshal pod patch to JSON: %v", err)
+	}
+
+	podList, err := k.clientset.CoreV1().Pods(k.target.Namespace).List(context.TODO(), metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list pods: %v", err)
+	}
+
+	var failedCount, attemptedCount int
+	probed := k.inPlaceAvailable != nil
+	for _, pod := range podList.Items {
+		// Skip pods that are terminating or already finished.
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		if pod.Status.Phase == apiv1.PodSucceeded || pod.Status.Phase == apiv1.PodFailed {
+			continue
+		}
+
+		attemptedCount++
+		_, err := k.clientset.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
+		if err != nil {
+			// On the first viable pod, probe whether the cluster supports
+			// in-place resizing at all (feature gate disabled).
+			if !probed && isImmutableFieldError(err) {
+				available := false
+				k.inPlaceAvailable = &available
+				glog.Warningf("In-place pod resizing is not supported by this cluster; disabling. New pods will still get updated resources via template patch.")
+				return nil
+			}
+			glog.Warningf("Failed to patch pod %s/%s for in-place resize: %v", pod.Namespace, pod.Name, err)
+			failedCount++
+			continue
+		}
+
+		if !probed {
+			available := true
+			k.inPlaceAvailable = &available
+			probed = true
+		}
+		glog.V(2).Infof("Patched pod %s/%s in-place", pod.Namespace, pod.Name)
+	}
+
+	if failedCount > 0 {
+		return fmt.Errorf("in-place resize failed for %d/%d pods", failedCount, attemptedCount)
+	}
+	return nil
+}
+
+// isImmutableFieldError detects whether a pod patch was rejected because the
+// cluster does not have the InPlacePodVerticalScaling feature gate enabled.
+func isImmutableFieldError(err error) bool {
+	if !apierrors.IsInvalid(err) {
+		return false
+	}
+	statusErr, ok := err.(*apierrors.StatusError)
+	if !ok || statusErr.ErrStatus.Details == nil {
+		return false
+	}
+	for _, cause := range statusErr.ErrStatus.Details.Causes {
+		if cause.Type == metav1.CauseTypeForbidden {
+			return true
+		}
+	}
+	return false
+}
+
+func (k *k8sClient) getTargetSelector() (string, error) {
+	switch strings.ToLower(k.target.Kind) {
+	case "deployment":
+		dep, err := k.clientset.AppsV1().Deployments(k.target.Namespace).Get(context.TODO(), k.target.Name, metav1.GetOptions{})
+		if err != nil {
+			return "", err
+		}
+		return metav1.FormatLabelSelector(dep.Spec.Selector), nil
+	case "daemonset":
+		ds, err := k.clientset.AppsV1().DaemonSets(k.target.Namespace).Get(context.TODO(), k.target.Name, metav1.GetOptions{})
+		if err != nil {
+			return "", err
+		}
+		return metav1.FormatLabelSelector(ds.Spec.Selector), nil
+	case "replicaset":
+		rs, err := k.clientset.AppsV1().ReplicaSets(k.target.Namespace).Get(context.TODO(), k.target.Name, metav1.GetOptions{})
+		if err != nil {
+			return "", err
+		}
+		return metav1.FormatLabelSelector(rs.Spec.Selector), nil
+	}
+	return "", fmt.Errorf("unknown target kind: %s", k.target.Kind)
 }

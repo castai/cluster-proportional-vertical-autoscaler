@@ -37,6 +37,7 @@ type AutoScalerConfig struct {
 	Kubeconfig        string
 	PrintVer          bool
 	DryRun            bool
+	InPlace           bool
 }
 
 // NewAutoScalerConfig returns a Autoscaler config
@@ -60,6 +61,7 @@ func (c *AutoScalerConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&c.Kubeconfig, "kubeconfig", c.Kubeconfig, "Path to a kubeconfig. Only required if running out-of-cluster.")
 	fs.BoolVar(&c.PrintVer, "version", c.PrintVer, "Print the version and exit.")
 	fs.BoolVar(&c.DryRun, "dry-run", c.PrintVer, "Calulate updates for a target but does not apply the update.")
+	fs.BoolVar(&c.InPlace, "in-place", c.InPlace, "Enable in-place pod resource resizing. When enabled, CPVPA will patch running pods directly in addition to the controller template.")
 }
 
 // InitFlags no// WordSepNormalizeFunc changes all flags that contain "_" separators

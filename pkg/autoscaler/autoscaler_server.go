@@ -47,6 +47,7 @@ type AutoScaler struct {
 	clock         clock.WithTicker
 	stopCh        chan struct{}
 	readyCh       chan<- struct{} // For testing.
+	inPlace       bool
 }
 
 // NewAutoScaler returns a new AutoScaler
@@ -69,6 +70,7 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 		clock:         clock.RealClock{},
 		stopCh:        make(chan struct{}),
 		readyCh:       make(chan struct{}, 1),
+		inPlace:       c.InPlace,
 	}, nil
 }
 
@@ -152,6 +154,12 @@ func (s *AutoScaler) pollAPIServer() {
 		glog.Errorf("Update failure: %s", err)
 	} else {
 		s.lastReqs = newReqs
+		if s.inPlace {
+			glog.V(0).Infof("Applying in-place resize to running pods")
+			if err := s.k8sClient.UpdatePodResources(newReqs); err != nil {
+				glog.Warningf("In-place pod resize had failures: %v", err)
+			}
+		}
 	}
 }
 
