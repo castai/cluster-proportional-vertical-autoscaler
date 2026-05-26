@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/spf13/pflag"
@@ -29,25 +30,30 @@ import (
 
 // AutoScalerConfig configures and runs an autoscaler server
 type AutoScalerConfig struct {
-	Namespace         string
-	Target            string
-	DefaultConfig     string
-	ConfigFile        string
-	PollPeriodSeconds int
-	Kubeconfig        string
-	PrintVer          bool
-	DryRun            bool
-	InPlace           bool
+	Namespace                     string
+	Target                        string
+	DefaultConfig                 string
+	ConfigFile                    string
+	PollPeriodSeconds             int
+	Kubeconfig                    string
+	PrintVer                      bool
+	DryRun                        bool
+	ResizeMode                    string
+	ResizeFallbackGracePeriod     time.Duration
+	ResizeFallbackMaxPodsPerCycle int
 }
 
 // NewAutoScalerConfig returns a Autoscaler config
 func NewAutoScalerConfig() *AutoScalerConfig {
 	return &AutoScalerConfig{
 		// Defaults.
-		Namespace:         os.Getenv("MY_NAMESPACE"),
-		PollPeriodSeconds: 10,
-		PrintVer:          false,
-		DryRun:            false,
+		Namespace:                     os.Getenv("MY_NAMESPACE"),
+		PollPeriodSeconds:             10,
+		PrintVer:                      false,
+		DryRun:                        false,
+		ResizeMode:                    "Recreate",
+		ResizeFallbackGracePeriod:     5 * time.Minute,
+		ResizeFallbackMaxPodsPerCycle: 1,
 	}
 }
 
@@ -61,7 +67,9 @@ func (c *AutoScalerConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&c.Kubeconfig, "kubeconfig", c.Kubeconfig, "Path to a kubeconfig. Only required if running out-of-cluster.")
 	fs.BoolVar(&c.PrintVer, "version", c.PrintVer, "Print the version and exit.")
 	fs.BoolVar(&c.DryRun, "dry-run", c.PrintVer, "Calulate updates for a target but does not apply the update.")
-	fs.BoolVar(&c.InPlace, "in-place", c.InPlace, "Enable in-place pod resource resizing. When enabled, CPVPA will patch running pods directly in addition to the controller template.")
+	fs.StringVar(&c.ResizeMode, "resize-mode", c.ResizeMode, "How to apply resource changes. One of: Recreate, InPlace, InPlaceOrRecreate. Recreate is the legacy behaviour. InPlace requires Kubernetes 1.33+.")
+	fs.DurationVar(&c.ResizeFallbackGracePeriod, "resize-fallback-grace-period", c.ResizeFallbackGracePeriod, "Only used with InPlaceOrRecreate. How long a pod must remain Infeasible before cpvpa will delete it so the controller can reschedule it.")
+	fs.IntVar(&c.ResizeFallbackMaxPodsPerCycle, "resize-fallback-max-pods-per-cycle", c.ResizeFallbackMaxPodsPerCycle, "Only used with InPlaceOrRecreate. Caps how many Infeasible pods cpvpa will delete in a single poll cycle.")
 }
 
 // InitFlags no// WordSepNormalizeFunc changes all flags that contain "_" separators
@@ -98,6 +106,12 @@ func (c *AutoScalerConfig) ValidateFlags() error {
 	if c.PollPeriodSeconds < 1 {
 		errorsFound = true
 		glog.Errorf("--poll-period-seconds cannot be less than 1")
+	}
+	switch c.ResizeMode {
+	case "Recreate", "InPlace", "InPlaceOrRecreate":
+	default:
+		errorsFound = true
+		glog.Errorf("--resize-mode must be one of: Recreate, InPlace, InPlaceOrRecreate (got %q)", c.ResizeMode)
 	}
 
 	// Log all sanity check errors before returning a single error string

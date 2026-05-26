@@ -47,12 +47,17 @@ type AutoScaler struct {
 	clock         clock.WithTicker
 	stopCh        chan struct{}
 	readyCh       chan<- struct{} // For testing.
-	inPlace       bool
+	resizeMode    k8sclient.ResizeMode
 }
 
 // NewAutoScaler returns a new AutoScaler
 func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
-	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun)
+	mode := k8sclient.ResizeMode(c.ResizeMode)
+	fallbackCfg := k8sclient.FallbackConfig{
+		GracePeriod:     c.ResizeFallbackGracePeriod,
+		MaxPodsPerCycle: c.ResizeFallbackMaxPodsPerCycle,
+	}
+	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun, mode, fallbackCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +75,7 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 		clock:         clock.RealClock{},
 		stopCh:        make(chan struct{}),
 		readyCh:       make(chan struct{}, 1),
-		inPlace:       c.InPlace,
+		resizeMode:    mode,
 	}, nil
 }
 
@@ -142,24 +147,22 @@ func (s *AutoScaler) pollAPIServer() {
 			glog.V(4).Infof("Calculated %s limits[%q] = %v", ctr, res, r)
 		}
 	}
-	if reflect.DeepEqual(s.lastReqs, newReqs) {
+	reqsChanged := !reflect.DeepEqual(s.lastReqs, newReqs)
+
+	if !reqsChanged && s.resizeMode == k8sclient.ResizeModeRecreate {
 		return
 	}
 
-	glog.V(0).Infof("Updating resource for nodes: %d, cores: %d",
-		clusterSize.Nodes, clusterSize.Cores)
-	logRequirements(newReqs)
-	// Update resource target with new resources.
+	if reqsChanged {
+		glog.V(0).Infof("Updating resource for nodes: %d, cores: %d",
+			clusterSize.Nodes, clusterSize.Cores)
+		logRequirements(newReqs)
+	}
+
 	if err = s.k8sClient.UpdateResources(newReqs); err != nil {
 		glog.Errorf("Update failure: %s", err)
 	} else {
 		s.lastReqs = newReqs
-		if s.inPlace {
-			glog.V(0).Infof("Applying in-place resize to running pods")
-			if err := s.k8sClient.UpdatePodResources(newReqs); err != nil {
-				glog.Warningf("In-place pod resize had failures: %v", err)
-			}
-		}
 	}
 }
 
@@ -269,22 +272,23 @@ type ContainerScaleConfig struct {
 // scaling and the by-nodes scaling, bounded by the max value.
 //
 // Example:
-//   Base = 10
-//   Max = 100
-//   Step = 2
-//   CoresPerStep = 4
-//   NodesPerStep = 2
 //
-//   The core and node counts are rounded up to the next whole step.
+//	Base = 10
+//	Max = 100
+//	Step = 2
+//	CoresPerStep = 4
+//	NodesPerStep = 2
 //
-//   If we find 64 cores and 4 nodes we get scalars of:
-//     by-cores: 10 + (2 * (round(64, 4)/4)) = 10 + 32 = 42
-//     by-nodes: 10 + (2 * (round(4, 2)/2)) = 10 + 4 = 14
-//   The larger is by-cores, and it is less than Max, so the final value is 42.
+//	The core and node counts are rounded up to the next whole step.
 //
-//   If we find 3 cores and 3 nodes we get scalars of:
-//     by-cores: 10 + (2 * (round(3, 4)/4)) = 10 + 2 = 12
-//     by-nodes: 10 + (2 * (round(3, 2)/2)) = 10 + 4 = 14
+//	If we find 64 cores and 4 nodes we get scalars of:
+//	  by-cores: 10 + (2 * (round(64, 4)/4)) = 10 + 32 = 42
+//	  by-nodes: 10 + (2 * (round(4, 2)/2)) = 10 + 4 = 14
+//	The larger is by-cores, and it is less than Max, so the final value is 42.
+//
+//	If we find 3 cores and 3 nodes we get scalars of:
+//	  by-cores: 10 + (2 * (round(3, 4)/4)) = 10 + 2 = 12
+//	  by-nodes: 10 + (2 * (round(3, 2)/2)) = 10 + 4 = 14
 type ResourceScaleConfig struct {
 	// The baseline quantity required.
 	Base *resource.Quantity

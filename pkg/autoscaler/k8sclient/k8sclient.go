@@ -23,14 +23,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/version"
 
 	"github.com/golang/glog"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
@@ -42,23 +43,25 @@ import (
 type K8sClient interface {
 	// GetClusterSize counts schedulable nodes and cores in the cluster
 	GetClusterSize() (*ClusterSize, error)
-	// UpdateResources updates the resource needs for the containers in the target
+	// UpdateResources updates the resource needs for the containers in the target.
+	// When resize mode is InPlace or InPlaceOrRecreate, it also patches running
+	// pods via the /resize subresource.
 	UpdateResources(resources map[string]apiv1.ResourceRequirements) error
-	// UpdatePodResources patches running pods with updated container resources
-	UpdatePodResources(resources map[string]apiv1.ResourceRequirements) error
 }
 
 // k8sClient - Wraps all Kubernetes API client functionality.
 type k8sClient struct {
-	target           *targetSpec
-	clientset        kubernetes.Interface
-	clusterStatus    *ClusterSize
-	dryRun           bool
-	inPlaceAvailable *bool // nil = unknown; set once on first UpdatePodResources call
+	target         *targetSpec
+	clientset      kubernetes.Interface
+	clusterStatus  *ClusterSize
+	dryRun         bool
+	resizeMode     ResizeMode
+	fallbackConfig FallbackConfig
+	tracker        *resizeTracker
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
-func NewK8sClient(namespace, target, kubeconfig string, dryRun bool) (K8sClient, error) {
+func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg FallbackConfig) (K8sClient, error) {
 	var config *rest.Config
 	var err error
 	if kubeconfig != "" {
@@ -82,10 +85,24 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool) (K8sClient,
 		return nil, err
 	}
 
+	if mode != ResizeModeRecreate {
+		if err := EnsureResizeSubresource(clientset); err != nil {
+			return nil, err
+		}
+	}
+
+	var tracker *resizeTracker
+	if mode != ResizeModeRecreate {
+		tracker = newResizeTracker()
+	}
+
 	return &k8sClient{
-		clientset: clientset,
-		target:    tgt,
-		dryRun:    dryRun,
+		clientset:      clientset,
+		target:         tgt,
+		dryRun:         dryRun,
+		resizeMode:     mode,
+		fallbackConfig: fallbackCfg,
+		tracker:        tracker,
 	}, nil
 }
 
@@ -366,109 +383,47 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 		return fmt.Errorf("patch failed: %v", err)
 	}
 
-	return nil
-}
-
-func (k *k8sClient) UpdatePodResources(resources map[string]apiv1.ResourceRequirements) error {
-	if k.dryRun {
-		glog.Infof("Performing dry-run for pod updates, no updates will take effect.")
+	if k.resizeMode == ResizeModeRecreate {
 		return nil
 	}
 
-	// If we already determined the cluster does not support in-place resizing,
-	// skip silently.  The template patch already ensures new pods get the
-	// correct resources.
-	if k.inPlaceAvailable != nil && !*k.inPlaceAvailable {
-		glog.V(2).Infof("In-place resizing not available on this cluster, skipping")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	selectorStr, err := k.getTargetSelector()
+	if err != nil {
+		glog.Errorf("in-place resize: failed to get selector: %v", err)
+		return nil
+	}
+	selector, err := labels.Parse(selectorStr)
+	if err != nil {
+		glog.Errorf("in-place resize: failed to parse selector %q: %v", selectorStr, err)
 		return nil
 	}
 
-	selector, err := k.getTargetSelector()
+	result, err := k.resizeRunningPods(ctx, k.target.Namespace, selector, resources, k.resizeMode, k.fallbackConfig, k.tracker)
 	if err != nil {
-		return fmt.Errorf("failed to get target selector: %v", err)
+		glog.Errorf("in-place resize failed (template already updated): %v", err)
 	}
-
-	ctrs := []interface{}{}
-	for ctrName, res := range resources {
-		ctrs = append(ctrs, map[string]interface{}{
-			"name":      ctrName,
-			"resources": res,
-		})
-	}
-	patch := map[string]interface{}{
-		"spec": map[string]interface{}{
-			"containers": ctrs,
-		},
-	}
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return fmt.Errorf("can't marshal pod patch to JSON: %v", err)
-	}
-
-	podList, err := k.clientset.CoreV1().Pods(k.target.Namespace).List(context.TODO(), metav1.ListOptions{
-		LabelSelector: selector,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to list pods: %v", err)
-	}
-
-	var failedCount, attemptedCount int
-	probed := k.inPlaceAvailable != nil
-	for _, pod := range podList.Items {
-		// Skip pods that are terminating or already finished.
-		if pod.DeletionTimestamp != nil {
-			continue
-		}
-		if pod.Status.Phase == apiv1.PodSucceeded || pod.Status.Phase == apiv1.PodFailed {
-			continue
-		}
-
-		attemptedCount++
-		_, err := k.clientset.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
-		if err != nil {
-			// On the first viable pod, probe whether the cluster supports
-			// in-place resizing at all (feature gate disabled).
-			if !probed && isImmutableFieldError(err) {
-				available := false
-				k.inPlaceAvailable = &available
-				glog.Warningf("In-place pod resizing is not supported by this cluster; disabling. New pods will still get updated resources via template patch.")
-				return nil
-			}
-			glog.Warningf("Failed to patch pod %s/%s for in-place resize: %v", pod.Namespace, pod.Name, err)
-			failedCount++
-			continue
-		}
-
-		if !probed {
-			available := true
-			k.inPlaceAvailable = &available
-			probed = true
-		}
-		glog.V(2).Infof("Patched pod %s/%s in-place", pod.Namespace, pod.Name)
-	}
-
-	if failedCount > 0 {
-		return fmt.Errorf("in-place resize failed for %d/%d pods", failedCount, attemptedCount)
-	}
+	glog.V(1).Infof("resize cycle: %+v", result)
 	return nil
 }
 
-// isImmutableFieldError detects whether a pod patch was rejected because the
-// cluster does not have the InPlacePodVerticalScaling feature gate enabled.
-func isImmutableFieldError(err error) bool {
-	if !apierrors.IsInvalid(err) {
-		return false
+// EnsureResizeSubresource checks that the cluster supports the pods/resize
+// subresource (Kubernetes 1.33+). Call at startup when resize mode is not
+// Recreate to fail fast with a clear message.
+func EnsureResizeSubresource(client kubernetes.Interface) error {
+	resources, err := client.Discovery().ServerResourcesForGroupVersion("v1")
+	if err != nil {
+		return fmt.Errorf("failed to discover v1 API resources: %w", err)
 	}
-	statusErr, ok := err.(*apierrors.StatusError)
-	if !ok || statusErr.ErrStatus.Details == nil {
-		return false
-	}
-	for _, cause := range statusErr.ErrStatus.Details.Causes {
-		if cause.Type == metav1.CauseTypeForbidden {
-			return true
+	for _, r := range resources.APIResources {
+		if r.Name == "pods/resize" {
+			return nil
 		}
 	}
-	return false
+	return fmt.Errorf("cluster does not support pods/resize subresource; " +
+		"in-place pod resize requires Kubernetes 1.33+ with InPlacePodVerticalScaling enabled")
 }
 
 func (k *k8sClient) getTargetSelector() (string, error) {
