@@ -136,10 +136,9 @@ func (k *k8sClient) resizeRunningPods(
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 
-		// Skip pods that are not actually running. New pods will come up
-		// with the new template, and pods that are terminating are about
-		// to disappear.
-		if pod.Status.Phase != v1.PodRunning || pod.DeletionTimestamp != nil {
+		// Skip terminal and terminating pods. Include Pending pods so
+		// they get the correct resources before the kubelet admits them.
+		if (pod.Status.Phase != v1.PodRunning && pod.Status.Phase != v1.PodPending) || pod.DeletionTimestamp != nil {
 			continue
 		}
 
@@ -149,8 +148,43 @@ func (k *k8sClient) resizeRunningPods(
 		// what we're racing to converge.
 		patchBody, needsPatch := buildResizePatch(pod, desired)
 		if !needsPatch {
-			result.AlreadyOK++
-			tracker.clear(pod.UID)
+			// Even with no patch needed, the pod may still be Infeasible
+			// from a previous cycle (spec already updated, kubelet rejected).
+			// Re-classify from the list data to avoid resetting the tracker.
+			switch classifyResize(pod) {
+			case resizeStatusInfeasible:
+				result.Infeasible++
+				firstSeen := tracker.markInfeasible(pod.UID, now)
+				age := now.Sub(firstSeen)
+				glog.V(2).Infof("pod=%s/%s resize Infeasible (age=%s)",
+					pod.Namespace, pod.Name, age)
+				if mode == ResizeModeInPlaceOrRecreate &&
+					age >= fallback.GracePeriod &&
+					evictedThisCycle < fallback.MaxPodsPerCycle {
+					if err := k.deleteForFallback(ctx, pod); err != nil {
+						glog.Errorf("fallback delete failed for pod=%s/%s: %v",
+							pod.Namespace, pod.Name, err)
+						result.Errors++
+					} else {
+						glog.Infof("fallback-deleted pod=%s/%s (Infeasible for %s)",
+							pod.Namespace, pod.Name, age)
+						result.Evicted++
+						evictedThisCycle++
+						tracker.clear(pod.UID)
+					}
+				}
+			case resizeStatusDeferred:
+				result.Deferred++
+				tracker.clear(pod.UID)
+				glog.V(2).Infof("pod=%s/%s resize Deferred (node pressure)",
+					pod.Namespace, pod.Name)
+			case resizeStatusInProgress:
+				result.InProgress++
+				tracker.clear(pod.UID)
+			default:
+				result.AlreadyOK++
+				tracker.clear(pod.UID)
+			}
 			continue
 		}
 
@@ -170,11 +204,16 @@ func (k *k8sClient) resizeRunningPods(
 			// Infeasible / Deferred from the API server come back as
 			// StatusUnprocessableEntity (422) in some kubelet versions;
 			// more commonly they are reported asynchronously via pod
-			// conditions, which we read below. So we don't fail hard here
-			// unless it's clearly a different kind of error.
+			// conditions, which we read below.
 			if apierrors.IsInvalid(patchErr) {
 				glog.V(2).Infof("resize rejected synchronously for pod=%s/%s: %v",
 					pod.Namespace, pod.Name, patchErr)
+			} else if apierrors.IsNotFound(patchErr) || apierrors.IsConflict(patchErr) {
+				// Pod was deleted or modified concurrently — transient,
+				// will be retried on the next poll.
+				glog.V(2).Infof("resize patch transient error for pod=%s/%s: %v",
+					pod.Namespace, pod.Name, patchErr)
+				continue
 			} else {
 				glog.Errorf("resize patch error for pod=%s/%s: %v",
 					pod.Namespace, pod.Name, patchErr)
@@ -245,6 +284,9 @@ func (k *k8sClient) resizeRunningPods(
 // this mode knowing pods may be deleted; MaxPodsPerCycle is their throttle.
 func (k *k8sClient) deleteForFallback(ctx context.Context, pod *v1.Pod) error {
 	grace := int64(30)
+	if pod.Spec.TerminationGracePeriodSeconds != nil {
+		grace = *pod.Spec.TerminationGracePeriodSeconds
+	}
 	return k.clientset.CoreV1().Pods(pod.Namespace).Delete(
 		ctx, pod.Name,
 		metav1.DeleteOptions{GracePeriodSeconds: &grace},
