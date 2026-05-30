@@ -118,43 +118,26 @@ func TestResizeRunningPods_AllAlreadyOK(t *testing.T) {
 	}
 }
 
-// TestResizeRunningPods_InProgress verifies that a pod whose patch is
-// accepted and whose conditions show InProgress is counted correctly.
+// TestResizeRunningPods_InProgress verifies that a pod already at desired
+// spec but showing InProgress is counted correctly via the no-patch path.
 func TestResizeRunningPods_InProgress(t *testing.T) {
-	oldRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")},
-	}
 	newRes := v1.ResourceRequirements{
 		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
 	}
 
-	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
-	updatedPod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizeInProgress,
 		Status: v1.ConditionTrue,
-	}}, oldRes)
+	}}, newRes)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		switch {
-		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+		if req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
-		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
-			// Accept patch — update spec in the returned pod.
-			p := pod
-			p.Spec.Containers = append([]v1.Container(nil), pod.Spec.Containers...)
-			p.Spec.Containers[0].Resources = newRes
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podResponse(&p))
-		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podResponse(&updatedPod))
-		default:
-			w.WriteHeader(http.StatusNotFound)
+			return
 		}
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
 
@@ -167,49 +150,33 @@ func TestResizeRunningPods_InProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Applied != 1 {
-		t.Errorf("Applied = %d, want 1", result.Applied)
+	if result.Applied != 0 {
+		t.Errorf("Applied = %d, want 0 (no patch needed)", result.Applied)
 	}
 	if result.InProgress != 1 {
 		t.Errorf("InProgress = %d, want 1", result.InProgress)
 	}
 }
 
-// TestResizeRunningPods_Deferred verifies Deferred counting.
+// TestResizeRunningPods_Deferred verifies Deferred counting via the no-patch path.
 func TestResizeRunningPods_Deferred(t *testing.T) {
-	oldRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")},
-	}
 	newRes := v1.ResourceRequirements{
 		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
 	}
 
-	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
-	updatedPod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
-		Reason: "Deferred",
-	}}, oldRes)
+		Reason: v1.PodReasonDeferred,
+	}}, newRes)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		switch {
-		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+		if req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
-		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
-			p := pod
-			p.Spec.Containers = append([]v1.Container(nil), pod.Spec.Containers...)
-			p.Spec.Containers[0].Resources = newRes
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podResponse(&p))
-		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podResponse(&updatedPod))
-		default:
-			w.WriteHeader(http.StatusNotFound)
+			return
 		}
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
 
@@ -222,8 +189,8 @@ func TestResizeRunningPods_Deferred(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Applied != 1 {
-		t.Errorf("Applied = %d, want 1", result.Applied)
+	if result.Applied != 0 {
+		t.Errorf("Applied = %d, want 0 (no patch needed)", result.Applied)
 	}
 	if result.Deferred != 1 {
 		t.Errorf("Deferred = %d, want 1", result.Deferred)
@@ -231,7 +198,10 @@ func TestResizeRunningPods_Deferred(t *testing.T) {
 }
 
 // TestResizeRunningPods_InfeasibleTracksGrace verifies that an Infeasible
-// pod is tracked and NOT deleted before the grace period expires.
+// pod is tracked and NOT deleted before the grace period expires. Because
+// classification is now async (no GET-after-PATCH), this test simulates
+// two poll cycles: the first patches, the second classifies via the no-patch
+// path once conditions have appeared.
 func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	oldRes := v1.ResourceRequirements{
 		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")},
@@ -241,10 +211,10 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	}
 
 	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
-	updatedPod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+	infeasiblePod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
-		Reason: "Infeasible",
-	}}, oldRes)
+		Reason: v1.PodReasonInfeasible,
+	}}, newRes)
 
 	deleted := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -254,19 +224,12 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
-			// Deep-copy the containers slice so the original `pod` is
-			// not mutated by the test server (Go struct copy shares
-			// the backing array).
 			p := pod
 			p.Spec.Containers = append([]v1.Container(nil), pod.Spec.Containers...)
 			p.Spec.Containers[0].Resources = newRes
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			w.Write(podResponse(&p))
-		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podResponse(&updatedPod))
 		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
 			deleted = true
 			w.WriteHeader(http.StatusOK)
@@ -281,18 +244,26 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	tracker := newResizeTracker()
 	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 
+	// First cycle: pod needs a patch. We only count Applied; classification
+	// happens on the next cycle once conditions appear.
 	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Infeasible != 1 {
-		t.Errorf("Infeasible = %d, want 1", result.Infeasible)
+	if result.Applied != 1 {
+		t.Errorf("Applied = %d, want 1", result.Applied)
 	}
 	if deleted {
 		t.Error("pod was deleted before grace period expired")
 	}
-	// Simulate a second poll after grace period has elapsed.
+
+	// Simulate the next poll: kubelet has now written the Infeasible
+	// condition. The pod spec already matches desired, so the no-patch
+	// path classifies it. Pre-seed tracker so grace has elapsed.
+	pod.Spec.Containers = append([]v1.Container(nil), pod.Spec.Containers...)
+	pod.Spec.Containers[0].Resources = newRes
+	pod.Status.Conditions = infeasiblePod.Status.Conditions
 	tracker.infeasibleSeen[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	deleted = false
@@ -300,6 +271,9 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Infeasible != 1 {
+		t.Errorf("Infeasible = %d, want 1", result.Infeasible)
 	}
 	if result.Evicted != 1 {
 		t.Errorf("Evicted = %d, want 1", result.Evicted)
@@ -536,8 +510,50 @@ func TestResizeRunningPods_NoPatchButInfeasible(t *testing.T) {
 }
 
 // TestResizeRunningPods_PendingPodIncluded verifies that Pending pods are
-// resized in-place so they start with the correct resources.
+// included for convergence. Here the pod already matches desired spec and
+// shows InProgress, so the no-patch path classifies it.
 func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
+	newRes := v1.ResourceRequirements{
+		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
+	}
+
+	pod := makePod("pod-a", v1.PodPending, []v1.PodCondition{{
+		Type:   v1.PodResizeInProgress,
+		Status: v1.ConditionTrue,
+	}}, newRes)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(podListResponse([]v1.Pod{pod}))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	k8scli := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+
+	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Applied != 0 {
+		t.Errorf("Applied = %d, want 0 (no patch needed)", result.Applied)
+	}
+	if result.InProgress != 1 {
+		t.Errorf("InProgress = %d, want 1", result.InProgress)
+	}
+}
+
+// TestResizeRunningPods_AsyncClassification verifies that conditions
+// written asynchronously by the kubelet are detected on the *next* poll
+// cycle via the no-patch path, not via a synchronous GET after PATCH.
+func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 	oldRes := v1.ResourceRequirements{
 		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")},
 	}
@@ -545,11 +561,7 @@ func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
 		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
 	}
 
-	pod := makePod("pod-a", v1.PodPending, nil, oldRes)
-	updatedPod := makePod("pod-a", v1.PodPending, []v1.PodCondition{{
-		Type:   v1.PodResizeInProgress,
-		Status: v1.ConditionTrue,
-	}}, oldRes)
+	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
@@ -564,10 +576,6 @@ func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			w.Write(podResponse(&p))
-		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podResponse(&updatedPod))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -578,6 +586,7 @@ func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
+	// First cycle: patch accepted, but no conditions yet → Applied=1.
 	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
 	if err != nil {
@@ -585,6 +594,27 @@ func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
 	}
 	if result.Applied != 1 {
 		t.Errorf("Applied = %d, want 1", result.Applied)
+	}
+	if result.InProgress != 0 {
+		t.Errorf("InProgress = %d, want 0 (conditions not visible yet)", result.InProgress)
+	}
+
+	// Second cycle: kubelet has written InProgress. Pod spec already matches
+	// desired, so the no-patch path classifies it.
+	pod.Spec.Containers = append([]v1.Container(nil), pod.Spec.Containers...)
+	pod.Spec.Containers[0].Resources = newRes
+	pod.Status.Conditions = []v1.PodCondition{{
+		Type:   v1.PodResizeInProgress,
+		Status: v1.ConditionTrue,
+	}}
+
+	result, err = k8scli.resizeRunningPods(context.Background(), "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Applied != 0 {
+		t.Errorf("Applied = %d, want 0 (no patch needed)", result.Applied)
 	}
 	if result.InProgress != 1 {
 		t.Errorf("InProgress = %d, want 1", result.InProgress)

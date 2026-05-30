@@ -88,6 +88,43 @@ func TestBuildResizePatch_OnlyManagedContainers(t *testing.T) {
 	}
 }
 
+// Verifies that a pod with extra resource dimensions (e.g. limits) that
+// are NOT in the desired config does NOT trigger a perpetual patch.
+// This is the fix for the churn bug: cpvpa should only compare keys it
+// actually manages and leave everything else alone.
+func TestBuildResizePatch_NoOpWhenPodHasExtraDimensions(t *testing.T) {
+	pod := &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{
+				Name: "main",
+				Resources: v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceCPU:    mustQty(t, "250m"),
+						v1.ResourceMemory: mustQty(t, "128Mi"),
+					},
+					Limits: v1.ResourceList{
+						v1.ResourceCPU:    mustQty(t, "500m"),
+						v1.ResourceMemory: mustQty(t, "256Mi"),
+					},
+				},
+			}},
+		},
+	}
+	// Config only sets requests — cpvpa does not manage limits.
+	desired := map[string]v1.ResourceRequirements{
+		"main": {
+			Requests: v1.ResourceList{
+				v1.ResourceCPU:    mustQty(t, "250m"),
+				v1.ResourceMemory: mustQty(t, "128Mi"),
+			},
+		},
+	}
+	body, need := buildResizePatch(pod, desired)
+	if need {
+		t.Fatalf("expected no patch needed when pod already satisfies managed keys, got body=%s", string(body))
+	}
+}
+
 // Pod condition matrix: makes sure we classify each kubelet-reported
 // state correctly. This is the part that decides whether cpvpa retries,
 // waits, or falls back to delete.
@@ -105,14 +142,14 @@ func TestClassifyResize(t *testing.T) {
 		{
 			name: "pending Deferred",
 			conditions: []v1.PodCondition{{
-				Type: v1.PodResizePending, Reason: "Deferred",
+				Type: v1.PodResizePending, Reason: v1.PodReasonDeferred,
 			}},
 			want: resizeStatusDeferred,
 		},
 		{
 			name: "pending Infeasible",
 			conditions: []v1.PodCondition{{
-				Type: v1.PodResizePending, Reason: "Infeasible",
+				Type: v1.PodResizePending, Reason: v1.PodReasonInfeasible,
 			}},
 			want: resizeStatusInfeasible,
 		},
@@ -127,6 +164,21 @@ func TestClassifyResize(t *testing.T) {
 			name: "in progress false (already done)",
 			conditions: []v1.PodCondition{{
 				Type: v1.PodResizeInProgress, Status: v1.ConditionFalse,
+			}},
+			want: resizeStatusOK,
+		},
+		{
+			name: "pending wins over in-progress regardless of slice order",
+			conditions: []v1.PodCondition{
+				{Type: v1.PodResizeInProgress, Status: v1.ConditionTrue},
+				{Type: v1.PodResizePending, Reason: v1.PodReasonDeferred},
+			},
+			want: resizeStatusDeferred,
+		},
+		{
+			name: "in-progress with Error reason is not InProgress",
+			conditions: []v1.PodCondition{{
+				Type: v1.PodResizeInProgress, Status: v1.ConditionTrue, Reason: v1.PodReasonError,
 			}},
 			want: resizeStatusOK,
 		},
@@ -176,6 +228,28 @@ func TestResizeTracker_DistinctUIDs(t *testing.T) {
 	got := tr.markInfeasible(types.UID("pod-v2"), t0.Add(time.Minute))
 	if !got.Equal(t0.Add(time.Minute)) {
 		t.Fatalf("new pod UID should get fresh timestamp")
+	}
+}
+
+// prune should remove UIDs that are no longer in the pod list (e.g.
+// pods deleted by node drain or scale-down), preventing unbounded growth.
+func TestResizeTracker_Prune(t *testing.T) {
+	tr := newResizeTracker()
+	t0 := time.Now()
+	tr.markInfeasible(types.UID("pod-a"), t0)
+	tr.markInfeasible(types.UID("pod-b"), t0)
+
+	// Only pod-a is still in the cluster.
+	seen := map[types.UID]struct{}{
+		types.UID("pod-a"): {},
+	}
+	tr.prune(seen)
+
+	if _, ok := tr.infeasibleSeen[types.UID("pod-a")]; !ok {
+		t.Fatal("pod-a should still be tracked")
+	}
+	if _, ok := tr.infeasibleSeen[types.UID("pod-b")]; ok {
+		t.Fatal("pod-b should have been pruned")
 	}
 }
 

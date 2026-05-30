@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/golang/glog"
@@ -77,8 +76,10 @@ type ResizeResult struct {
 // resizeTracker remembers the first time each pod was seen as Infeasible,
 // so we can apply the fallback grace period. It is keyed by pod UID to
 // survive pod-name reuse on DaemonSets.
+//
+// The tracker is only accessed from the single-threaded poll loop, so it
+// does not need synchronization.
 type resizeTracker struct {
-	mu             sync.Mutex
 	infeasibleSeen map[types.UID]time.Time
 }
 
@@ -87,8 +88,6 @@ func newResizeTracker() *resizeTracker {
 }
 
 func (t *resizeTracker) markInfeasible(uid types.UID, now time.Time) time.Time {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	if first, ok := t.infeasibleSeen[uid]; ok {
 		return first
 	}
@@ -97,9 +96,18 @@ func (t *resizeTracker) markInfeasible(uid types.UID, now time.Time) time.Time {
 }
 
 func (t *resizeTracker) clear(uid types.UID) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	delete(t.infeasibleSeen, uid)
+}
+
+// prune removes UIDs that are not present in the given set. Call this
+// at the end of each poll cycle with the UIDs actually seen, so entries
+// for pods that were deleted (scale-down, node drain) don't leak.
+func (t *resizeTracker) prune(seen map[types.UID]struct{}) {
+	for uid := range t.infeasibleSeen {
+		if _, ok := seen[uid]; !ok {
+			delete(t.infeasibleSeen, uid)
+		}
+	}
 }
 
 // resizeRunningPods enumerates pods owned by the target controller and
@@ -136,8 +144,9 @@ func (k *k8sClient) resizeRunningPods(
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 
-		// Skip terminal and terminating pods. Include Pending pods so
-		// they get the correct resources before the kubelet admits them.
+		// Skip terminal and terminating pods. Include Pending pods; they
+		// may be leftovers from an old template and still need their spec
+		// converged before the kubelet schedules them.
 		if (pod.Status.Phase != v1.PodRunning && pod.Status.Phase != v1.PodPending) || pod.DeletionTimestamp != nil {
 			continue
 		}
@@ -192,6 +201,11 @@ func (k *k8sClient) resizeRunningPods(
 		// is the right choice here: it keys on container name and won't
 		// clobber resizePolicy (JSON merge would replace the containers
 		// array wholesale).
+		if k.dryRun {
+			glog.V(2).Infof("dry-run: would patch /resize for pod=%s/%s: %s",
+				pod.Namespace, pod.Name, string(patchBody))
+			continue
+		}
 		_, patchErr := k.clientset.CoreV1().Pods(pod.Namespace).Patch(
 			ctx,
 			pod.Name,
@@ -222,58 +236,23 @@ func (k *k8sClient) resizeRunningPods(
 			}
 		} else {
 			result.Applied++
-		}
-
-		// Re-fetch the pod to read the resize conditions the kubelet
-		// produced. We do this in a tight loop because the conditions are
-		// what tell us Deferred vs Infeasible vs InProgress; the patch
-		// response itself doesn't carry that info.
-		updated, getErr := k.clientset.CoreV1().Pods(pod.Namespace).
-			Get(ctx, pod.Name, metav1.GetOptions{})
-		if getErr != nil {
-			glog.Warningf("failed to refetch pod=%s/%s after resize: %v",
-				pod.Namespace, pod.Name, getErr)
+			// We do NOT re-fetch the pod here. The kubelet writes
+			// PodResizePending / PodResizeInProgress asynchronously, so a
+			// same-cycle GET almost always returns no conditions → wrongly
+			// classified as OK. Real classification happens on the next
+			// poll via the no-patch path, which reads conditions from the
+			// List response. This halves API calls per changed pod.
 			continue
 		}
-
-		status := classifyResize(updated)
-		switch status {
-		case resizeStatusInProgress:
-			result.InProgress++
-			tracker.clear(updated.UID)
-		case resizeStatusDeferred:
-			result.Deferred++
-			tracker.clear(updated.UID) // not Infeasible — reset the timer
-			glog.V(2).Infof("pod=%s/%s resize Deferred (node pressure)",
-				updated.Namespace, updated.Name)
-		case resizeStatusInfeasible:
-			result.Infeasible++
-			firstSeen := tracker.markInfeasible(updated.UID, now)
-			age := now.Sub(firstSeen)
-			glog.V(2).Infof("pod=%s/%s resize Infeasible (age=%s)",
-				updated.Namespace, updated.Name, age)
-
-			if mode == ResizeModeInPlaceOrRecreate &&
-				age >= fallback.GracePeriod &&
-				evictedThisCycle < fallback.MaxPodsPerCycle {
-
-				if err := k.deleteForFallback(ctx, updated); err != nil {
-					glog.Errorf("fallback delete failed for pod=%s/%s: %v",
-						updated.Namespace, updated.Name, err)
-					result.Errors++
-				} else {
-					glog.Infof("fallback-deleted pod=%s/%s (Infeasible for %s)",
-						updated.Namespace, updated.Name, age)
-					result.Evicted++
-					evictedThisCycle++
-					tracker.clear(updated.UID)
-				}
-			}
-		case resizeStatusOK:
-			// kubelet has caught up — nothing more to do.
-			tracker.clear(updated.UID)
-		}
 	}
+
+	// Prune tracker entries for pods that were not seen this cycle
+	// (deleted by scale-down, node drain, etc.) to prevent unbounded growth.
+	seenUIDs := make(map[types.UID]struct{}, len(pods.Items))
+	for i := range pods.Items {
+		seenUIDs[pods.Items[i].UID] = struct{}{}
+	}
+	tracker.prune(seenUIDs)
 
 	return result, nil
 }
@@ -315,7 +294,7 @@ func buildResizePatch(pod *v1.Pod, desired map[string]v1.ResourceRequirements) (
 		if !managed {
 			continue
 		}
-		if resourcesEqual(c.Resources, want) {
+		if resourcesSatisfied(c.Resources, want) {
 			continue
 		}
 		changed = append(changed, containerPatch{Name: c.Name, Resources: want})
@@ -339,18 +318,15 @@ func buildResizePatch(pod *v1.Pod, desired map[string]v1.ResourceRequirements) (
 	return body, true
 }
 
-func resourcesEqual(a, b v1.ResourceRequirements) bool {
-	return resourceListEqual(a.Requests, b.Requests) &&
-		resourceListEqual(a.Limits, b.Limits)
+func resourcesSatisfied(a, b v1.ResourceRequirements) bool {
+	return resourceListSatisfied(a.Requests, b.Requests) &&
+		resourceListSatisfied(a.Limits, b.Limits)
 }
 
-func resourceListEqual(a, b v1.ResourceList) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, av := range a {
-		bv, ok := b[k]
-		if !ok || !quantityEqual(av, bv) {
+func resourceListSatisfied(have, want v1.ResourceList) bool {
+	for k, wv := range want {
+		hv, ok := have[k]
+		if !ok || hv.Cmp(wv) != 0 {
 			return false
 		}
 	}
@@ -385,19 +361,28 @@ const (
 // Absence of both means: either the kubelet has caught up, or it hasn't
 // observed the spec change yet. We treat absence as OK; if the kubelet
 // is just slow, the next poll will reclassify.
+//
+// Precedence: PodResizePending (Infeasible > Deferred) wins over
+// PodResizeInProgress. If PodResizeInProgress has Reason PodReasonError
+// we treat it as an error state rather than InProgress so the tracker
+// stays active and the pod may be fallback-deleted if infeasible.
 func classifyResize(pod *v1.Pod) resizeStatus {
+	var hasInProgress bool
 	for _, c := range pod.Status.Conditions {
 		switch c.Type {
 		case v1.PodResizePending:
-			if c.Reason == "Infeasible" {
+			if c.Reason == v1.PodReasonInfeasible {
 				return resizeStatusInfeasible
 			}
 			return resizeStatusDeferred
 		case v1.PodResizeInProgress:
-			if c.Status == v1.ConditionTrue {
-				return resizeStatusInProgress
+			if c.Status == v1.ConditionTrue && c.Reason != v1.PodReasonError {
+				hasInProgress = true
 			}
 		}
+	}
+	if hasInProgress {
+		return resizeStatusInProgress
 	}
 	return resizeStatusOK
 }

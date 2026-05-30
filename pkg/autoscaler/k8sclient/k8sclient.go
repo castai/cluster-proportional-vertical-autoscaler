@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -58,10 +59,14 @@ type k8sClient struct {
 	resizeMode     ResizeMode
 	fallbackConfig FallbackConfig
 	tracker        *resizeTracker
+	lastResources  map[string]apiv1.ResourceRequirements
+	cachedSelector labels.Selector
+	ctx            context.Context
+	pollPeriod     time.Duration
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
-func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg FallbackConfig) (K8sClient, error) {
+func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg FallbackConfig, pollPeriod time.Duration, stopCh <-chan struct{}) (K8sClient, error) {
 	var config *rest.Config
 	var err error
 	if kubeconfig != "" {
@@ -96,6 +101,16 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 		tracker = newResizeTracker()
 	}
 
+	ctx := context.Background()
+	if stopCh != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		go func() {
+			<-stopCh
+			cancel()
+		}()
+	}
+
 	return &k8sClient{
 		clientset:      clientset,
 		target:         tgt,
@@ -103,6 +118,8 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 		resizeMode:     mode,
 		fallbackConfig: fallbackCfg,
 		tracker:        tracker,
+		ctx:            ctx,
+		pollPeriod:     pollPeriod,
 	}, nil
 }
 
@@ -348,56 +365,69 @@ func (k *k8sClient) GetClusterSize() (clusterStatus *ClusterSize, err error) {
 }
 
 func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequirements) error {
-	ctrs := []interface{}{}
-	for ctrName, res := range resources {
-		ctrs = append(ctrs, map[string]interface{}{
-			"name":      ctrName,
-			"resources": res,
-		})
-	}
-	patch := map[string]interface{}{
-		"apiVersion": k.target.GroupVersion,
-		"kind":       k.target.Kind,
-		"metadata": map[string]interface{}{
-			"name": k.target.Name,
-		},
-		"spec": map[string]interface{}{
-			"template": map[string]interface{}{
-				"spec": map[string]interface{}{
-					"containers": ctrs,
+	// Skip the template patch when nothing changed. The pod convergence
+	// loop still runs because running pods may need to be caught up even
+	// when the template is already correct.
+	templateChanged := !reflect.DeepEqual(k.lastResources, resources)
+
+	if templateChanged {
+		ctrs := []interface{}{}
+		for ctrName, res := range resources {
+			ctrs = append(ctrs, map[string]interface{}{
+				"name":      ctrName,
+				"resources": res,
+			})
+		}
+		patch := map[string]interface{}{
+			"apiVersion": k.target.GroupVersion,
+			"kind":       k.target.Kind,
+			"metadata": map[string]interface{}{
+				"name": k.target.Name,
+			},
+			"spec": map[string]interface{}{
+				"template": map[string]interface{}{
+					"spec": map[string]interface{}{
+						"containers": ctrs,
+					},
 				},
 			},
-		},
-	}
+		}
 
-	jb, err := json.Marshal(patch)
-	if err != nil {
-		return fmt.Errorf("can't marshal patch to JSON: %v", err)
-	}
+		jb, err := json.Marshal(patch)
+		if err != nil {
+			return fmt.Errorf("can't marshal patch to JSON: %v", err)
+		}
 
-	if k.dryRun {
-		glog.Infof("Performing dry-run, no updates will take affect.")
-		return nil
-	}
-	if err := k.target.Patch(k.clientset, types.StrategicMergePatchType, jb); err != nil {
-		return fmt.Errorf("patch failed: %v", err)
+		if k.dryRun {
+			glog.V(1).Infof("dry-run: would patch template for %s/%s", k.target.Kind, k.target.Name)
+		} else {
+			if err := k.target.Patch(k.clientset, types.StrategicMergePatchType, jb); err != nil {
+				return fmt.Errorf("patch failed: %v", err)
+			}
+		}
+		k.lastResources = resources
 	}
 
 	if k.resizeMode == ResizeModeRecreate {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Derive the poll timeout from the configured poll period, with a
+	// fallback for test code that constructs k8sClient directly.
+	baseCtx := k.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	timeout := k.pollPeriod
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, timeout)
 	defer cancel()
 
-	selectorStr, err := k.getTargetSelector()
+	selector, err := k.cachedSelectorOrResolve()
 	if err != nil {
-		glog.Errorf("in-place resize: failed to get selector: %v", err)
-		return nil
-	}
-	selector, err := labels.Parse(selectorStr)
-	if err != nil {
-		glog.Errorf("in-place resize: failed to parse selector %q: %v", selectorStr, err)
+		glog.Errorf("in-place resize: failed to resolve selector: %v", err)
 		return nil
 	}
 
@@ -412,6 +442,11 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 // EnsureResizeSubresource checks that the cluster supports the pods/resize
 // subresource (Kubernetes 1.33+). Call at startup when resize mode is not
 // Recreate to fail fast with a clear message.
+//
+// Note: this checks discovery (the API server advertises the subresource),
+// but it cannot confirm the InPlacePodVerticalScaling feature gate is
+// enabled on every kubelet. As of Kubernetes 1.33 the gate is on by
+// default, so discovery presence is a sufficient signal.
 func EnsureResizeSubresource(client kubernetes.Interface) error {
 	resources, err := client.Discovery().ServerResourcesForGroupVersion("v1")
 	if err != nil {
@@ -448,4 +483,24 @@ func (k *k8sClient) getTargetSelector() (string, error) {
 		return metav1.FormatLabelSelector(rs.Spec.Selector), nil
 	}
 	return "", fmt.Errorf("unknown target kind: %s", k.target.Kind)
+}
+
+// cachedSelectorOrResolve returns the cached selector if available,
+// otherwise fetches it from the target workload, parses it, and caches
+// it for subsequent cycles. Selectors are immutable for Deployment,
+// DaemonSet, and ReplicaSet, so the cache never needs invalidation.
+func (k *k8sClient) cachedSelectorOrResolve() (labels.Selector, error) {
+	if k.cachedSelector != nil {
+		return k.cachedSelector, nil
+	}
+	selectorStr, err := k.getTargetSelector()
+	if err != nil {
+		return nil, err
+	}
+	selector, err := labels.Parse(selectorStr)
+	if err != nil {
+		return nil, err
+	}
+	k.cachedSelector = selector
+	return selector, nil
 }
