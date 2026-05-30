@@ -1,8 +1,6 @@
 module github.com/thockin/go-build-template/tools
 
-go 1.23.0
-
-toolchain go1.24.1
+go 1.26.3
 
 require (
 	github.com/estesp/manifest-tool/v2 v2.1.6
