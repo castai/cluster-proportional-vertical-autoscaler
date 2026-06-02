@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/glog"
@@ -71,6 +72,46 @@ type ResizeResult struct {
 	Infeasible int // kubelet says: never on this node
 	Evicted    int // pods deleted via the InPlaceOrRecreate fallback
 	Errors     int // any other unexpected error per pod
+}
+
+// Metrics holds cumulative atomic counters for the InPlace resize path.
+// Counters may overlap by design (a single pod can contribute to Applied
+// in one cycle and InProgress in the next).
+type Metrics struct {
+	Applied    atomic.Int64
+	Deferred   atomic.Int64
+	Infeasible atomic.Int64
+	Evicted    atomic.Int64
+	Errors     atomic.Int64
+}
+
+// Record atomically adds the values from a ResizeResult.
+func (m *Metrics) Record(r ResizeResult) {
+	m.Applied.Add(int64(r.Applied))
+	m.Deferred.Add(int64(r.Deferred))
+	m.Infeasible.Add(int64(r.Infeasible))
+	m.Evicted.Add(int64(r.Evicted))
+	m.Errors.Add(int64(r.Errors))
+}
+
+// Snapshot returns a copy of the current counter values.
+func (m *Metrics) Snapshot() MetricsSnapshot {
+	return MetricsSnapshot{
+		Applied:    m.Applied.Load(),
+		Deferred:   m.Deferred.Load(),
+		Infeasible: m.Infeasible.Load(),
+		Evicted:    m.Evicted.Load(),
+		Errors:     m.Errors.Load(),
+	}
+}
+
+// MetricsSnapshot is a read-only snapshot of Metrics counters.
+type MetricsSnapshot struct {
+	Applied    int64
+	Deferred   int64
+	Infeasible int64
+	Evicted    int64
+	Errors     int64
 }
 
 // resizeTracker remembers the first time each pod was seen as Infeasible,

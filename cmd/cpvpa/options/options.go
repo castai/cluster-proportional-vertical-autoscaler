@@ -114,6 +114,20 @@ func (c *AutoScalerConfig) ValidateFlags() error {
 		glog.Errorf("--resize-mode must be one of: Recreate, InPlace, InPlaceOrRecreate (got %q)", c.ResizeMode)
 	}
 
+	if c.ResizeFallbackGracePeriod <= 0 {
+		errorsFound = true
+		glog.Errorf("--resize-fallback-grace-period must be positive (got %v)", c.ResizeFallbackGracePeriod)
+	}
+	if c.ResizeFallbackMaxPodsPerCycle <= 0 {
+		errorsFound = true
+		glog.Errorf("--resize-fallback-max-pods-per-cycle must be > 0 (got %d)", c.ResizeFallbackMaxPodsPerCycle)
+	}
+	if c.ResizeMode != "InPlaceOrRecreate" {
+		if c.ResizeFallbackGracePeriod != 5*time.Minute || c.ResizeFallbackMaxPodsPerCycle != 1 {
+			glog.Warningf("--resize-fallback-grace-period and --resize-fallback-max-pods-per-cycle are ignored when --resize-mode=%q", c.ResizeMode)
+		}
+	}
+
 	// Log all sanity check errors before returning a single error string
 	if errorsFound {
 		return fmt.Errorf("failed to validate config parameters")

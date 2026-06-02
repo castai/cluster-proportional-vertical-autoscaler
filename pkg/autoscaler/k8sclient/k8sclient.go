@@ -63,6 +63,7 @@ type k8sClient struct {
 	cachedSelector labels.Selector
 	ctx            context.Context
 	pollPeriod     time.Duration
+	metrics        *Metrics
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
@@ -120,6 +121,7 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 		tracker:        tracker,
 		ctx:            ctx,
 		pollPeriod:     pollPeriod,
+		metrics:        &Metrics{},
 	}, nil
 }
 
@@ -435,7 +437,10 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 	if err != nil {
 		glog.Errorf("in-place resize failed (template already updated): %v", err)
 	}
-	glog.V(1).Infof("resize cycle: %+v", result)
+	k.metrics.Record(result)
+	m := k.metrics.Snapshot()
+	glog.V(1).Infof("resize cycle: %+v (cumulative: Applied=%d Deferred=%d Infeasible=%d Evicted=%d Errors=%d)",
+		result, m.Applied, m.Deferred, m.Infeasible, m.Evicted, m.Errors)
 	return nil
 }
 

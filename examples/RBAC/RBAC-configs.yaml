@@ -27,8 +27,8 @@ rules:
     resources: ["nodes"]
     verbs: ["list"]
   - apiGroups: ["apps", "extensions"]
-    resources: ["deployments"]
-    verbs: ["patch"]
+    resources: ["deployments", "daemonsets", "replicasets"]
+    verbs: ["get", "patch"]
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1

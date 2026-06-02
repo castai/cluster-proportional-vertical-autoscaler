@@ -255,3 +255,28 @@ func TestResizeTracker_Prune(t *testing.T) {
 
 // Suppress unused-import warnings in case the test file is read alone.
 var _ = metav1.ObjectMeta{}
+
+// TestMetrics verifies that Metrics records cumulative counts correctly
+// and that Snapshot returns stable values.
+func TestMetrics(t *testing.T) {
+	m := &Metrics{}
+	m.Record(ResizeResult{Applied: 2, Deferred: 1, Infeasible: 3, Evicted: 1, Errors: 1})
+	m.Record(ResizeResult{Applied: 1, Deferred: 2, Infeasible: 0, Evicted: 0, Errors: 0})
+
+	s := m.Snapshot()
+	if s.Applied != 3 {
+		t.Errorf("Applied = %d, want 3", s.Applied)
+	}
+	if s.Deferred != 3 {
+		t.Errorf("Deferred = %d, want 3", s.Deferred)
+	}
+	if s.Infeasible != 3 {
+		t.Errorf("Infeasible = %d, want 3", s.Infeasible)
+	}
+	if s.Evicted != 1 {
+		t.Errorf("Evicted = %d, want 1", s.Evicted)
+	}
+	if s.Errors != 1 {
+		t.Errorf("Errors = %d, want 1", s.Errors)
+	}
+}

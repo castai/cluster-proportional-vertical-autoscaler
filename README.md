@@ -177,3 +177,48 @@ spec:
         operator: "Exists"
       serviceAccountName: thing-autoscaler
 ```
+
+## In-place pod resize (Kubernetes 1.33+)
+
+By default, cpvpa only patches the workload template; new pods come up at the correct size, but existing pods are rolled only when the owning controller recreates them. In-place resize mode uses the `pods/resize` subresource (KEP-1287) to patch live pods without restart.
+
+### Requirements
+
+- Kubernetes 1.33+ with the `InPlacePodVerticalScaling` feature gate enabled (on by default in 1.33).
+- Each container that should resize in-place must declare a `resizePolicy` with `restartPolicy: NotRequired` for the resources you want to resize.
+
+### RBAC
+
+In-place modes need extra permissions beyond the base role. Apply `examples/RBAC/RBAC-inplace-configs.yaml` in addition to the base role:
+
+```bash
+kubectl apply -f examples/RBAC/RBAC-inplace-configs.yaml
+```
+
+This grants:
+- `pods`: `[list, get]` — to find and classify pods owned by the target
+- `pods/resize`: `[patch]` — the actual in-place resize subresource
+- `pods`: `[delete]` — fallback eviction in `InPlaceOrRecreate` mode
+
+### Resize modes
+
+- `--resize-mode=Recreate` (default): patch only the template; existing pods are rolled by the controller.
+- `--resize-mode=InPlace`: patch template + live pods via `/resize`. Pods that report `Deferred` or `Infeasible` are retried on the next poll.
+- `--resize-mode=InPlaceOrRecreate`: like `InPlace`, but pods that remain `Infeasible` for longer than `--resize-fallback-grace-period` are deleted so the controller can recreate them.
+
+Both `InPlace` and `InPlaceOrRecreate` need the in-place RBAC add-on.
+
+### Flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--resize-mode` | How to apply resource changes: `Recreate`, `InPlace`, or `InPlaceOrRecreate` | `Recreate` |
+| `--resize-fallback-grace-period` | Only for `InPlaceOrRecreate`. How long a pod must remain `Infeasible` before cpvpa deletes it. | `5m` |
+| `--resize-fallback-max-pods-per-cycle` | Only for `InPlaceOrRecreate`. Caps how many `Infeasible` pods cpvpa will delete in a single poll cycle. | `1` |
+
+### Example
+
+See `examples/cpvpa-inplace-example.yaml` for a complete example including:
+- a target Deployment with `resizePolicy` on its containers
+- a cpvpa Deployment running in `InPlaceOrRecreate` mode
+- the required RBAC bindings

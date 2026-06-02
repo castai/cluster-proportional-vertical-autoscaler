@@ -3,6 +3,10 @@
 # End-to-end example: a target Deployment whose containers declare a
 # resizePolicy, plus a cpvpa controller pointed at it in InPlaceOrRecreate
 # mode. Requires Kubernetes 1.33+ (InPlacePodVerticalScaling on by default).
+#
+# IMPORTANT: apply examples/RBAC/RBAC-inplace-configs.yaml first. The
+# InPlaceOrRecreate mode needs extra permissions (pods/resize, pods/delete)
+# beyond the base RBAC role.
 
 ---
 # Target workload. The interesting bit is resizePolicy on each container.
