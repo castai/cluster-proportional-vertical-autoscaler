@@ -1,0 +1,72 @@
+name: e2e
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  # In-place resize across supported versions. Pin node images by digest.
+  e2e:
+    runs-on: ubuntu-latest # cgroup v2, required by in-place resize
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Replace <digest> with the real sha256 for each release.
+          # Find the latest digests at https://github.com/kubernetes-sigs/kind/releases
+          - k8s: "1.33"
+            node_image: "kindest/node:v1.33.4@sha256:<digest>"
+          - k8s: "1.34"
+            node_image: "kindest/node:v1.34.0@sha256:<digest>"
+          - k8s: "1.35"
+            node_image: "kindest/node:v1.35.0@sha256:<digest>"
+    name: e2e (k8s ${{ matrix.k8s }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run e2e
+        env:
+          KIND_NODE_IMAGE: ${{ matrix.node_image }}
+          # PRs run the fast in-place specs on all versions; the slow
+          # fallback/recreate specs run on 1.35 only (see schedule job).
+          GINKGO_LABEL_FILTER: ${{ github.event_name == 'pull_request' && '!slow' || '' }}
+        run: make -f e2e/Makefile.e2e test-e2e
+
+  # Negative test: on a pre-1.33 cluster the controller must refuse to start
+  # in InPlace mode with a clear "requires 1.33+" error.
+  startup-guard:
+    runs-on: ubuntu-latest
+    name: startup guard (k8s 1.32)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Create 1.32 cluster + build image
+        env:
+          KIND_NODE_IMAGE: "kindest/node:v1.32.5@sha256:<digest>"
+        run: |
+          make -f e2e/Makefile.e2e kind-up kind-load
+      - name: Assert cpvpa exits with the version error
+        run: |
+          kubectl create ns guard
+          kubectl create sa cpvpa -n guard
+          kubectl run cpvpa --image=cpvpa:e2e --image-pull-policy=IfNotPresent \
+            --restart=Never -n guard --command -- \
+            /cpvpa --target=deployment/none --namespace=guard \
+            --default-config='{}' --resize-mode=InPlace --logtostderr=true
+          # Expect CrashLoopBackOff/Error, and the log to mention 1.33+.
+          for i in $(seq 1 30); do
+            phase=$(kubectl get pod cpvpa -n guard -o jsonpath='{.status.phase}' || true)
+            [ "$phase" = "Failed" ] && break
+            sleep 2
+          done
+          logs=$(kubectl logs cpvpa -n guard || true)
+          echo "$logs"
+          echo "$logs" | grep -q "requires Kubernetes 1.33+" \
+            || (echo "::error::cpvpa did not fail-fast with the expected version error"; exit 1)
+      - if: always()
+        run: make -f e2e/Makefile.e2e kind-down

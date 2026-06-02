@@ -1,0 +1,51 @@
+# e2e targets — include from the top-level Makefile, or run standalone with:
+#   make -f e2e/Makefile.e2e test-e2e
+#
+# Drives kind + the Ginkgo suite. KIND_NODE_IMAGE selects the k8s version;
+# pin by digest in CI.
+
+KIND            ?= kind
+KUBECTL         ?= kubectl
+GINKGO          ?= go run github.com/onsi/ginkgo/v2/ginkgo
+CLUSTER_NAME    ?= cpvpa-e2e
+CPVPA_IMAGE     ?= cpvpa:e2e
+KIND_CONFIG     ?= e2e/kind-config.yaml
+# Override per matrix entry, e.g.:
+#   kindest/node:v1.35.0@sha256:<digest>
+KIND_NODE_IMAGE ?= kindest/node:v1.35.0
+
+# Slow specs (fallback/recreate) are labeled; PR runs can skip them with
+# GINKGO_LABEL_FILTER='!slow'.
+GINKGO_LABEL_FILTER ?=
+
+.PHONY: docker-build-e2e kind-up kind-load kind-down test-e2e test-e2e-only
+
+docker-build-e2e:
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o e2e/cpvpa ./cmd/cpvpa
+	docker build -t $(CPVPA_IMAGE) -f e2e/Dockerfile.e2e .
+
+kind-up:
+	$(KIND) create cluster --name $(CLUSTER_NAME) \
+		--image $(KIND_NODE_IMAGE) --config $(KIND_CONFIG) --wait 120s
+	$(KUBECTL) wait --for=condition=Ready nodes --all --timeout=120s
+
+kind-load: docker-build-e2e
+	$(KIND) load docker-image $(CPVPA_IMAGE) --name $(CLUSTER_NAME)
+
+kind-down:
+	-$(KIND) delete cluster --name $(CLUSTER_NAME)
+
+# Full lifecycle: build, cluster up, load image, run, tear down.
+test-e2e: kind-up kind-load
+	$(KIND) export kubeconfig --name $(CLUSTER_NAME) --kubeconfig $(PWD)/e2e/.kubeconfig-$(CLUSTER_NAME)
+	CPVPA_IMAGE=$(CPVPA_IMAGE) \
+	KUBECONFIG=$(PWD)/e2e/.kubeconfig-$(CLUSTER_NAME) \
+	$(GINKGO) -v --label-filter='$(GINKGO_LABEL_FILTER)' ./e2e/... ; \
+	rc=$$? ; $(MAKE) -f e2e/Makefile.e2e kind-down ; exit $$rc
+
+# Reuse an already-running cluster (fast local iteration; no teardown).
+test-e2e-only:
+	$(KIND) export kubeconfig --name $(CLUSTER_NAME) --kubeconfig $(PWD)/e2e/.kubeconfig-$(CLUSTER_NAME)
+	CPVPA_IMAGE=$(CPVPA_IMAGE) \
+	KUBECONFIG=$(PWD)/e2e/.kubeconfig-$(CLUSTER_NAME) \
+	$(GINKGO) -v --label-filter='$(GINKGO_LABEL_FILTER)' ./e2e/...
