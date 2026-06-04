@@ -70,7 +70,15 @@ func newResizeTestClient(server *httptest.Server) *k8sClient {
 			GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"},
 		},
 	})
-	return &k8sClient{clientset: client}
+	return &k8sClient{
+		clientset: client,
+		// Safe seams so resizeRunningPods can run without a live target object.
+		// Tests that need the controller-driven (self-healing) recreate path
+		// override selfHealsFn; tests that want to observe the template patch
+		// override patchTemplateFn.
+		patchTemplateFn: func(map[string]v1.ResourceRequirements) error { return nil },
+		selfHealsFn:     func() bool { return false },
+	}
 }
 
 // TestResizeRunningPods_AllAlreadyOK verifies that when every pod already
@@ -264,7 +272,7 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	pod.Spec.Containers = append([]v1.Container(nil), pod.Spec.Containers...)
 	pod.Spec.Containers[0].Resources = newRes
 	pod.Status.Conditions = infeasiblePod.Status.Conditions
-	tracker.infeasibleSeen[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	deleted = false
 	result, err = k8scli.resizeRunningPods(context.Background(), "test", selector,
@@ -441,8 +449,8 @@ func TestResizeRunningPods_MaxPodsPerCycle(t *testing.T) {
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 	// Pre-seed tracker so both pods are past grace period.
-	tracker.infeasibleSeen[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
-	tracker.infeasibleSeen[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute)
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute)
 
 	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
@@ -490,7 +498,7 @@ func TestResizeRunningPods_NoPatchButInfeasible(t *testing.T) {
 	k8scli := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
-	tracker.infeasibleSeen[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
@@ -618,5 +626,275 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 	}
 	if result.InProgress != 1 {
 		t.Errorf("InProgress = %d, want 1", result.InProgress)
+	}
+}
+
+// TestResizeRunningPods_PartialFailure_OneOfMany verifies that when one pod in
+// a multi-pod workload cannot be resized within the grace period, it is
+// recreated via the fallback while the OTHER pods are resized in place and
+// left running. The stuck pod must not block or disturb the healthy ones, and
+// the template must be patched exactly once (before the recreate).
+func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
+	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")}}
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+
+	// pod-a and pod-c still need a resize and will accept it in place.
+	podA := makePod("pod-a", v1.PodRunning, nil, oldRes)
+	podC := makePod("pod-c", v1.PodRunning, nil, oldRes)
+	// pod-b is already at the desired spec but stuck Infeasible from a prior
+	// cycle — it is the "one of many" that fails to resize within the period.
+	podB := makePod("pod-b", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Reason: "Infeasible",
+	}}, newRes)
+
+	inProgress := func(name string) *v1.Pod {
+		p := makePod(name, v1.PodRunning, []v1.PodCondition{{
+			Type:   v1.PodResizeInProgress,
+			Status: v1.ConditionTrue,
+		}}, newRes)
+		return &p
+	}
+
+	var deleted []string
+	templatePatches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{podA, podB, podC}))
+		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
+			// The patched pod is returned and classified by the code.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if strings.Contains(req.URL.Path, "/pod-a/resize") {
+				w.Write(podResponse(inProgress("pod-a")))
+			} else if strings.Contains(req.URL.Path, "/pod-c/resize") {
+				w.Write(podResponse(inProgress("pod-c")))
+			} else {
+				w.Write(podResponse(&podA))
+			}
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podResponse(inProgress("pod-a")))
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-c":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podResponse(inProgress("pod-c")))
+		case req.Method == "DELETE" && strings.HasPrefix(req.URL.Path, "/api/v1/namespaces/test/pods/"):
+			deleted = append(deleted, req.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	k8scli := newResizeTestClient(server)
+	k8scli.patchTemplateFn = func(map[string]v1.ResourceRequirements) error {
+		templatePatches++
+		return nil
+	}
+	// selfHealsFn defaults to false (bare RS / OnDelete DS): manual-delete path.
+
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute) // past grace
+
+	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.TargetPods != 3 {
+		t.Errorf("TargetPods = %d, want 3", result.TargetPods)
+	}
+	if result.Applied != 2 {
+		t.Errorf("Applied = %d, want 2 (pod-a and pod-c resized in place)", result.Applied)
+	}
+	if result.InProgress != 2 {
+		t.Errorf("InProgress = %d, want 2", result.InProgress)
+	}
+	if result.Infeasible != 1 {
+		t.Errorf("Infeasible = %d, want 1 (pod-b)", result.Infeasible)
+	}
+	if result.Evicted != 1 {
+		t.Errorf("Evicted = %d, want 1 (only pod-b)", result.Evicted)
+	}
+	if len(deleted) != 1 || !strings.HasSuffix(deleted[0], "/pod-b") {
+		t.Errorf("deleted = %v, want exactly [pod-b]", deleted)
+	}
+	if templatePatches != 1 {
+		t.Errorf("templatePatches = %d, want 1 (patched once, before the recreate)", templatePatches)
+	}
+}
+
+// TestResizeRunningPods_FallbackSelfHealingNoDelete verifies that for a
+// self-healing target (Deployment / RollingUpdate DaemonSet) the fallback
+// patches the template and lets the controller recreate the pod, WITHOUT a
+// manual delete that would bypass maxUnavailable / PodDisruptionBudgets.
+func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+	podA := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Reason: "Infeasible",
+	}}, newRes)
+
+	deleted := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{podA}))
+		case req.Method == "DELETE":
+			deleted++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	k8scli := newResizeTestClient(server)
+	templatePatches := 0
+	k8scli.patchTemplateFn = func(map[string]v1.ResourceRequirements) error {
+		templatePatches++
+		return nil
+	}
+	k8scli.selfHealsFn = func() bool { return true } // Deployment / RollingUpdate DS
+
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+
+	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if templatePatches != 1 {
+		t.Errorf("templatePatches = %d, want 1", templatePatches)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (self-healing target must not be manually deleted)", deleted)
+	}
+	if result.RecreateTriggered != 1 {
+		t.Errorf("RecreateTriggered = %d, want 1 (recreate handed to the controller)", result.RecreateTriggered)
+	}
+	if result.Evicted != 0 {
+		t.Errorf("Evicted = %d, want 0 (no direct delete for a self-healing target)", result.Evicted)
+	}
+}
+
+// TestResizeRunningPods_PersistentDeferredRecreated verifies the unified
+// fallback rule: a pod stuck Deferred (not just Infeasible) past the grace
+// period is recreated. Deferred is the common "can't resize up right now"
+// outcome under node pressure, so an Infeasible-only fallback would rarely
+// fire when it is actually needed.
+func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+	// Spec already at desired (no-patch branch) but stuck Deferred.
+	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Reason: "Deferred",
+	}}, newRes)
+
+	deleteCount := 0
+	templatePatches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
+			deleteCount++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	k8scli := newResizeTestClient(server)
+	k8scli.patchTemplateFn = func(map[string]v1.ResourceRequirements) error {
+		templatePatches++
+		return nil
+	}
+	// selfHealsFn defaults to false: manual-delete path.
+
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute) // past grace
+
+	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Deferred != 1 {
+		t.Errorf("Deferred = %d, want 1", result.Deferred)
+	}
+	if result.Evicted != 1 {
+		t.Errorf("Evicted = %d, want 1 (persistent Deferred should be recreated)", result.Evicted)
+	}
+	if deleteCount != 1 {
+		t.Errorf("deleteCount = %d, want 1", deleteCount)
+	}
+	if templatePatches != 1 {
+		t.Errorf("templatePatches = %d, want 1", templatePatches)
+	}
+}
+
+// TestResizeRunningPods_TransientDeferredNotRecreated verifies the grace
+// period protects a transient Deferred: a pod that has only just gone
+// Deferred (well within grace) is left alone to let the kubelet resolve it in
+// place, and is NOT recreated.
+func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Reason: "Deferred",
+	}}, newRes)
+
+	deleteCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "DELETE":
+			deleteCount++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	k8scli := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker() // not pre-seeded: first time seen, age ~0
+
+	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Deferred != 1 {
+		t.Errorf("Deferred = %d, want 1", result.Deferred)
+	}
+	if result.Evicted != 0 {
+		t.Errorf("Evicted = %d, want 0 (transient Deferred must not be recreated)", result.Evicted)
+	}
+	if deleteCount != 0 {
+		t.Errorf("deleteCount = %d, want 0", deleteCount)
+	}
+	// And the pod is now tracked, so a later cycle past grace can act on it.
+	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; !ok {
+		t.Errorf("expected pod-a to be tracked as not resized")
 	}
 }

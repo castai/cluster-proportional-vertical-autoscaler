@@ -193,25 +193,26 @@ func TestClassifyResize(t *testing.T) {
 	}
 }
 
-// Tracker contract: first-seen timestamp is stable across repeat calls
-// (so the grace period actually means something), and clear() resets it
-// — important because a pod that goes Deferred → Infeasible → Deferred
-// should not trigger a fallback delete based on its old Infeasible time.
+// Tracker contract: the first-seen timestamp is stable across repeat calls
+// (so the grace period measures continuous time-not-resized, not the most recent
+// blip), and clear() resets it — clear() is called when a pod returns to OK,
+// so a pod that recovers and later fails again starts a fresh grace window
+// rather than being recreated on stale history.
 func TestResizeTracker_FirstSeenIsStable(t *testing.T) {
 	tr := newResizeTracker()
 	uid := types.UID("abc")
 	t0 := time.Now()
-	first := tr.markInfeasible(uid, t0)
+	first := tr.markNotResized(uid, t0)
 	if !first.Equal(t0) {
 		t.Fatalf("first call should return now, got %v", first)
 	}
 	t1 := t0.Add(2 * time.Minute)
-	second := tr.markInfeasible(uid, t1)
+	second := tr.markNotResized(uid, t1)
 	if !second.Equal(t0) {
 		t.Fatalf("second call should still return original timestamp, got %v", second)
 	}
 	tr.clear(uid)
-	third := tr.markInfeasible(uid, t1)
+	third := tr.markNotResized(uid, t1)
 	if !third.Equal(t1) {
 		t.Fatalf("after clear, should return new timestamp, got %v", third)
 	}
@@ -223,32 +224,32 @@ func TestResizeTracker_FirstSeenIsStable(t *testing.T) {
 func TestResizeTracker_DistinctUIDs(t *testing.T) {
 	tr := newResizeTracker()
 	t0 := time.Now()
-	tr.markInfeasible(types.UID("pod-v1"), t0)
+	tr.markNotResized(types.UID("pod-v1"), t0)
 	tr.clear(types.UID("pod-v1")) // fallback deleted it
-	got := tr.markInfeasible(types.UID("pod-v2"), t0.Add(time.Minute))
+	got := tr.markNotResized(types.UID("pod-v2"), t0.Add(time.Minute))
 	if !got.Equal(t0.Add(time.Minute)) {
 		t.Fatalf("new pod UID should get fresh timestamp")
 	}
 }
 
-// prune should remove UIDs that are no longer in the pod list (e.g.
+// retain drops tracker entries for UIDs not present in live (e.g.
 // pods deleted by node drain or scale-down), preventing unbounded growth.
-func TestResizeTracker_Prune(t *testing.T) {
+func TestResizeTracker_Retain(t *testing.T) {
 	tr := newResizeTracker()
 	t0 := time.Now()
-	tr.markInfeasible(types.UID("pod-a"), t0)
-	tr.markInfeasible(types.UID("pod-b"), t0)
+	tr.markNotResized(types.UID("pod-a"), t0)
+	tr.markNotResized(types.UID("pod-b"), t0)
 
 	// Only pod-a is still in the cluster.
-	seen := map[types.UID]struct{}{
-		types.UID("pod-a"): {},
+	live := map[types.UID]bool{
+		types.UID("pod-a"): true,
 	}
-	tr.prune(seen)
+	tr.retain(live)
 
-	if _, ok := tr.infeasibleSeen[types.UID("pod-a")]; !ok {
+	if _, ok := tr.notResizedSince[types.UID("pod-a")]; !ok {
 		t.Fatal("pod-a should still be tracked")
 	}
-	if _, ok := tr.infeasibleSeen[types.UID("pod-b")]; ok {
+	if _, ok := tr.notResizedSince[types.UID("pod-b")]; ok {
 		t.Fatal("pod-b should have been pruned")
 	}
 }

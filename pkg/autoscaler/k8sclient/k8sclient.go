@@ -22,13 +22,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"time"
 
 	"github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/version"
 
 	"github.com/golang/glog"
+	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,9 +45,11 @@ type K8sClient interface {
 	// GetClusterSize counts schedulable nodes and cores in the cluster
 	GetClusterSize() (*ClusterSize, error)
 	// UpdateResources updates the resource needs for the containers in the target.
-	// When resize mode is InPlace or InPlaceOrRecreate, it also patches running
-	// pods via the /resize subresource.
-	UpdateResources(resources map[string]apiv1.ResourceRequirements) error
+	// reqsChanged indicates the desired resources differ from what cpvpa last
+	// applied; it gates the (disruptive) template patch. When resize mode is
+	// InPlace or InPlaceOrRecreate, running pods are converged via the /resize
+	// subresource and the template is left untouched on the happy path.
+	UpdateResources(resources map[string]apiv1.ResourceRequirements, reqsChanged bool) error
 }
 
 // k8sClient - Wraps all Kubernetes API client functionality.
@@ -59,6 +61,12 @@ type k8sClient struct {
 	resizeMode     ResizeMode
 	fallbackConfig FallbackConfig
 	tracker        *resizeTracker
+
+	// Test seams. When nil, the real target-based behavior is used. They let
+	// resizeRunningPods be exercised without a live target object.
+	patchTemplateFn func(map[string]apiv1.ResourceRequirements) error
+	selfHealsFn     func() bool
+
 	lastResources  map[string]apiv1.ResourceRequirements
 	cachedSelector labels.Selector
 	ctx            context.Context
@@ -366,51 +374,27 @@ func (k *k8sClient) GetClusterSize() (clusterStatus *ClusterSize, err error) {
 	return clusterStatus, nil
 }
 
-func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequirements) error {
-	// Skip the template patch when nothing changed. The pod convergence
-	// loop still runs because running pods may need to be caught up even
-	// when the template is already correct.
-	templateChanged := !reflect.DeepEqual(k.lastResources, resources)
-
-	if templateChanged {
-		ctrs := []interface{}{}
-		for ctrName, res := range resources {
-			ctrs = append(ctrs, map[string]interface{}{
-				"name":      ctrName,
-				"resources": res,
-			})
+func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequirements, reqsChanged bool) error {
+	// Recreate mode: the template is the delivery mechanism. Patch only when
+	// the desired values actually changed and let the workload controller
+	// perform its normal rolling replacement. Nothing else to do.
+	if k.resizeMode == ResizeModeRecreate {
+		if !reqsChanged {
+			return nil
 		}
-		patch := map[string]interface{}{
-			"apiVersion": k.target.GroupVersion,
-			"kind":       k.target.Kind,
-			"metadata": map[string]interface{}{
-				"name": k.target.Name,
-			},
-			"spec": map[string]interface{}{
-				"template": map[string]interface{}{
-					"spec": map[string]interface{}{
-						"containers": ctrs,
-					},
-				},
-			},
-		}
-
-		jb, err := json.Marshal(patch)
-		if err != nil {
-			return fmt.Errorf("can't marshal patch to JSON: %v", err)
-		}
-
-		if k.dryRun {
-			glog.V(1).Infof("dry-run: would patch template for %s/%s", k.target.Kind, k.target.Name)
-		} else {
-			if err := k.target.Patch(k.clientset, types.StrategicMergePatchType, jb); err != nil {
-				return fmt.Errorf("patch failed: %v", err)
-			}
-		}
-		k.lastResources = resources
+		return k.patchTemplate(resources)
 	}
 
-	if k.resizeMode == ResizeModeRecreate {
+	// In-place modes: deliberately do NOT patch the template up front. On a
+	// Deployment or RollingUpdate DaemonSet that changes the pod-template-hash
+	// and triggers the controller's rolling recreate — destroying the very
+	// pods we want to resize live. Existing pods are converged via /resize;
+	// pods created later (scale-up, user rollout, reschedule) start at the
+	// stale template size and are resized on a subsequent cycle (accepted
+	// drift). The template is patched lazily inside the fallback path, and
+	// only when a pod must actually be recreated.
+	if k.dryRun {
+		glog.Infof("dry-run: would in-place resize pods of %s/%s", k.target.Kind, k.target.Name)
 		return nil
 	}
 
@@ -433,15 +417,90 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 		return nil
 	}
 
-	result, err := k.resizeRunningPods(ctx, k.target.Namespace, selector, resources, k.resizeMode, k.fallbackConfig, k.tracker)
+	result, err := k.resizeRunningPods(ctx, k.target.Namespace, selector, resources,
+		k.resizeMode, k.fallbackConfig, k.tracker)
 	if err != nil {
-		glog.Errorf("in-place resize failed (template already updated): %v", err)
+		glog.Errorf("in-place resize: %v", err)
 	}
-	k.metrics.Record(result)
-	m := k.metrics.Snapshot()
-	glog.V(1).Infof("resize cycle: %+v (cumulative: Applied=%d Deferred=%d Infeasible=%d Evicted=%d Errors=%d)",
-		result, m.Applied, m.Deferred, m.Infeasible, m.Evicted, m.Errors)
+	glog.V(1).Infof("resize cycle: %+v", result)
 	return nil
+}
+
+// patchTemplate updates spec.template.spec.containers[].resources on the
+// workload. On a Deployment or RollingUpdate DaemonSet this bumps the
+// pod-template-hash and triggers the controller's rolling recreate, so it is
+// only ever called on the Recreate path and the InPlaceOrRecreate fallback —
+// never on a successful in-place resize.
+func (k *k8sClient) patchTemplate(resources map[string]apiv1.ResourceRequirements) error {
+	ctrs := make([]interface{}, 0, len(resources))
+	for ctrName, res := range resources {
+		ctrs = append(ctrs, map[string]interface{}{
+			"name":      ctrName,
+			"resources": res,
+		})
+	}
+	patch := map[string]interface{}{
+		"apiVersion": k.target.GroupVersion,
+		"kind":       k.target.Kind,
+		"metadata": map[string]interface{}{
+			"name": k.target.Name,
+		},
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"spec": map[string]interface{}{
+					"containers": ctrs,
+				},
+			},
+		},
+	}
+
+	jb, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("can't marshal template patch to JSON: %v", err)
+	}
+	if k.dryRun {
+		glog.Infof("dry-run: would patch %s/%s template resources", k.target.Kind, k.target.Name)
+		return nil
+	}
+	if err := k.target.Patch(k.clientset, types.StrategicMergePatchType, jb); err != nil {
+		return fmt.Errorf("template patch failed: %v", err)
+	}
+	return nil
+}
+
+// patchTemplateForResize patches the template, honoring the test seam.
+func (k *k8sClient) patchTemplateForResize(resources map[string]apiv1.ResourceRequirements) error {
+	if k.patchTemplateFn != nil {
+		return k.patchTemplateFn(resources)
+	}
+	return k.patchTemplate(resources)
+}
+
+// targetSelfHeals reports whether the target controller recreates its pods on
+// its own in response to a template change. Deployments and RollingUpdate
+// DaemonSets do (the controller paces the replacement via maxUnavailable/PDB,
+// so cpvpa must NOT delete pods itself). Bare ReplicaSets/ReplicationControllers
+// and OnDelete DaemonSets do not, so cpvpa must delete the pod to force a
+// recreate. Honors the test seam.
+func (k *k8sClient) targetSelfHeals() bool {
+	if k.selfHealsFn != nil {
+		return k.selfHealsFn()
+	}
+	switch k.target.Kind {
+	case "Deployment":
+		return true
+	case "DaemonSet":
+		ds, err := k.clientset.AppsV1().DaemonSets(k.target.Namespace).
+			Get(context.TODO(), k.target.Name, metav1.GetOptions{})
+		if err != nil {
+			glog.Errorf("self-heal check: get daemonset %s/%s: %v; assuming rolling update",
+				k.target.Namespace, k.target.Name, err)
+			return true
+		}
+		return ds.Spec.UpdateStrategy.Type != appsv1.OnDeleteDaemonSetStrategyType
+	default: // ReplicaSet, ReplicationController (not owned by a higher controller)
+		return false
+	}
 }
 
 // EnsureResizeSubresource checks that the cluster supports the pods/resize

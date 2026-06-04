@@ -296,8 +296,9 @@ func TestUpdateResources(t *testing.T) {
 			t.Fatalf("error making target %q: %v", tc.target, err)
 		}
 		k8scli := &k8sClient{
-			clientset: client,
-			target:    target,
+			clientset:  client,
+			target:     target,
+			resizeMode: ResizeModeRecreate,
 		}
 
 		newReqs := map[string]apiv1.ResourceRequirements{}
@@ -308,7 +309,7 @@ func TestUpdateResources(t *testing.T) {
 		r := resource.NewQuantity(0, resource.BinarySI)
 		r.SetMilli(10)
 		newReqs["thing"].Requests[apiv1.ResourceName("cpu")] = *r
-		if err := k8scli.UpdateResources(newReqs); err != nil {
+		if err := k8scli.UpdateResources(newReqs, true); err != nil {
 			t.Errorf("failed to update resources for target %q: %v", tc.target, err)
 		}
 	}

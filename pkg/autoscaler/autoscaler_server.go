@@ -150,17 +150,16 @@ func (s *AutoScaler) pollAPIServer() {
 	}
 	reqsChanged := !reflect.DeepEqual(s.lastReqs, newReqs)
 
-	if !reqsChanged && s.resizeMode == k8sclient.ResizeModeRecreate {
-		return
-	}
-
 	if reqsChanged {
 		glog.V(0).Infof("Updating resource for nodes: %d, cores: %d",
 			clusterSize.Nodes, clusterSize.Cores)
 		logRequirements(newReqs)
 	}
 
-	if err = s.k8sClient.UpdateResources(newReqs); err != nil {
+	// UpdateResources is called every cycle for the in-place modes (so newly
+	// created pods converge and stuck resizes are retried); it internally
+	// no-ops when reqsChanged is false in Recreate mode.
+	if err = s.k8sClient.UpdateResources(newReqs, reqsChanged); err != nil {
 		glog.Errorf("Update failure: %s", err)
 	} else {
 		s.lastReqs = newReqs

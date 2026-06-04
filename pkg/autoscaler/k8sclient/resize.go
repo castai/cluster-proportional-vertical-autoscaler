@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -64,14 +65,15 @@ type FallbackConfig struct {
 
 // ResizeResult is a per-cycle summary, useful for logging and metrics.
 type ResizeResult struct {
-	TargetPods int // pods owned by the target that we considered
-	AlreadyOK  int // pods already at the desired resources
-	Applied    int // /resize patches accepted by the API server
-	InProgress int // kubelet has accepted and is applying
-	Deferred   int // kubelet says: not now, maybe later (node pressure)
-	Infeasible int // kubelet says: never on this node
-	Evicted    int // pods deleted via the InPlaceOrRecreate fallback
-	Errors     int // any other unexpected error per pod
+	TargetPods        int // pods owned by the target that we considered
+	AlreadyOK         int // pods already at the desired resources
+	Applied           int // /resize patches accepted by the API server
+	InProgress        int // kubelet has accepted and is applying
+	Deferred          int // kubelet says: not now, maybe later (node pressure)
+	Infeasible        int // kubelet says: never on this node
+	Evicted           int // pods cpvpa deleted directly (bare RS / OnDelete DS fallback)
+	RecreateTriggered int // pods handed to the controller's rollout via a template patch
+	Errors            int // any other unexpected error per pod
 }
 
 // Metrics holds cumulative atomic counters for the InPlace resize path.
@@ -114,39 +116,47 @@ type MetricsSnapshot struct {
 	Errors     int64
 }
 
-// resizeTracker remembers the first time each pod was seen as Infeasible,
-// so we can apply the fallback grace period. It is keyed by pod UID to
-// survive pod-name reuse on DaemonSets.
-//
-// The tracker is only accessed from the single-threaded poll loop, so it
-// does not need synchronization.
+// resizeTracker remembers the first time each pod was continuously seen in a
+// not-yet-completed resize state (Infeasible, Deferred, or InProgress), so we can apply
+// the fallback grace period to any pod that fails to resize in time. It is
+// keyed by pod UID to survive pod-name reuse on DaemonSets.
 type resizeTracker struct {
-	infeasibleSeen map[types.UID]time.Time
+	mu              sync.Mutex
+	notResizedSince map[types.UID]time.Time
 }
 
 func newResizeTracker() *resizeTracker {
-	return &resizeTracker{infeasibleSeen: make(map[types.UID]time.Time)}
+	return &resizeTracker{notResizedSince: make(map[types.UID]time.Time)}
 }
 
-func (t *resizeTracker) markInfeasible(uid types.UID, now time.Time) time.Time {
-	if first, ok := t.infeasibleSeen[uid]; ok {
+// markNotResized records (once) when a pod first entered a not-yet-completed resize state and
+// returns that timestamp. Repeat calls keep the original time so the grace
+// period measures continuous, not most-recent, time-not-resized.
+func (t *resizeTracker) markNotResized(uid types.UID, now time.Time) time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if first, ok := t.notResizedSince[uid]; ok {
 		return first
 	}
-	t.infeasibleSeen[uid] = now
+	t.notResizedSince[uid] = now
 	return now
 }
 
 func (t *resizeTracker) clear(uid types.UID) {
-	delete(t.infeasibleSeen, uid)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.notResizedSince, uid)
 }
 
-// prune removes UIDs that are not present in the given set. Call this
-// at the end of each poll cycle with the UIDs actually seen, so entries
-// for pods that were deleted (scale-down, node drain) don't leak.
-func (t *resizeTracker) prune(seen map[types.UID]struct{}) {
-	for uid := range t.infeasibleSeen {
-		if _, ok := seen[uid]; !ok {
-			delete(t.infeasibleSeen, uid)
+// retain drops tracker entries for UIDs not present in live, so pods that
+// disappear while not resized (scaled down, drained, deleted elsewhere) don't
+// leak entries across the lifetime of the process.
+func (t *resizeTracker) retain(live map[types.UID]bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for uid := range t.notResizedSince {
+		if !live[uid] {
+			delete(t.notResizedSince, uid)
 		}
 	}
 }
@@ -182,12 +192,46 @@ func (k *k8sClient) resizeRunningPods(
 	evictedThisCycle := 0
 	now := time.Now()
 
+	// Whether the target recreates pods by itself when its template changes.
+	// Computed once per cycle and only when the fallback could fire.
+	selfHeals := false
+	if mode == ResizeModeInPlaceOrRecreate {
+		selfHeals = k.targetSelfHeals()
+	}
+
+	// The template is patched at most once per cycle, lazily, and only when a
+	// pod must actually be recreated (the InPlaceOrRecreate fallback). This is
+	// what keeps a successful in-place resize from triggering a rollout, while
+	// still ensuring a recreated pod comes back at the new size (no flapping).
+	templatePatched := false
+	ensureTemplate := func() error {
+		if templatePatched {
+			return nil
+		}
+		if err := k.patchTemplateForResize(desired); err != nil {
+			return err
+		}
+		templatePatched = true
+		return nil
+	}
+
+	// UIDs seen this cycle, used to prune stale tracker entries at the end.
+	live := make(map[types.UID]bool, len(pods.Items))
+
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		live[pod.UID] = true
 
-		// Skip terminal and terminating pods. Include Pending pods; they
-		// may be leftovers from an old template and still need their spec
-		// converged before the kubelet schedules them.
+		// A slow pod must not starve the rest. If the per-cycle deadline is
+		// hit, stop cleanly; remaining pods (and any partial failure) are
+		// reconsidered on the next poll — every step here is idempotent.
+		if err := ctx.Err(); err != nil {
+			glog.Warningf("resize cycle truncated after %d/%d pods: %v", i, len(pods.Items), err)
+			break
+		}
+
+		// Skip terminal and terminating pods. Include Pending pods so
+		// they get the correct resources before the kubelet admits them.
 		if (pod.Status.Phase != v1.PodRunning && pod.Status.Phase != v1.PodPending) || pod.DeletionTimestamp != nil {
 			continue
 		}
@@ -198,42 +242,16 @@ func (k *k8sClient) resizeRunningPods(
 		// what we're racing to converge.
 		patchBody, needsPatch := buildResizePatch(pod, desired)
 		if !needsPatch {
-			// Even with no patch needed, the pod may still be Infeasible
-			// from a previous cycle (spec already updated, kubelet rejected).
-			// Re-classify from the list data to avoid resetting the tracker.
-			switch classifyResize(pod) {
-			case resizeStatusInfeasible:
-				result.Infeasible++
-				firstSeen := tracker.markInfeasible(pod.UID, now)
-				age := now.Sub(firstSeen)
-				glog.V(2).Infof("pod=%s/%s resize Infeasible (age=%s)",
-					pod.Namespace, pod.Name, age)
-				if mode == ResizeModeInPlaceOrRecreate &&
-					age >= fallback.GracePeriod &&
-					evictedThisCycle < fallback.MaxPodsPerCycle {
-					if err := k.deleteForFallback(ctx, pod); err != nil {
-						glog.Errorf("fallback delete failed for pod=%s/%s: %v",
-							pod.Namespace, pod.Name, err)
-						result.Errors++
-					} else {
-						glog.Infof("fallback-deleted pod=%s/%s (Infeasible for %s)",
-							pod.Namespace, pod.Name, age)
-						result.Evicted++
-						evictedThisCycle++
-						tracker.clear(pod.UID)
-					}
-				}
-			case resizeStatusDeferred:
-				result.Deferred++
-				tracker.clear(pod.UID)
-				glog.V(2).Infof("pod=%s/%s resize Deferred (node pressure)",
-					pod.Namespace, pod.Name)
-			case resizeStatusInProgress:
-				result.InProgress++
-				tracker.clear(pod.UID)
-			default:
+			// Spec already matches desired, but the kubelet may still report a
+			// not-yet-completed resize state from a previous cycle (Deferred under node
+			// pressure, Infeasible, or stuck InProgress). Classify from the
+			// list data so we don't reset the grace timer.
+			if status := classifyResize(pod); status == resizeStatusOK {
 				result.AlreadyOK++
 				tracker.clear(pod.UID)
+			} else {
+				k.accountNotResized(ctx, pod, status, now, mode, fallback, selfHeals,
+					ensureTemplate, &evictedThisCycle, &result, tracker)
 			}
 			continue
 		}
@@ -247,7 +265,7 @@ func (k *k8sClient) resizeRunningPods(
 				pod.Namespace, pod.Name, string(patchBody))
 			continue
 		}
-		_, patchErr := k.clientset.CoreV1().Pods(pod.Namespace).Patch(
+		updated, patchErr := k.clientset.CoreV1().Pods(pod.Namespace).Patch(
 			ctx,
 			pod.Name,
 			types.StrategicMergePatchType,
@@ -277,25 +295,120 @@ func (k *k8sClient) resizeRunningPods(
 			}
 		} else {
 			result.Applied++
-			// We do NOT re-fetch the pod here. The kubelet writes
-			// PodResizePending / PodResizeInProgress asynchronously, so a
-			// same-cycle GET almost always returns no conditions → wrongly
-			// classified as OK. Real classification happens on the next
-			// poll via the no-patch path, which reads conditions from the
-			// List response. This halves API calls per changed pod.
-			continue
+		}
+
+		// Classify the post-patch state. If still not OK, hand off to
+		// accountNotResized for tracking and potential fallback.
+		if status := classifyResize(updated); status == resizeStatusOK {
+			// kubelet has caught up — nothing more to do.
+			tracker.clear(updated.UID)
+		} else {
+			k.accountNotResized(ctx, updated, status, now, mode, fallback, selfHeals,
+				ensureTemplate, &evictedThisCycle, &result, tracker)
 		}
 	}
 
-	// Prune tracker entries for pods that were not seen this cycle
-	// (deleted by scale-down, node drain, etc.) to prevent unbounded growth.
-	seenUIDs := make(map[types.UID]struct{}, len(pods.Items))
-	for i := range pods.Items {
-		seenUIDs[pods.Items[i].UID] = struct{}{}
-	}
-	tracker.prune(seenUIDs)
+	// Drop tracker entries for pods that no longer exist.
+	tracker.retain(live)
 
 	return result, nil
+}
+
+// accountNotResized records a not-yet-completed resize state for one pod (Infeasible,
+// Deferred, or stuck InProgress): it bumps the matching state counter,
+// advances the not-resized timer, and triggers the recreate fallback once the pod
+// has been continuously not resized for the grace period. cpvpa treats every not-yet-completed
+// state the same way — recreate after grace — for simplicity and a strong
+// convergence guarantee; the Deferred and Infeasible counters are kept
+// distinct only for observability (Deferred ~= cluster under pressure,
+// Infeasible ~= request larger than any node). OK states are handled by the
+// caller (a no-patch pod is AlreadyOK; a freshly patched pod was Applied).
+func (k *k8sClient) accountNotResized(
+	ctx context.Context,
+	pod *v1.Pod,
+	status resizeStatus,
+	now time.Time,
+	mode ResizeMode,
+	fallback FallbackConfig,
+	selfHeals bool,
+	ensureTemplate func() error,
+	evictedThisCycle *int,
+	result *ResizeResult,
+	tracker *resizeTracker,
+) {
+	switch status {
+	case resizeStatusInProgress:
+		result.InProgress++
+	case resizeStatusDeferred:
+		result.Deferred++
+	case resizeStatusInfeasible:
+		result.Infeasible++
+	}
+	firstSeen := tracker.markNotResized(pod.UID, now)
+	age := now.Sub(firstSeen)
+	glog.V(2).Infof("pod=%s/%s resize %s (not resized for %s)", pod.Namespace, pod.Name, status, age)
+	k.maybeFallbackEvict(ctx, pod, age, mode, fallback, selfHeals,
+		ensureTemplate, evictedThisCycle, result, tracker)
+}
+
+// maybeFallbackEvict handles one not-resized pod under InPlaceOrRecreate: once it
+// has been not resized (Infeasible, Deferred, or stuck InProgress) continuously for
+// at least the grace period, it makes the pod get recreated at the new size.
+// The template is patched first (so the replacement is correctly sized rather
+// than flapping). For self-healing targets (Deployment, RollingUpdate
+// DaemonSet) the template patch alone triggers a controlled rollout, so we do
+// NOT delete the pod ourselves — that would bypass maxUnavailable/PDB. For
+// other targets we delete the pod so its controller recreates it, throttled by
+// MaxPodsPerCycle.
+//
+// It operates per pod, so one pod failing to resize never blocks the others:
+// the healthy pods in the same cycle are resized in place independently, and
+// only the stuck pod(s) — up to the per-cycle cap — are recreated.
+func (k *k8sClient) maybeFallbackEvict(
+	ctx context.Context,
+	pod *v1.Pod,
+	age time.Duration,
+	mode ResizeMode,
+	fallback FallbackConfig,
+	selfHeals bool,
+	ensureTemplate func() error,
+	evictedThisCycle *int,
+	result *ResizeResult,
+	tracker *resizeTracker,
+) {
+	if mode != ResizeModeInPlaceOrRecreate || age < fallback.GracePeriod {
+		return
+	}
+	// Manual deletes are throttled per cycle; controller-driven rollouts pace
+	// themselves, so the cap does not apply to self-healing targets.
+	if !selfHeals && *evictedThisCycle >= fallback.MaxPodsPerCycle {
+		return
+	}
+	// The replacement is created from the workload template, so it must carry
+	// the new size before we trigger the recreate.
+	if err := ensureTemplate(); err != nil {
+		glog.Errorf("fallback: template patch failed, not recreating pod=%s/%s this cycle: %v",
+			pod.Namespace, pod.Name, err)
+		result.Errors++
+		return
+	}
+	if selfHeals {
+		// The template change triggers the controller's rolling recreate.
+		glog.Infof("fallback: template updated; controller will recreate pod=%s/%s (not resized for %s)",
+			pod.Namespace, pod.Name, age)
+		result.RecreateTriggered++
+		tracker.clear(pod.UID)
+		return
+	}
+	if err := k.deleteForFallback(ctx, pod); err != nil {
+		glog.Errorf("fallback delete failed for pod=%s/%s: %v", pod.Namespace, pod.Name, err)
+		result.Errors++
+		return
+	}
+	glog.Infof("fallback-deleted pod=%s/%s (not resized for %s)", pod.Namespace, pod.Name, age)
+	result.Evicted++
+	*evictedThisCycle++
+	tracker.clear(pod.UID)
 }
 
 // deleteForFallback uses a plain Delete with a short grace period. We
