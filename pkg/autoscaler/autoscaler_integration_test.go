@@ -66,7 +66,7 @@ func TestPollAPIServer_RecreateMode(t *testing.T) {
 	as.pollAPIServer()
 
 	if !deployPatched {
-		t.Fatal("deployment was not patched")
+		t.Fatal("deployment template was patched unexpectedly in InPlace mode")
 	}
 	var patch map[string]interface{}
 	if err := json.Unmarshal(patchBody, &patch); err != nil {
@@ -93,7 +93,7 @@ func TestPollAPIServer_RecreateMode(t *testing.T) {
 }
 
 // TestPollAPIServer_InPlaceMode verifies that in InPlace mode the
-// controller patches the deployment template *and* resizes running pods.
+// controller resizes running pods via the /resize subresource, leaving the deployment template untouched.
 func TestPollAPIServer_InPlaceMode(t *testing.T) {
 	deployPatched := false
 	resizePatched := false
@@ -131,11 +131,11 @@ func TestPollAPIServer_InPlaceMode(t *testing.T) {
 
 	as.pollAPIServer()
 
-	if !deployPatched {
-		t.Fatal("deployment was not patched")
-	}
 	if !resizePatched {
 		t.Fatal("running pod was not resized")
+	}
+	if deployPatched {
+		t.Fatal("deployment template was patched unexpectedly in InPlace mode")
 	}
 }
 
