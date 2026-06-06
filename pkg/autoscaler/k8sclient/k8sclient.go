@@ -71,7 +71,6 @@ type k8sClient struct {
 	cachedSelector labels.Selector
 	ctx            context.Context
 	pollPeriod     time.Duration
-	metrics        *Metrics
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
@@ -129,7 +128,6 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 		tracker:        tracker,
 		ctx:            ctx,
 		pollPeriod:     pollPeriod,
-		metrics:        &Metrics{},
 	}, nil
 }
 
