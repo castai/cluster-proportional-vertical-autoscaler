@@ -68,8 +68,8 @@ func (c *AutoScalerConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&c.PrintVer, "version", c.PrintVer, "Print the version and exit.")
 	fs.BoolVar(&c.DryRun, "dry-run", c.PrintVer, "Calulate updates for a target but does not apply the update.")
 	fs.StringVar(&c.ResizeMode, "resize-mode", c.ResizeMode, "How to apply resource changes. One of: Recreate, InPlace, InPlaceOrRecreate. Recreate is the legacy behaviour. InPlace requires Kubernetes 1.33+.")
-	fs.DurationVar(&c.ResizeFallbackGracePeriod, "resize-fallback-grace-period", c.ResizeFallbackGracePeriod, "Only used with InPlaceOrRecreate. How long a pod must remain Infeasible before cpvpa will delete it so the controller can reschedule it.")
-	fs.IntVar(&c.ResizeFallbackMaxPodsPerCycle, "resize-fallback-max-pods-per-cycle", c.ResizeFallbackMaxPodsPerCycle, "Only used with InPlaceOrRecreate. Caps how many Infeasible pods cpvpa will delete in a single poll cycle.")
+	fs.DurationVar(&c.ResizeFallbackGracePeriod, "resize-fallback-grace-period", c.ResizeFallbackGracePeriod, "Only used with InPlaceOrRecreate. How long a pod must continuously fail to resize (Infeasible, Deferred, or stuck in progress) before cpvpa recreates it so the controller can reschedule it at the new size.")
+	fs.IntVar(&c.ResizeFallbackMaxPodsPerCycle, "resize-fallback-max-pods-per-cycle", c.ResizeFallbackMaxPodsPerCycle, "Only used with InPlaceOrRecreate. Caps how many not-yet-resized pods cpvpa recreates (by direct delete) in a single poll cycle.")
 }
 
 // InitFlags no// WordSepNormalizeFunc changes all flags that contain "_" separators
