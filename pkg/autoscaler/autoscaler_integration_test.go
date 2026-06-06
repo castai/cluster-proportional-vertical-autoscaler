@@ -66,7 +66,7 @@ func TestPollAPIServer_RecreateMode(t *testing.T) {
 	as.pollAPIServer()
 
 	if !deployPatched {
-		t.Fatal("deployment template was patched unexpectedly in InPlace mode")
+		t.Fatal("deployment template was NOT patched in Recreate mode")
 	}
 	var patch map[string]interface{}
 	if err := json.Unmarshal(patchBody, &patch); err != nil {

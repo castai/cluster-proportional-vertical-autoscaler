@@ -446,13 +446,6 @@ func resourceListSatisfied(have, want v1.ResourceList) bool {
 	return true
 }
 
-// quantityEqual compares two Quantities by value, not by string form —
-// "1000m" and "1" should be treated as equal so we don't churn on
-// every poll.
-func quantityEqual(a, b resource.Quantity) bool {
-	return a.Cmp(b) == 0
-}
-
 // --- status classification --------------------------------------------------
 
 type resizeStatus int

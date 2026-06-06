@@ -67,7 +67,6 @@ type k8sClient struct {
 	patchTemplateFn func(map[string]apiv1.ResourceRequirements) error
 	selfHealsFn     func() bool
 
-	lastResources  map[string]apiv1.ResourceRequirements
 	cachedSelector labels.Selector
 	ctx            context.Context
 	pollPeriod     time.Duration
@@ -484,12 +483,12 @@ func (k *k8sClient) targetSelfHeals() bool {
 	if k.selfHealsFn != nil {
 		return k.selfHealsFn()
 	}
-	switch k.target.Kind {
-	case "Deployment":
+	switch strings.ToLower(k.target.Kind) {
+	case "deployment":
 		return true
-	case "DaemonSet":
+	case "daemonset":
 		ds, err := k.clientset.AppsV1().DaemonSets(k.target.Namespace).
-			Get(context.TODO(), k.target.Name, metav1.GetOptions{})
+			Get(k.ctx, k.target.Name, metav1.GetOptions{})
 		if err != nil {
 			glog.Errorf("self-heal check: get daemonset %s/%s: %v; assuming rolling update",
 				k.target.Namespace, k.target.Name, err)
@@ -526,19 +525,19 @@ func EnsureResizeSubresource(client kubernetes.Interface) error {
 func (k *k8sClient) getTargetSelector() (string, error) {
 	switch strings.ToLower(k.target.Kind) {
 	case "deployment":
-		dep, err := k.clientset.AppsV1().Deployments(k.target.Namespace).Get(context.TODO(), k.target.Name, metav1.GetOptions{})
+		dep, err := k.clientset.AppsV1().Deployments(k.target.Namespace).Get(k.ctx, k.target.Name, metav1.GetOptions{})
 		if err != nil {
 			return "", err
 		}
 		return metav1.FormatLabelSelector(dep.Spec.Selector), nil
 	case "daemonset":
-		ds, err := k.clientset.AppsV1().DaemonSets(k.target.Namespace).Get(context.TODO(), k.target.Name, metav1.GetOptions{})
+		ds, err := k.clientset.AppsV1().DaemonSets(k.target.Namespace).Get(k.ctx, k.target.Name, metav1.GetOptions{})
 		if err != nil {
 			return "", err
 		}
 		return metav1.FormatLabelSelector(ds.Spec.Selector), nil
 	case "replicaset":
-		rs, err := k.clientset.AppsV1().ReplicaSets(k.target.Namespace).Get(context.TODO(), k.target.Name, metav1.GetOptions{})
+		rs, err := k.clientset.AppsV1().ReplicaSets(k.target.Namespace).Get(k.ctx, k.target.Name, metav1.GetOptions{})
 		if err != nil {
 			return "", err
 		}

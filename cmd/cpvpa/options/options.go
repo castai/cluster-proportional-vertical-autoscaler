@@ -28,6 +28,11 @@ import (
 	"github.com/spf13/pflag"
 )
 
+const (
+	defaultResizeFallbackGracePeriod     = 5 * time.Minute
+	defaultResizeFallbackMaxPodsPerCycle = 1
+)
+
 // AutoScalerConfig configures and runs an autoscaler server
 type AutoScalerConfig struct {
 	Namespace                     string
@@ -52,8 +57,8 @@ func NewAutoScalerConfig() *AutoScalerConfig {
 		PrintVer:                      false,
 		DryRun:                        false,
 		ResizeMode:                    "Recreate",
-		ResizeFallbackGracePeriod:     5 * time.Minute,
-		ResizeFallbackMaxPodsPerCycle: 1,
+		ResizeFallbackGracePeriod:     defaultResizeFallbackGracePeriod,
+		ResizeFallbackMaxPodsPerCycle: defaultResizeFallbackMaxPodsPerCycle,
 	}
 }
 
@@ -75,7 +80,7 @@ func (c *AutoScalerConfig) AddFlags(fs *pflag.FlagSet) {
 // InitFlags no// WordSepNormalizeFunc changes all flags that contain "_" separators
 func WordSepNormalizeFunc(f *pflag.FlagSet, name string) pflag.NormalizedName {
 	if strings.Contains(name, "_") {
-		return pflag.NormalizedName(strings.Replace(name, "_", "-", -1))
+		return pflag.NormalizedName(strings.ReplaceAll(name, "_", "-"))
 	}
 	return pflag.NormalizedName(name)
 }
@@ -123,7 +128,7 @@ func (c *AutoScalerConfig) ValidateFlags() error {
 		glog.Errorf("--resize-fallback-max-pods-per-cycle must be > 0 (got %d)", c.ResizeFallbackMaxPodsPerCycle)
 	}
 	if c.ResizeMode != "InPlaceOrRecreate" {
-		if c.ResizeFallbackGracePeriod != 5*time.Minute || c.ResizeFallbackMaxPodsPerCycle != 1 {
+		if c.ResizeFallbackGracePeriod != defaultResizeFallbackGracePeriod || c.ResizeFallbackMaxPodsPerCycle != defaultResizeFallbackMaxPodsPerCycle {
 			glog.Warningf("--resize-fallback-grace-period and --resize-fallback-max-pods-per-cycle are ignored when --resize-mode=%q", c.ResizeMode)
 		}
 	}
