@@ -204,7 +204,7 @@ This grants:
 
 - `--resize-mode=Recreate` (default): patch only the template; existing pods are rolled by the controller.
 - `--resize-mode=InPlace`: patch template + live pods via `/resize`. Pods that report `Deferred` or `Infeasible` are retried on the next poll.
-- `--resize-mode=InPlaceOrRecreate`: like `InPlace`, but pods that remain `Infeasible` for longer than `--resize-fallback-grace-period` are deleted so the controller can recreate them.
+- `--resize-mode=InPlaceOrRecreate`: like `InPlace`, but pods that fail to resize (kubelet reports `Infeasible` or `Deferred`, or the resize stays in progress) for longer than `--resize-fallback-grace-period` are recreated at the new size. How they're recreated depends on the target: for Deployments and `RollingUpdate` DaemonSets cpvpa patches the template and lets the controller perform its normal rolling update — which recreates **all** of the workload's pods, paced by `maxUnavailable`/PodDisruptionBudgets, not just the stuck ones; for bare ReplicaSets and `OnDelete` DaemonSets cpvpa deletes the stuck pods directly so the controller recreates them.
 
 Both `InPlace` and `InPlaceOrRecreate` need the in-place RBAC add-on.
 
@@ -213,8 +213,8 @@ Both `InPlace` and `InPlaceOrRecreate` need the in-place RBAC add-on.
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--resize-mode` | How to apply resource changes: `Recreate`, `InPlace`, or `InPlaceOrRecreate` | `Recreate` |
-| `--resize-fallback-grace-period` | Only for `InPlaceOrRecreate`. How long a pod must remain `Infeasible` before cpvpa deletes it. | `5m` |
-| `--resize-fallback-max-pods-per-cycle` | Only for `InPlaceOrRecreate`. Caps how many `Infeasible` pods cpvpa will delete in a single poll cycle. | `1` |
+| `--resize-fallback-grace-period` | Only for `InPlaceOrRecreate`. How long a pod must fail to resize (Infeasible, Deferred, or stuck in progress) before cpvpa recreates it. | `5m` |
+| `--resize-fallback-max-pods-per-cycle` | Only for `InPlaceOrRecreate`. Caps how many stuck pods cpvpa deletes directly per cycle (bare ReplicaSet / OnDelete DaemonSet only; self-healing controllers pace their own rollout). | `1` |
 
 ### Example
 
