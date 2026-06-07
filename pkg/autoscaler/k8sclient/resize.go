@@ -171,6 +171,10 @@ func (k *k8sClient) resizeRunningPods(
 			return err
 		}
 		templatePatched = true
+		if selfHeals {
+			glog.Warningf("InPlaceOrRecreate fallback: patched %s/%s template; the controller will perform a workload-wide rolling update",
+				k.target.Kind, k.target.Name)
+		}
 		return nil
 	}
 
