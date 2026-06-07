@@ -410,8 +410,7 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 
 	selector, err := k.cachedSelectorOrResolve()
 	if err != nil {
-		glog.Errorf("in-place resize: failed to resolve selector: %v", err)
-		return nil
+		return fmt.Errorf("resolve selector: %w", err)
 	}
 
 	result, err := k.resizeRunningPods(ctx, k.target.Namespace, selector, resources,
