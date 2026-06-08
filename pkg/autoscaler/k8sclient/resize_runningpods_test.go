@@ -899,3 +899,49 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 		t.Errorf("expected pod-a to be tracked as not resized")
 	}
 }
+
+// TestResizeRunningPods_InvalidPatchNoPanic is a regression test: a synchronous
+// Invalid (HTTP 422) rejection from the /resize patch must not panic the loop
+// (it previously fell through to classifyResize(nil)) and must not stop the
+// remaining pods from being processed.
+func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
+	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")}}
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+
+	podA := makePod("pod-a", v1.PodRunning, nil, oldRes) // /resize rejected with 422
+	podB := makePod("pod-b", v1.PodRunning, nil, oldRes) // /resize succeeds
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{podA, podB}))
+		case req.Method == "PATCH" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/resize":
+			w.WriteHeader(http.StatusUnprocessableEntity) // 422 -> apierrors.IsInvalid
+		case req.Method == "PATCH" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-b/resize":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(podResponse(&podB))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	k8scli := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+
+	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// pod-a's 422 is skipped (not counted as an error); pod-b still resized.
+	if result.Applied != 1 {
+		t.Errorf("Applied = %d, want 1 (pod-b processed after pod-a was rejected)", result.Applied)
+	}
+	if result.Errors != 0 {
+		t.Errorf("Errors = %d, want 0 (synchronous Invalid is not an error count)", result.Errors)
+	}
+}

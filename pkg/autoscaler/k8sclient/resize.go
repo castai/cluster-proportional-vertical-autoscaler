@@ -236,14 +236,7 @@ func (k *k8sClient) resizeRunningPods(
 			"resize",
 		)
 		if patchErr != nil {
-			// Infeasible / Deferred from the API server come back as
-			// StatusUnprocessableEntity (422) in some kubelet versions;
-			// more commonly they are reported asynchronously via pod
-			// conditions, which we read below.
-			if apierrors.IsInvalid(patchErr) {
-				glog.V(2).Infof("resize rejected synchronously for pod=%s/%s: %v",
-					pod.Namespace, pod.Name, patchErr)
-			} else if apierrors.IsNotFound(patchErr) || apierrors.IsConflict(patchErr) {
+			if apierrors.IsNotFound(patchErr) || apierrors.IsConflict(patchErr) {
 				// Pod was deleted or modified concurrently — transient,
 				// will be retried on the next poll.
 				glog.V(2).Infof("resize patch transient error for pod=%s/%s: %v",
