@@ -29,7 +29,7 @@ import (
 
 	"github.com/golang/glog"
 	appsv1 "k8s.io/api/apps/v1"
-	apiv1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -43,32 +43,25 @@ import (
 // K8sClient - Wraps all needed client functionalities for autoscaler
 type K8sClient interface {
 	// GetClusterSize counts schedulable nodes and cores in the cluster
-	GetClusterSize() (*ClusterSize, error)
+	GetClusterSize(ctx context.Context) (*ClusterSize, error)
 	// UpdateResources updates the resource needs for the containers in the target.
 	// reqsChanged indicates the desired resources differ from what cpvpa last
 	// applied; it gates the (disruptive) template patch. When resize mode is
 	// InPlace or InPlaceOrRecreate, running pods are converged via the /resize
 	// subresource and the template is left untouched on the happy path.
-	UpdateResources(resources map[string]apiv1.ResourceRequirements, reqsChanged bool) error
+	UpdateResources(ctx context.Context, resources map[string]v1.ResourceRequirements, reqsChanged bool) error
 }
 
 // k8sClient - Wraps all Kubernetes API client functionality.
 type k8sClient struct {
 	target         *targetSpec
 	clientset      kubernetes.Interface
-	clusterStatus  *ClusterSize
 	dryRun         bool
 	resizeMode     ResizeMode
 	fallbackConfig FallbackConfig
 	tracker        *resizeTracker
 
-	// Test seams. When nil, the real target-based behavior is used. They let
-	// resizeRunningPods be exercised without a live target object.
-	patchTemplateFn func(map[string]apiv1.ResourceRequirements) error
-	selfHealsFn     func() bool
-
 	cachedSelector labels.Selector
-	ctx            context.Context
 	pollPeriod     time.Duration
 }
 
@@ -108,25 +101,25 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 		tracker = newResizeTracker()
 	}
 
-	ctx := context.Background()
-	if stopCh != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithCancel(ctx)
-		go func() {
-			<-stopCh
-			cancel()
-		}()
-	}
+	return newK8sClient(clientset, tgt, dryRun, mode, fallbackCfg, tracker)
+}
 
+// newK8sClient builds a k8sClient from its core dependencies.
+func newK8sClient(
+	clientset kubernetes.Interface,
+	target *targetSpec,
+	dryRun bool,
+	mode ResizeMode,
+	fallbackCfg FallbackConfig,
+	tracker *resizeTracker,
+) (*k8sClient, error) {
 	return &k8sClient{
 		clientset:      clientset,
-		target:         tgt,
+		target:         target,
 		dryRun:         dryRun,
 		resizeMode:     mode,
 		fallbackConfig: fallbackCfg,
 		tracker:        tracker,
-		ctx:            ctx,
-		pollPeriod:     pollPeriod,
 	}, nil
 }
 
@@ -214,7 +207,7 @@ type targetSpec struct {
 
 // Captures the namespace and name to patch, and calls the best
 // resource-specific patch method.
-type patchFunc func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error
+type patchFunc func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error
 
 func newTargetSpec(kind string, groupVersions map[string]bool, namespace, name string) (*targetSpec, error) {
 	groupVer, patcher, err := findPatcher(kind, groupVersions)
@@ -231,8 +224,8 @@ func newTargetSpec(kind string, groupVersions map[string]bool, namespace, name s
 	}, nil
 }
 
-func (tgt *targetSpec) Patch(client kubernetes.Interface, pt types.PatchType, data []byte) error {
-	return tgt.patcher(client, tgt.Namespace, tgt.Name, pt, data)
+func (tgt *targetSpec) Patch(ctx context.Context, client kubernetes.Interface, pt types.PatchType, data []byte) error {
+	return tgt.patcher(ctx, client, tgt.Namespace, tgt.Name, pt, data)
 }
 
 // findPatcher returns a groupVersion string and a patch function for the
@@ -258,29 +251,29 @@ func findPatcher(kind string, groupVersions map[string]bool) (string, patchFunc,
 func findDeploymentPatcher(groupVersions map[string]bool) (string, patchFunc, error) {
 	// Find the best API to use - newest API first.
 	if groupVersions["apps/v1"] {
-		fn := func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1().Deployments(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{})
+		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
+			_, err := client.AppsV1().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
 			return err
 		}
 		return "apps/v1", patchFunc(fn), nil
 	}
 	if groupVersions["apps/v1beta2"] {
-		fn := func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1beta2().Deployments(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{})
+		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
+			_, err := client.AppsV1beta2().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
 			return err
 		}
 		return "apps/v1beta2", patchFunc(fn), nil
 	}
 	if groupVersions["apps/v1beta1"] {
-		fn := func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1beta1().Deployments(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{})
+		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
+			_, err := client.AppsV1beta1().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
 			return err
 		}
 		return "apps/v1beta1", patchFunc(fn), nil
 	}
 	if groupVersions["extensions/v1beta1"] {
-		fn := func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.ExtensionsV1beta1().Deployments(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{})
+		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
+			_, err := client.ExtensionsV1beta1().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
 			return err
 		}
 		return "extensions/v1beta1", patchFunc(fn), nil
@@ -291,22 +284,22 @@ func findDeploymentPatcher(groupVersions map[string]bool) (string, patchFunc, er
 func findDaemonSetPatcher(groupVersions map[string]bool) (string, patchFunc, error) {
 	// Find the best API to use - newest API first.
 	if groupVersions["apps/v1"] {
-		fn := func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1().DaemonSets(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{})
+		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
+			_, err := client.AppsV1().DaemonSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
 			return err
 		}
 		return "apps/v1", patchFunc(fn), nil
 	}
 	if groupVersions["apps/v1beta2"] {
-		fn := func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1beta2().DaemonSets(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{})
+		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
+			_, err := client.AppsV1beta2().DaemonSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
 			return err
 		}
 		return "apps/v1beta2", patchFunc(fn), nil
 	}
 	if groupVersions["extensions/v1beta1"] {
-		fn := func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.ExtensionsV1beta1().DaemonSets(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{})
+		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
+			_, err := client.ExtensionsV1beta1().DaemonSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
 			return err
 		}
 		return "extensions/v1beta1", patchFunc(fn), nil
@@ -317,22 +310,22 @@ func findDaemonSetPatcher(groupVersions map[string]bool) (string, patchFunc, err
 func findReplicaSetPatcher(groupVersions map[string]bool) (string, patchFunc, error) {
 	// Find the best API to use - newest API first.
 	if groupVersions["apps/v1"] {
-		fn := func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1().ReplicaSets(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{})
+		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
+			_, err := client.AppsV1().ReplicaSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
 			return err
 		}
 		return "apps/v1", patchFunc(fn), nil
 	}
 	if groupVersions["apps/v1beta2"] {
-		fn := func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1beta2().ReplicaSets(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{})
+		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
+			_, err := client.AppsV1beta2().ReplicaSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
 			return err
 		}
 		return "apps/v1beta2", patchFunc(fn), nil
 	}
 	if groupVersions["extensions/v1beta1"] {
-		fn := func(client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.ExtensionsV1beta1().ReplicaSets(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{})
+		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
+			_, err := client.ExtensionsV1beta1().ReplicaSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
 			return err
 		}
 		return "extensions/v1beta1", patchFunc(fn), nil
@@ -346,10 +339,10 @@ type ClusterSize struct {
 	Cores int
 }
 
-func (k *k8sClient) GetClusterSize() (clusterStatus *ClusterSize, err error) {
+func (k *k8sClient) GetClusterSize(ctx context.Context) (clusterStatus *ClusterSize, err error) {
 	opt := metav1.ListOptions{Watch: false}
 
-	nodes, err := k.clientset.CoreV1().Nodes().List(context.TODO(), opt)
+	nodes, err := k.clientset.CoreV1().Nodes().List(ctx, opt)
 	if err != nil || nodes == nil {
 		return nil, err
 	}
@@ -359,7 +352,7 @@ func (k *k8sClient) GetClusterSize() (clusterStatus *ClusterSize, err error) {
 	// All nodes are considered, even those that are marked as unshedulable,
 	// this includes the master.
 	for _, node := range nodes.Items {
-		tc.Add(node.Status.Capacity[apiv1.ResourceCPU])
+		tc.Add(node.Status.Capacity[v1.ResourceCPU])
 	}
 
 	tcInt64, tcOk := tc.AsInt64()
@@ -367,11 +360,10 @@ func (k *k8sClient) GetClusterSize() (clusterStatus *ClusterSize, err error) {
 		return nil, fmt.Errorf("unable to compute integer values of cores in the cluster")
 	}
 	clusterStatus.Cores = int(tcInt64)
-	k.clusterStatus = clusterStatus
 	return clusterStatus, nil
 }
 
-func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequirements, reqsChanged bool) error {
+func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1.ResourceRequirements, reqsChanged bool) error {
 	// Recreate mode: the template is the delivery mechanism. Patch only when
 	// the desired values actually changed and let the workload controller
 	// perform its normal rolling replacement. Nothing else to do.
@@ -379,7 +371,7 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 		if !reqsChanged {
 			return nil
 		}
-		return k.patchTemplate(resources)
+		return k.patchTemplate(ctx, resources)
 	}
 
 	// In-place modes: deliberately do NOT patch the template up front. On a
@@ -397,7 +389,7 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 
 	// Derive the poll timeout from the configured poll period, with a
 	// fallback for test code that constructs k8sClient directly.
-	baseCtx := k.ctx
+	baseCtx := ctx
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
@@ -408,13 +400,20 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 	ctx, cancel := context.WithTimeout(baseCtx, timeout)
 	defer cancel()
 
-	selector, err := k.cachedSelectorOrResolve()
+	selector, err := k.cachedSelectorOrResolve(ctx)
 	if err != nil {
 		return fmt.Errorf("resolve selector: %w", err)
 	}
 
-	result, err := k.resizeRunningPods(ctx, k.target.Namespace, selector, resources,
-		k.resizeMode, k.fallbackConfig, k.tracker)
+	selfHeals := func(ctx context.Context) bool {
+		return k.targetSelfHeals(ctx)
+	}
+	patcher := func(resources map[string]v1.ResourceRequirements) error {
+		return k.patchTemplateForResize(ctx, resources)
+	}
+
+	result, err := resizeRunningPods(ctx, k.clientset, k.target.Namespace, selector, resources,
+		k.resizeMode, k.fallbackConfig, k.tracker, patcher, selfHeals, k.dryRun)
 	glog.V(1).Infof("resize cycle: %+v", result)
 	if err != nil {
 		return fmt.Errorf("in-place resize: %w", err)
@@ -427,7 +426,7 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 // pod-template-hash and triggers the controller's rolling recreate, so it is
 // only ever called on the Recreate path and the InPlaceOrRecreate fallback —
 // never on a successful in-place resize.
-func (k *k8sClient) patchTemplate(resources map[string]apiv1.ResourceRequirements) error {
+func (k *k8sClient) patchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) error {
 	ctrs := make([]interface{}, 0, len(resources))
 	for ctrName, res := range resources {
 		ctrs = append(ctrs, map[string]interface{}{
@@ -458,18 +457,16 @@ func (k *k8sClient) patchTemplate(resources map[string]apiv1.ResourceRequirement
 		glog.Infof("dry-run: would patch %s/%s template resources", k.target.Kind, k.target.Name)
 		return nil
 	}
-	if err := k.target.Patch(k.clientset, types.StrategicMergePatchType, jb); err != nil {
+	if err := k.target.Patch(ctx, k.clientset, types.StrategicMergePatchType, jb); err != nil {
 		return fmt.Errorf("template patch failed: %v", err)
 	}
 	return nil
 }
 
-// patchTemplateForResize patches the template, honoring the test seam.
-func (k *k8sClient) patchTemplateForResize(resources map[string]apiv1.ResourceRequirements) error {
-	if k.patchTemplateFn != nil {
-		return k.patchTemplateFn(resources)
-	}
-	return k.patchTemplate(resources)
+// patchTemplateForResize patches the template for the resize path.
+// This is a thin wrapper around patchTemplate to adapt the ResizeMode path.
+func (k *k8sClient) patchTemplateForResize(ctx context.Context, resources map[string]v1.ResourceRequirements) error {
+	return k.patchTemplate(ctx, resources)
 }
 
 // targetSelfHeals reports whether the target controller recreates its pods on
@@ -477,17 +474,14 @@ func (k *k8sClient) patchTemplateForResize(resources map[string]apiv1.ResourceRe
 // DaemonSets do (the controller paces the replacement via maxUnavailable/PDB,
 // so cpvpa must NOT delete pods itself). Bare ReplicaSets/ReplicationControllers
 // and OnDelete DaemonSets do not, so cpvpa must delete the pod to force a
-// recreate. Honors the test seam.
-func (k *k8sClient) targetSelfHeals() bool {
-	if k.selfHealsFn != nil {
-		return k.selfHealsFn()
-	}
+// recreate.
+func (k *k8sClient) targetSelfHeals(ctx context.Context) bool {
 	switch strings.ToLower(k.target.Kind) {
 	case "deployment":
 		return true
 	case "daemonset":
 		ds, err := k.clientset.AppsV1().DaemonSets(k.target.Namespace).
-			Get(k.ctx, k.target.Name, metav1.GetOptions{})
+			Get(ctx, k.target.Name, metav1.GetOptions{})
 		if err != nil {
 			// Unknown strategy: assume NOT self-healing so the fallback deletes
 			// the stuck pod directly. Assuming self-healing here would, for an
@@ -525,22 +519,22 @@ func EnsureResizeSubresource(client kubernetes.Interface) error {
 		"in-place pod resize requires Kubernetes 1.33+ with InPlacePodVerticalScaling enabled")
 }
 
-func (k *k8sClient) getTargetSelector() (string, error) {
+func (k *k8sClient) getTargetSelector(ctx context.Context) (string, error) {
 	switch strings.ToLower(k.target.Kind) {
 	case "deployment":
-		dep, err := k.clientset.AppsV1().Deployments(k.target.Namespace).Get(k.ctx, k.target.Name, metav1.GetOptions{})
+		dep, err := k.clientset.AppsV1().Deployments(k.target.Namespace).Get(ctx, k.target.Name, metav1.GetOptions{})
 		if err != nil {
 			return "", err
 		}
 		return metav1.FormatLabelSelector(dep.Spec.Selector), nil
 	case "daemonset":
-		ds, err := k.clientset.AppsV1().DaemonSets(k.target.Namespace).Get(k.ctx, k.target.Name, metav1.GetOptions{})
+		ds, err := k.clientset.AppsV1().DaemonSets(k.target.Namespace).Get(ctx, k.target.Name, metav1.GetOptions{})
 		if err != nil {
 			return "", err
 		}
 		return metav1.FormatLabelSelector(ds.Spec.Selector), nil
 	case "replicaset":
-		rs, err := k.clientset.AppsV1().ReplicaSets(k.target.Namespace).Get(k.ctx, k.target.Name, metav1.GetOptions{})
+		rs, err := k.clientset.AppsV1().ReplicaSets(k.target.Namespace).Get(ctx, k.target.Name, metav1.GetOptions{})
 		if err != nil {
 			return "", err
 		}
@@ -553,11 +547,11 @@ func (k *k8sClient) getTargetSelector() (string, error) {
 // otherwise fetches it from the target workload, parses it, and caches
 // it for subsequent cycles. Selectors are immutable for Deployment,
 // DaemonSet, and ReplicaSet, so the cache never needs invalidation.
-func (k *k8sClient) cachedSelectorOrResolve() (labels.Selector, error) {
+func (k *k8sClient) cachedSelectorOrResolve(ctx context.Context) (labels.Selector, error) {
 	if k.cachedSelector != nil {
 		return k.cachedSelector, nil
 	}
-	selectorStr, err := k.getTargetSelector()
+	selectorStr, err := k.getTargetSelector(ctx)
 	if err != nil {
 		return nil, err
 	}

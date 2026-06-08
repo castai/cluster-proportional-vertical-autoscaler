@@ -18,6 +18,7 @@ package autoscaler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -102,7 +103,7 @@ func (s *AutoScaler) Run() {
 
 func (s *AutoScaler) pollAPIServer() {
 	// Query the apiserver for the cluster status --- number of nodes and cores
-	clusterSize, err := s.k8sClient.GetClusterSize()
+	clusterSize, err := s.k8sClient.GetClusterSize(context.Background())
 	if err != nil {
 		glog.Errorf("Error getting cluster size: %v", err)
 		return
@@ -159,7 +160,7 @@ func (s *AutoScaler) pollAPIServer() {
 	// UpdateResources is called every cycle for the in-place modes (so newly
 	// created pods converge and stuck resizes are retried); it internally
 	// no-ops when reqsChanged is false in Recreate mode.
-	if err = s.k8sClient.UpdateResources(newReqs, reqsChanged); err != nil {
+	if err = s.k8sClient.UpdateResources(context.Background(), newReqs, reqsChanged); err != nil {
 		glog.Errorf("Update failure: %s", err)
 	} else {
 		s.lastReqs = newReqs

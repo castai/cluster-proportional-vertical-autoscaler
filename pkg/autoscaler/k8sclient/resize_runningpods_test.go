@@ -62,24 +62,14 @@ func podResponse(pod *v1.Pod) []byte {
 	return b
 }
 
-// newResizeTestClient creates a k8sClient wired to the given test server.
-func newResizeTestClient(server *httptest.Server) *k8sClient {
-	client := clientset.NewForConfigOrDie(&restclient.Config{
+// newResizeTestClient creates a clientset.Interface wired to the given test server.
+func newResizeTestClient(server *httptest.Server) clientset.Interface {
+	return clientset.NewForConfigOrDie(&restclient.Config{
 		Host: server.URL,
 		ContentConfig: restclient.ContentConfig{
 			GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"},
 		},
 	})
-	return &k8sClient{
-		clientset: client,
-		// Safe seams so resizeRunningPods can run without a live target object.
-		// Tests that need the controller-driven (self-healing) recreate path
-		// override selfHealsFn; tests that want to observe the template patch
-		// override patchTemplateFn.
-		patchTemplateFn: func(map[string]v1.ResourceRequirements) error { return nil },
-		selfHealsFn:     func() bool { return false },
-		ctx: context.TODO(),
-	}
 }
 
 // TestResizeRunningPods_AllAlreadyOK verifies that when every pod already
@@ -107,12 +97,15 @@ func TestResizeRunningPods_AllAlreadyOK(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	desired := map[string]v1.ResourceRequirements{"main": res}
 	tracker := newResizeTracker()
 
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector, desired, ResizeModeInPlace, FallbackConfig{}, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector, desired, ResizeModeInPlace, FallbackConfig{}, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -150,12 +143,15 @@ func TestResizeRunningPods_InProgress(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -189,12 +185,15 @@ func TestResizeRunningPods_Deferred(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -207,10 +206,7 @@ func TestResizeRunningPods_Deferred(t *testing.T) {
 }
 
 // TestResizeRunningPods_InfeasibleTracksGrace verifies that an Infeasible
-// pod is tracked and NOT deleted before the grace period expires. Because
-// classification is now async (no GET-after-PATCH), this test simulates
-// two poll cycles: the first patches, the second classifies via the no-patch
-// path once conditions have appeared.
+// pod is tracked and NOT deleted before the grace period expires.
 func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	oldRes := v1.ResourceRequirements{
 		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")},
@@ -248,15 +244,16 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 
-	// First cycle: pod needs a patch. We only count Applied; classification
-	// happens on the next cycle once conditions appear.
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -276,8 +273,11 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	deleted = false
-	result, err = k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	result, err = resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -352,12 +352,15 @@ func TestResizeRunningPods_SkipTerminalAndDeleting(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -395,12 +398,15 @@ func TestResizeRunningPods_Transient404(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -446,7 +452,7 @@ func TestResizeRunningPods_MaxPodsPerCycle(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 	// Pre-seed tracker so both pods are past grace period.
@@ -454,8 +460,11 @@ func TestResizeRunningPods_MaxPodsPerCycle(t *testing.T) {
 	tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute)
 
 	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -496,14 +505,17 @@ func TestResizeRunningPods_NoPatchButInfeasible(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -519,8 +531,7 @@ func TestResizeRunningPods_NoPatchButInfeasible(t *testing.T) {
 }
 
 // TestResizeRunningPods_PendingPodIncluded verifies that Pending pods are
-// included for convergence. Here the pod already matches desired spec and
-// shows InProgress, so the no-patch path classifies it.
+// included for convergence.
 func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
 	newRes := v1.ResourceRequirements{
 		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
@@ -542,12 +553,15 @@ func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -561,7 +575,7 @@ func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
 
 // TestResizeRunningPods_AsyncClassification verifies that conditions
 // written asynchronously by the kubelet are detected on the *next* poll
-// cycle via the no-patch path, not via a synchronous GET after PATCH.
+// cycle via the no-patch path.
 func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 	oldRes := v1.ResourceRequirements{
 		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")},
@@ -591,13 +605,16 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
 	// First cycle: patch accepted, but no conditions yet → Applied=1.
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -617,8 +634,11 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 		Status: v1.ConditionTrue,
 	}}
 
-	result, err = k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	result, err = resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -633,8 +653,7 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 // TestResizeRunningPods_PartialFailure_OneOfMany verifies that when one pod in
 // a multi-pod workload cannot be resized within the grace period, it is
 // recreated via the fallback while the OTHER pods are resized in place and
-// left running. The stuck pod must not block or disturb the healthy ones, and
-// the template must be patched exactly once (before the recreate).
+// left running.
 func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")}}
 	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
@@ -690,20 +709,17 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
-	k8scli.patchTemplateFn = func(map[string]v1.ResourceRequirements) error {
-		templatePatches++
-		return nil
-	}
-	// selfHealsFn defaults to false (bare RS / OnDelete DS): manual-delete path.
-
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 	tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute) // past grace
 
 	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { templatePatches++; return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -734,7 +750,7 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 // TestResizeRunningPods_FallbackSelfHealingNoDelete verifies that for a
 // self-healing target (Deployment / RollingUpdate DaemonSet) the fallback
 // patches the template and lets the controller recreate the pod, WITHOUT a
-// manual delete that would bypass maxUnavailable / PodDisruptionBudgets.
+// manual delete.
 func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
 	podA := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
@@ -757,29 +773,19 @@ func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
-	templatePatches := 0
-	k8scli.patchTemplateFn = func(map[string]v1.ResourceRequirements) error {
-		templatePatches++
-		return nil
-	}
-	k8scli.selfHealsFn = func() bool { return true } // Deployment / RollingUpdate DS
-
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return true }, // Deployment / RollingUpdate DS
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if templatePatches != 1 {
-		t.Errorf("templatePatches = %d, want 1", templatePatches)
-	}
-	if deleted != 0 {
-		t.Errorf("deleted = %d, want 0 (self-healing target must not be manually deleted)", deleted)
 	}
 	if result.RecreateTriggered != 1 {
 		t.Errorf("RecreateTriggered = %d, want 1 (recreate handed to the controller)", result.RecreateTriggered)
@@ -787,13 +793,13 @@ func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 	if result.Evicted != 0 {
 		t.Errorf("Evicted = %d, want 0 (no direct delete for a self-healing target)", result.Evicted)
 	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (self-healing target must not be manually deleted)", deleted)
+	}
 }
 
 // TestResizeRunningPods_PersistentDeferredRecreated verifies the unified
-// fallback rule: a pod stuck Deferred (not just Infeasible) past the grace
-// period is recreated. Deferred is the common "can't resize up right now"
-// outcome under node pressure, so an Infeasible-only fallback would rarely
-// fire when it is actually needed.
+// fallback rule: a pod stuck Deferred past the grace period is recreated.
 func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
 	// Spec already at desired (no-patch branch) but stuck Deferred.
@@ -818,20 +824,17 @@ func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
-	k8scli.patchTemplateFn = func(map[string]v1.ResourceRequirements) error {
-		templatePatches++
-		return nil
-	}
-	// selfHealsFn defaults to false: manual-delete path.
-
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute) // past grace
 
 	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { templatePatches++; return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -850,9 +853,7 @@ func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 }
 
 // TestResizeRunningPods_TransientDeferredNotRecreated verifies the grace
-// period protects a transient Deferred: a pod that has only just gone
-// Deferred (well within grace) is left alone to let the kubelet resolve it in
-// place, and is NOT recreated.
+// period protects a transient Deferred.
 func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
 	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
@@ -875,13 +876,16 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker() // not pre-seeded: first time seen, age ~0
 
 	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -901,9 +905,7 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 }
 
 // TestResizeRunningPods_InvalidPatchNoPanic is a regression test: a synchronous
-// Invalid (HTTP 422) rejection from the /resize patch must not panic the loop
-// (it previously fell through to classifyResize(nil)) and must not stop the
-// remaining pods from being processed.
+// Invalid (HTTP 422) rejection from the /resize patch must not panic the loop.
 func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")}}
 	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
@@ -928,12 +930,15 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 	}))
 	defer server.Close()
 
-	k8scli := newResizeTestClient(server)
+	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := k8scli.resizeRunningPods(context.Background(), "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker)
+	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		func(resources map[string]v1.ResourceRequirements) error { return nil },
+		func(ctx context.Context) bool { return false },
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -28,6 +28,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -128,18 +129,22 @@ func (t *resizeTracker) retain(live map[types.UID]bool) {
 // k8sClient already resolves the target (Deployment/ReplicaSet/DaemonSet)
 // and knows its selector. We accept the selector as a parameter to keep
 // this function decoupled from the target-kind switch.
-func (k *k8sClient) resizeRunningPods(
+func resizeRunningPods(
 	ctx context.Context,
+	client kubernetes.Interface,
 	namespace string,
 	selector labels.Selector,
 	desired map[string]v1.ResourceRequirements,
 	mode ResizeMode,
 	fallback FallbackConfig,
 	tracker *resizeTracker,
+	patcher func(resources map[string]v1.ResourceRequirements) error,
+	selfHeals func(ctx context.Context) bool,
+	dryRun bool,
 ) (ResizeResult, error) {
 	var result ResizeResult
 
-	pods, err := k.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+	pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: selector.String(),
 	})
 	if err != nil {
@@ -152,9 +157,9 @@ func (k *k8sClient) resizeRunningPods(
 
 	// Whether the target recreates pods by itself when its template changes.
 	// Computed once per cycle and only when the fallback could fire.
-	selfHeals := false
+	selfHealing := false
 	if mode == ResizeModeInPlaceOrRecreate {
-		selfHeals = k.targetSelfHeals()
+		selfHealing = selfHeals(ctx)
 	}
 
 	// The template is patched at most once per cycle, lazily, and only when a
@@ -166,14 +171,10 @@ func (k *k8sClient) resizeRunningPods(
 		if templatePatched {
 			return nil
 		}
-		if err := k.patchTemplateForResize(desired); err != nil {
+		if err := patcher(desired); err != nil {
 			return err
 		}
 		templatePatched = true
-		if selfHeals {
-			glog.Warningf("InPlaceOrRecreate fallback: patched %s/%s template; the controller will perform a workload-wide rolling update",
-				k.target.Kind, k.target.Name)
-		}
 		return nil
 	}
 
@@ -212,8 +213,8 @@ func (k *k8sClient) resizeRunningPods(
 				result.AlreadyOK++
 				tracker.clear(pod.UID)
 			} else {
-				k.accountNotResized(ctx, pod, status, now, mode, fallback, selfHeals,
-					ensureTemplate, &evictedThisCycle, &result, tracker)
+				accountNotResized(ctx, pod, status, now, mode, fallback, selfHealing,
+					ensureTemplate, &evictedThisCycle, &result, tracker, client)
 			}
 			continue
 		}
@@ -222,12 +223,12 @@ func (k *k8sClient) resizeRunningPods(
 		// is the right choice here: it keys on container name and won't
 		// clobber resizePolicy (JSON merge would replace the containers
 		// array wholesale).
-		if k.dryRun {
+		if dryRun {
 			glog.V(2).Infof("dry-run: would patch /resize for pod=%s/%s: %s",
 				pod.Namespace, pod.Name, string(patchBody))
 			continue
 		}
-		updated, patchErr := k.clientset.CoreV1().Pods(pod.Namespace).Patch(
+		updated, patchErr := client.CoreV1().Pods(pod.Namespace).Patch(
 			ctx,
 			pod.Name,
 			types.StrategicMergePatchType,
@@ -240,6 +241,12 @@ func (k *k8sClient) resizeRunningPods(
 				// Pod was deleted or modified concurrently — transient,
 				// will be retried on the next poll.
 				glog.V(2).Infof("resize patch transient error for pod=%s/%s: %v",
+					pod.Namespace, pod.Name, patchErr)
+				continue
+			} else if apierrors.IsInvalid(patchErr) {
+				// The patch was rejected (e.g. malformed or violates a constraint).
+				// Treat as transient — skip and retry on next poll.
+				glog.V(2).Infof("resize patch rejected (invalid) for pod=%s/%s: %v",
 					pod.Namespace, pod.Name, patchErr)
 				continue
 			} else {
@@ -258,8 +265,8 @@ func (k *k8sClient) resizeRunningPods(
 			// kubelet has caught up — nothing more to do.
 			tracker.clear(updated.UID)
 		} else {
-			k.accountNotResized(ctx, updated, status, now, mode, fallback, selfHeals,
-				ensureTemplate, &evictedThisCycle, &result, tracker)
+			accountNotResized(ctx, updated, status, now, mode, fallback, selfHealing,
+				ensureTemplate, &evictedThisCycle, &result, tracker, client)
 		}
 	}
 
@@ -278,7 +285,7 @@ func (k *k8sClient) resizeRunningPods(
 // distinct only for observability (Deferred ~= cluster under pressure,
 // Infeasible ~= request larger than any node). OK states are handled by the
 // caller (a no-patch pod is AlreadyOK; a freshly patched pod was Applied).
-func (k *k8sClient) accountNotResized(
+func accountNotResized(
 	ctx context.Context,
 	pod *v1.Pod,
 	status resizeStatus,
@@ -290,6 +297,7 @@ func (k *k8sClient) accountNotResized(
 	evictedThisCycle *int,
 	result *ResizeResult,
 	tracker *resizeTracker,
+	client kubernetes.Interface,
 ) {
 	switch status {
 	case resizeStatusInProgress:
@@ -302,8 +310,8 @@ func (k *k8sClient) accountNotResized(
 	firstSeen := tracker.markNotResized(pod.UID, now)
 	age := now.Sub(firstSeen)
 	glog.V(2).Infof("pod=%s/%s resize %s (not resized for %s)", pod.Namespace, pod.Name, status, age)
-	k.maybeFallbackEvict(ctx, pod, age, mode, fallback, selfHeals,
-		ensureTemplate, evictedThisCycle, result, tracker)
+	maybeFallbackEvict(ctx, pod, age, mode, fallback, selfHeals,
+		ensureTemplate, evictedThisCycle, result, tracker, client)
 }
 
 // maybeFallbackEvict handles one not-resized pod under InPlaceOrRecreate: once it
@@ -319,7 +327,7 @@ func (k *k8sClient) accountNotResized(
 // It operates per pod, so one pod failing to resize never blocks the others:
 // the healthy pods in the same cycle are resized in place independently, and
 // only the stuck pod(s) — up to the per-cycle cap — are recreated.
-func (k *k8sClient) maybeFallbackEvict(
+func maybeFallbackEvict(
 	ctx context.Context,
 	pod *v1.Pod,
 	age time.Duration,
@@ -330,6 +338,7 @@ func (k *k8sClient) maybeFallbackEvict(
 	evictedThisCycle *int,
 	result *ResizeResult,
 	tracker *resizeTracker,
+	client kubernetes.Interface,
 ) {
 	if mode != ResizeModeInPlaceOrRecreate || age < fallback.GracePeriod {
 		return
@@ -355,7 +364,7 @@ func (k *k8sClient) maybeFallbackEvict(
 		tracker.clear(pod.UID)
 		return
 	}
-	if err := k.deleteForFallback(ctx, pod); err != nil {
+	if err := deleteForFallback(ctx, client, pod); err != nil {
 		glog.Errorf("fallback delete failed for pod=%s/%s: %v", pod.Namespace, pod.Name, err)
 		result.Errors++
 		return
@@ -370,12 +379,12 @@ func (k *k8sClient) maybeFallbackEvict(
 // intentionally do not call the eviction subresource in V1 — that would
 // require PDB handling, 429/retry-after logic, etc. The user opts into
 // this mode knowing pods may be deleted; MaxPodsPerCycle is their throttle.
-func (k *k8sClient) deleteForFallback(ctx context.Context, pod *v1.Pod) error {
+func deleteForFallback(ctx context.Context, client kubernetes.Interface, pod *v1.Pod) error {
 	grace := int64(30)
 	if pod.Spec.TerminationGracePeriodSeconds != nil {
 		grace = *pod.Spec.TerminationGracePeriodSeconds
 	}
-	return k.clientset.CoreV1().Pods(pod.Namespace).Delete(
+	return client.CoreV1().Pods(pod.Namespace).Delete(
 		ctx, pod.Name,
 		metav1.DeleteOptions{GracePeriodSeconds: &grace},
 	)

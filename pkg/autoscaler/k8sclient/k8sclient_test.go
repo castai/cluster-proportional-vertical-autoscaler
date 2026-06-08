@@ -17,12 +17,12 @@ limitations under the License.
 package k8sclient
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"context"
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -185,18 +185,17 @@ func TestGetTargetSelector(t *testing.T) {
 				},
 			})
 
-			k8scli := &k8sClient{
-				clientset: client,
-				target: &targetSpec{
-					Kind:         tc.kind,
-					Name:         tc.targetName,
-					Namespace:    "default",
-					GroupVersion: "apps/v1",
-				},
-				ctx: context.TODO(),
+			k8scli, err := newK8sClient(client, &targetSpec{
+				Kind:         tc.kind,
+				Name:         tc.targetName,
+				Namespace:    "default",
+				GroupVersion: "apps/v1",
+			}, false, ResizeModeRecreate, FallbackConfig{}, nil)
+			if err != nil {
+				t.Fatalf("failed to create k8sClient: %v", err)
 			}
 
-			sel, err := k8scli.getTargetSelector()
+			sel, err := k8scli.getTargetSelector(context.Background())
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -297,10 +296,9 @@ func TestUpdateResources(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error making target %q: %v", tc.target, err)
 		}
-		k8scli := &k8sClient{
-			clientset:  client,
-			target:     target,
-			resizeMode: ResizeModeRecreate,
+		k8scli, err := newK8sClient(client, target, false, ResizeModeRecreate, FallbackConfig{}, nil)
+		if err != nil {
+			t.Fatalf("error creating k8sClient: %v", err)
 		}
 
 		newReqs := map[string]apiv1.ResourceRequirements{}
@@ -311,7 +309,7 @@ func TestUpdateResources(t *testing.T) {
 		r := resource.NewQuantity(0, resource.BinarySI)
 		r.SetMilli(10)
 		newReqs["thing"].Requests[apiv1.ResourceName("cpu")] = *r
-		if err := k8scli.UpdateResources(newReqs, true); err != nil {
+		if err := k8scli.UpdateResources(context.Background(), newReqs, true); err != nil {
 			t.Errorf("failed to update resources for target %q: %v", tc.target, err)
 		}
 	}
