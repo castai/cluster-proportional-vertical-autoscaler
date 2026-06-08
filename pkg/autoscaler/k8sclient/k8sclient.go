@@ -90,9 +90,14 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 		return nil, err
 	}
 
-	if mode != ResizeModeRecreate {
+	if mode == ResizeModeInPlace {
 		if err := EnsureResizeSubresource(clientset); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("in-place resize requires the pods/resize subresource: %w", err)
+		}
+	} else if mode == ResizeModeInPlaceOrRecreate {
+		if err := EnsureResizeSubresource(clientset); err != nil {
+			glog.Warningf("pods/resize unavailable (%v); %s degrading to %s", err, mode, ResizeModeRecreate)
+			mode = ResizeModeRecreate
 		}
 	}
 
