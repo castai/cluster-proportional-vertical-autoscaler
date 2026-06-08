@@ -78,6 +78,7 @@ func newResizeTestClient(server *httptest.Server) *k8sClient {
 		// override patchTemplateFn.
 		patchTemplateFn: func(map[string]v1.ResourceRequirements) error { return nil },
 		selfHealsFn:     func() bool { return false },
+		ctx: context.TODO(),
 	}
 }
 

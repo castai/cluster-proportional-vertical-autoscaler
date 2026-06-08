@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"context"
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -192,6 +193,7 @@ func TestGetTargetSelector(t *testing.T) {
 					Namespace:    "default",
 					GroupVersion: "apps/v1",
 				},
+				ctx: context.TODO(),
 			}
 
 			sel, err := k8scli.getTargetSelector()
