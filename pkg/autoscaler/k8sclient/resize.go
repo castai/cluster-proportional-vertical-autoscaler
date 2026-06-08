@@ -28,8 +28,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 )
 
 // ResizeMode controls how cpvpa applies resource changes to a target.
@@ -219,10 +219,6 @@ func resizeRunningPods(
 			continue
 		}
 
-		// Issue the patch against the /resize subresource. Strategic merge
-		// is the right choice here: it keys on container name and won't
-		// clobber resizePolicy (JSON merge would replace the containers
-		// array wholesale).
 		if dryRun {
 			glog.V(2).Infof("dry-run: would patch /resize for pod=%s/%s: %s",
 				pod.Namespace, pod.Name, string(patchBody))
@@ -233,17 +229,14 @@ func resizeRunningPods(
 			pod.Name,
 			types.StrategicMergePatchType,
 			patchBody,
-			metav1.PatchOptions{FieldManager: "cpvpa"},
+			metav1.PatchOptions{},
 			"resize",
 		)
 		if patchErr != nil {
 			result.Errors++
 			if apierrors.IsNotFound(patchErr) || apierrors.IsConflict(patchErr) {
-				// Pod was deleted or modified concurrently — transient,
-				// will be retried on the next poll.
 				glog.V(2).Infof("resize patch transient error for pod=%s/%s: %v",
 					pod.Namespace, pod.Name, patchErr)
-				continue
 			} else {
 				glog.Errorf("resize patch error for pod=%s/%s: %v",
 					pod.Namespace, pod.Name, patchErr)
@@ -251,16 +244,13 @@ func resizeRunningPods(
 				status := resizeStatusInfeasible
 				accountNotResized(ctx, pod, status, now, mode, fallback, selfHealing,
 					ensureTemplate, &evictedThisCycle, &result, tracker, client)
-				continue
 			}
+			continue
 		} else {
 			result.Applied++
 		}
 
-		// Classify the post-patch state. If still not OK, hand off to
-		// accountNotResized for tracking and potential fallback.
 		if status := classifyResize(updated); status == resizeStatusOK {
-			// kubelet has caught up — nothing more to do.
 			tracker.clear(updated.UID)
 		} else {
 			accountNotResized(ctx, updated, status, now, mode, fallback, selfHealing,
@@ -355,7 +345,6 @@ func maybeFallbackEvict(
 		return
 	}
 	if selfHeals {
-		// The template change triggers the controller's rolling recreate.
 		glog.Infof("fallback: template updated; controller will recreate pod=%s/%s (not resized for %s)",
 			pod.Namespace, pod.Name, age)
 		result.RecreateTriggered++

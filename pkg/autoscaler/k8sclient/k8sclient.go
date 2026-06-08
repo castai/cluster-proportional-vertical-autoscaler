@@ -414,7 +414,7 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 		return k.targetSelfHeals(ctx)
 	}
 	patcher := func(resources map[string]v1.ResourceRequirements) error {
-		return k.patchTemplateForResize(ctx, resources)
+		return k.patchTemplate(ctx, resources)
 	}
 
 	result, err := resizeRunningPods(ctx, k.clientset, k.target.Namespace, selector, resources,
@@ -466,12 +466,6 @@ func (k *k8sClient) patchTemplate(ctx context.Context, resources map[string]v1.R
 		return fmt.Errorf("template patch failed: %v", err)
 	}
 	return nil
-}
-
-// patchTemplateForResize patches the template for the resize path.
-// This is a thin wrapper around patchTemplate to adapt the ResizeMode path.
-func (k *k8sClient) patchTemplateForResize(ctx context.Context, resources map[string]v1.ResourceRequirements) error {
-	return k.patchTemplate(ctx, resources)
 }
 
 // targetSelfHeals reports whether the target controller recreates its pods on
