@@ -190,7 +190,7 @@ func TestGetTargetSelector(t *testing.T) {
 				Name:         tc.targetName,
 				Namespace:    "default",
 				GroupVersion: "apps/v1",
-			}, false, ResizeModeRecreate, FallbackConfig{}, nil)
+			}, false, ResizeModeRecreate, ResizeFallbackConfig{}, nil)
 			if err != nil {
 				t.Fatalf("failed to create k8sClient: %v", err)
 			}
@@ -296,7 +296,7 @@ func TestUpdateResources(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error making target %q: %v", tc.target, err)
 		}
-		k8scli, err := newK8sClient(client, target, false, ResizeModeRecreate, FallbackConfig{}, nil)
+		k8scli, err := newK8sClient(client, target, false, ResizeModeRecreate, ResizeFallbackConfig{}, nil)
 		if err != nil {
 			t.Fatalf("error creating k8sClient: %v", err)
 		}

@@ -102,7 +102,7 @@ func TestResizeRunningPods_AllAlreadyOK(t *testing.T) {
 	desired := map[string]v1.ResourceRequirements{"main": res}
 	tracker := newResizeTracker()
 
-	result, err := resizeRunningPods(context.Background(), client, "test", selector, desired, ResizeModeInPlace, FallbackConfig{}, tracker,
+	result, err := resizeRunningPods(context.Background(), client, "test", selector, desired, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
@@ -148,7 +148,7 @@ func TestResizeRunningPods_InProgress(t *testing.T) {
 	tracker := newResizeTracker()
 
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
@@ -190,7 +190,7 @@ func TestResizeRunningPods_Deferred(t *testing.T) {
 	tracker := newResizeTracker()
 
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
@@ -247,7 +247,7 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
-	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
@@ -357,7 +357,7 @@ func TestResizeRunningPods_SkipTerminalAndDeleting(t *testing.T) {
 	tracker := newResizeTracker()
 
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
@@ -403,7 +403,7 @@ func TestResizeRunningPods_Transient404(t *testing.T) {
 	tracker := newResizeTracker()
 
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
@@ -459,7 +459,7 @@ func TestResizeRunningPods_MaxPodsPerCycle(t *testing.T) {
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 	tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute)
 
-	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
@@ -510,7 +510,7 @@ func TestResizeRunningPods_NoPatchButInfeasible(t *testing.T) {
 	tracker := newResizeTracker()
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
-	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
@@ -558,7 +558,7 @@ func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
 	tracker := newResizeTracker()
 
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
@@ -611,7 +611,7 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 
 	// First cycle: patch accepted, but no conditions yet → Applied=1.
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
@@ -635,7 +635,7 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 	}}
 
 	result, err = resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
@@ -714,7 +714,7 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 	tracker := newResizeTracker()
 	tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute) // past grace
 
-	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { templatePatches++; return nil },
@@ -778,7 +778,7 @@ func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 	tracker := newResizeTracker()
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
-	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
@@ -829,7 +829,7 @@ func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 	tracker := newResizeTracker()
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute) // past grace
 
-	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { templatePatches++; return nil },
@@ -880,7 +880,7 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker() // not pre-seeded: first time seen, age ~0
 
-	fallback := FallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
@@ -935,7 +935,7 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 	tracker := newResizeTracker()
 
 	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, FallbackConfig{}, tracker,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
 		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)

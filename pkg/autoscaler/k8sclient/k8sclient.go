@@ -58,7 +58,7 @@ type k8sClient struct {
 	clientset      kubernetes.Interface
 	dryRun         bool
 	resizeMode     ResizeMode
-	fallbackConfig FallbackConfig
+	fallbackConfig ResizeFallbackConfig
 	tracker        *resizeTracker
 
 	cachedSelector labels.Selector
@@ -66,7 +66,7 @@ type k8sClient struct {
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
-func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg FallbackConfig, pollPeriod time.Duration, stopCh <-chan struct{}) (K8sClient, error) {
+func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg ResizeFallbackConfig, pollPeriod time.Duration) (K8sClient, error) {
 	var config *rest.Config
 	var err error
 	if kubeconfig != "" {
@@ -110,7 +110,7 @@ func newK8sClient(
 	target *targetSpec,
 	dryRun bool,
 	mode ResizeMode,
-	fallbackCfg FallbackConfig,
+	fallbackCfg ResizeFallbackConfig,
 	tracker *resizeTracker,
 ) (*k8sClient, error) {
 	return &k8sClient{

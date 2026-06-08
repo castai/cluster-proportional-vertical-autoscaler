@@ -52,8 +52,8 @@ const (
 	ResizeModeInPlaceOrRecreate ResizeMode = "InPlaceOrRecreate"
 )
 
-// FallbackConfig governs the InPlaceOrRecreate fallback path.
-type FallbackConfig struct {
+// ResizeFallbackConfig governs the InPlaceOrRecreate fallback path.
+type ResizeFallbackConfig struct {
 	// GracePeriod is how long a pod must remain Infeasible before cpvpa
 	// will delete it. Defaults to 5 minutes.
 	GracePeriod time.Duration
@@ -136,7 +136,7 @@ func resizeRunningPods(
 	selector labels.Selector,
 	desired map[string]v1.ResourceRequirements,
 	mode ResizeMode,
-	fallback FallbackConfig,
+	fallback ResizeFallbackConfig,
 	tracker *resizeTracker,
 	patcher func(resources map[string]v1.ResourceRequirements) error,
 	selfHeals func(ctx context.Context) bool,
@@ -291,7 +291,7 @@ func accountNotResized(
 	status resizeStatus,
 	now time.Time,
 	mode ResizeMode,
-	fallback FallbackConfig,
+	fallback ResizeFallbackConfig,
 	selfHeals bool,
 	ensureTemplate func() error,
 	evictedThisCycle *int,
@@ -332,7 +332,7 @@ func maybeFallbackEvict(
 	pod *v1.Pod,
 	age time.Duration,
 	mode ResizeMode,
-	fallback FallbackConfig,
+	fallback ResizeFallbackConfig,
 	selfHeals bool,
 	ensureTemplate func() error,
 	evictedThisCycle *int,

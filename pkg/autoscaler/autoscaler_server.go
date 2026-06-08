@@ -54,12 +54,11 @@ type AutoScaler struct {
 // NewAutoScaler returns a new AutoScaler
 func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 	mode := k8sclient.ResizeMode(c.ResizeMode)
-	fallbackCfg := k8sclient.FallbackConfig{
+	fallbackCfg := k8sclient.ResizeFallbackConfig{
 		GracePeriod:     c.ResizeFallbackGracePeriod,
 		MaxPodsPerCycle: c.ResizeFallbackMaxPodsPerCycle,
 	}
-	stopCh := make(chan struct{})
-	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun, mode, fallbackCfg, time.Second*time.Duration(c.PollPeriodSeconds), stopCh)
+	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun, mode, fallbackCfg, time.Second*time.Duration(c.PollPeriodSeconds))
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +74,7 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 		configFile:    c.ConfigFile,
 		pollPeriod:    time.Second * time.Duration(c.PollPeriodSeconds),
 		clock:         clock.RealClock{},
-		stopCh:        stopCh,
+		stopCh:        make(chan struct{}),
 		readyCh:       make(chan struct{}, 1),
 		resizeMode:    mode,
 	}, nil
