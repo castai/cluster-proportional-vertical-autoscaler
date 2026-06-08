@@ -415,10 +415,10 @@ func (k *k8sClient) UpdateResources(resources map[string]apiv1.ResourceRequireme
 
 	result, err := k.resizeRunningPods(ctx, k.target.Namespace, selector, resources,
 		k.resizeMode, k.fallbackConfig, k.tracker)
-	if err != nil {
-		glog.Errorf("in-place resize: %v", err)
-	}
 	glog.V(1).Infof("resize cycle: %+v", result)
+	if err != nil {
+		return fmt.Errorf("in-place resize: %w", err)
+	}
 	return nil
 }
 
@@ -489,12 +489,16 @@ func (k *k8sClient) targetSelfHeals() bool {
 		ds, err := k.clientset.AppsV1().DaemonSets(k.target.Namespace).
 			Get(k.ctx, k.target.Name, metav1.GetOptions{})
 		if err != nil {
-			glog.Errorf("self-heal check: get daemonset %s/%s: %v; assuming rolling update",
+			// Unknown strategy: assume NOT self-healing so the fallback deletes
+			// the stuck pod directly. Assuming self-healing here would, for an
+			// OnDelete DaemonSet, patch the template and then wait forever for a
+			// rollout the controller never performs, leaving the pod stuck.
+			glog.Errorf("self-heal check: get daemonset %s/%s: %v; assuming non-self-healing (will delete pods directly)",
 				k.target.Namespace, k.target.Name, err)
-			return true
+			return false
 		}
 		return ds.Spec.UpdateStrategy.Type != appsv1.OnDeleteDaemonSetStrategyType
-	default: // ReplicaSet, ReplicationController (not owned by a higher controller)
+	default: // bare ReplicaSet — not owned by a higher controller, so autoscaler deletes pods itself
 		return false
 	}
 }
