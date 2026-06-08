@@ -410,8 +410,8 @@ func TestResizeRunningPods_Transient404(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Errors != 0 {
-		t.Errorf("Errors = %d, want 0", result.Errors)
+	if result.Errors != 1 {
+		t.Errorf("Errors = %d, want 1", result.Errors)
 	}
 	if result.Applied != 0 {
 		t.Errorf("Applied = %d, want 0", result.Applied)
@@ -946,7 +946,7 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 	if result.Applied != 1 {
 		t.Errorf("Applied = %d, want 1 (pod-b processed after pod-a was rejected)", result.Applied)
 	}
-	if result.Errors != 0 {
-		t.Errorf("Errors = %d, want 0 (synchronous Invalid is not an error count)", result.Errors)
+	if result.Errors != 1 {
+		t.Errorf("Errors = %d, want 1", result.Errors)
 	}
 }

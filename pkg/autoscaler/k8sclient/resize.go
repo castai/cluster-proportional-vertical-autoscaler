@@ -237,22 +237,20 @@ func resizeRunningPods(
 			"resize",
 		)
 		if patchErr != nil {
+			result.Errors++
 			if apierrors.IsNotFound(patchErr) || apierrors.IsConflict(patchErr) {
 				// Pod was deleted or modified concurrently — transient,
 				// will be retried on the next poll.
 				glog.V(2).Infof("resize patch transient error for pod=%s/%s: %v",
 					pod.Namespace, pod.Name, patchErr)
 				continue
-			} else if apierrors.IsInvalid(patchErr) {
-				// The patch was rejected (e.g. malformed or violates a constraint).
-				// Treat as transient — skip and retry on next poll.
-				glog.V(2).Infof("resize patch rejected (invalid) for pod=%s/%s: %v",
-					pod.Namespace, pod.Name, patchErr)
-				continue
 			} else {
 				glog.Errorf("resize patch error for pod=%s/%s: %v",
 					pod.Namespace, pod.Name, patchErr)
-				result.Errors++
+
+				status := resizeStatusInfeasible
+				accountNotResized(ctx, pod, status, now, mode, fallback, selfHealing,
+					ensureTemplate, &evictedThisCycle, &result, tracker, client)
 				continue
 			}
 		} else {
