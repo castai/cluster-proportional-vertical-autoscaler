@@ -21,7 +21,7 @@ Usage of cluster-proportional-vertical-autoscaler:
       --log-dir="": If non-empty, write log files in this directory
       --logtostderr[=false]: log to standard error instead of files
       --namespace="": The Namespace of the --target. Defaults to ${MY_NAMESPACE}.
-      --poll-period-seconds=10: The period, in seconds, to poll cluster size and perform autoscaling.
+      --poll-period-seconds=10: The period, in seconds, to poll cluster size and perform autoscaling. In InPlace modes it also bounds a single resize cycle; autoscaler resumes on the next poll if a cycle can't finish in time.
       --stderrthreshold=2: logs at or above this threshold go to stderr
       --target="": Target to scale. In format: deployment/*, replicaset/* or daemonset/* (not case sensitive).
       --v=0: log level for V logs
@@ -207,6 +207,8 @@ This grants:
 - `--resize-mode=InPlaceOrRecreate`: like `InPlace`, but pods that fail to resize (kubelet reports `Infeasible` or `Deferred`, or the resize stays in progress) for longer than `--resize-fallback-grace-period` are recreated at the new size. How they're recreated depends on the target: for Deployments and `RollingUpdate` DaemonSets cpvpa patches the template and lets the controller perform its normal rolling update — which recreates **all** of the workload's pods, paced by `maxUnavailable`/PodDisruptionBudgets, not just the stuck ones; for bare ReplicaSets and `OnDelete` DaemonSets cpvpa deletes the stuck pods directly so the controller recreates them.
 
 Both `InPlace` and `InPlaceOrRecreate` need the in-place RBAC add-on.
+
+In the in-place modes, `--poll-period-seconds` also bounds how long one resize cycle may run: cpvpa tries to resize every matching pod within a single poll period and resumes on the next poll if it can't finish. Already-resized pods are skipped without any API calls, so large workloads converge over a few cycles. For very large workloads, raise the poll period rather than expecting a single cycle to process everything.
 
 ### Flags
 

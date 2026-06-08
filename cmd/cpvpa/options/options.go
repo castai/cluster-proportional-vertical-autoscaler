@@ -68,7 +68,7 @@ func (c *AutoScalerConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&c.Namespace, "namespace", c.Namespace, "The Namespace of the --target. Defaults to ${MY_NAMESPACE}.")
 	fs.StringVar(&c.DefaultConfig, "default-config", c.DefaultConfig, "The default configuration (in JSON format).")
 	fs.StringVar(&c.ConfigFile, "config-file", c.ConfigFile, "A config file (in JSON format), which overrides the --default-config.")
-	fs.IntVar(&c.PollPeriodSeconds, "poll-period-seconds", c.PollPeriodSeconds, "The period, in seconds, to poll cluster size and perform autoscaling.")
+	fs.IntVar(&c.PollPeriodSeconds, "poll-period-seconds", c.PollPeriodSeconds, "The period, in seconds, to poll cluster size and perform autoscaling. In InPlace modes it also bounds a single resize cycle; autoscaler resumes on the next poll if a cycle can't finish in time.")
 	fs.StringVar(&c.Kubeconfig, "kubeconfig", c.Kubeconfig, "Path to a kubeconfig. Only required if running out-of-cluster.")
 	fs.BoolVar(&c.PrintVer, "version", c.PrintVer, "Print the version and exit.")
 	fs.BoolVar(&c.DryRun, "dry-run", c.DryRun, "Calculate updates for a target but do not apply them.")
