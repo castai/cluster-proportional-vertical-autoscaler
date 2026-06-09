@@ -85,6 +85,7 @@ type resizeResult struct {
 	InProgress        int // kubelet has accepted and is applying
 	Deferred          int // kubelet says: not now, maybe later (node pressure)
 	Infeasible        int // kubelet says: never on this node
+	ActuationLag      int // kubelet reported resources but they differ from desired
 	Evicted           int // pods cpvpa deleted directly (bare RS / OnDelete DS fallback)
 	RecreateTriggered int // pods handed to the controller's rollout via a template patch
 	Transient         int // transient errors (404 NotFound, 409 Conflict) per pod
@@ -149,8 +150,20 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 		patchBody, needsPatch := buildResizePatch(pod, desired)
 		if !needsPatch {
 			if status := classifyResize(pod); status == resizeStatusOK {
-				result.AlreadyOK++
-				r.tracker.clear(pod.UID)
+				switch actuationState(pod, desired) {
+				case actuationConfirmed:
+					result.AlreadyOK++
+					r.tracker.clear(pod.UID)
+				case actuationMismatch:
+					result.ActuationLag++
+					firstSeen := r.tracker.markNotResized(pod.UID, now)
+					age := now.Sub(firstSeen)
+					glog.V(2).Infof("pod=%s/%s actuation mismatch (not resized for %s)", pod.Namespace, pod.Name, age)
+					r.maybeFallbackEvict(ctx, pod, age, selfHealing, ensureTemplate, &evictedThisCycle, &result)
+				case actuationUnknown:
+					glog.Warningf("actuation unknown for pod=%s/%s: kubelet has not reported container resources", pod.Namespace, pod.Name)
+					r.tracker.clear(pod.UID)
+				}
 			} else {
 				r.accountNotResized(ctx, pod, status, now, selfHealing, ensureTemplate, &evictedThisCycle, &result)
 			}
@@ -193,7 +206,19 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 		}
 
 		if status := classifyResize(updated); status == resizeStatusOK {
-			r.tracker.clear(updated.UID)
+			switch actuationState(updated, desired) {
+			case actuationConfirmed:
+				r.tracker.clear(updated.UID)
+			case actuationMismatch:
+				result.ActuationLag++
+				firstSeen := r.tracker.markNotResized(updated.UID, now)
+				age := now.Sub(firstSeen)
+				glog.V(2).Infof("pod=%s/%s actuation mismatch (not resized for %s)", updated.Namespace, updated.Name, age)
+				r.maybeFallbackEvict(ctx, updated, age, selfHealing, ensureTemplate, &evictedThisCycle, &result)
+			case actuationUnknown:
+				glog.Warningf("actuation unknown for pod=%s/%s: kubelet has not reported container resources", updated.Namespace, updated.Name)
+				r.tracker.clear(updated.UID)
+			}
 		} else {
 			r.accountNotResized(ctx, updated, status, now, selfHealing,
 				ensureTemplate, &evictedThisCycle, &result)
@@ -439,6 +464,41 @@ func classifyResize(pod *v1.Pod) resizeStatus {
 		return resizeStatusInProgress
 	}
 	return resizeStatusOK
+}
+
+// actuation describes whether the kubelet has actually enacted the desired
+// resources on the running containers.
+type actuation int
+
+const (
+	actuationConfirmed actuation = iota // status matches desired for all managed, running containers
+	actuationMismatch                   // kubelet reported resources and they differ from desired
+	actuationUnknown                    // kubelet has not reported (cs.Resources == nil)
+)
+
+// actuationState inspects containerStatuses[].Resources to verify that the
+// kubelet has actuated the desired resize. A container that has not started
+// yet or is not managed by cpvpa is ignored.
+func actuationState(pod *v1.Pod, desired map[string]v1.ResourceRequirements) actuation {
+	sawUnknown := false
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		want, managed := desired[cs.Name]
+		if !managed || cs.State.Running == nil {
+			continue // not started yet: spec applies at container start
+		}
+		if cs.Resources == nil {
+			sawUnknown = true
+			continue
+		}
+		if !resourcesSatisfied(*cs.Resources, want) {
+			return actuationMismatch
+		}
+	}
+	if sawUnknown {
+		return actuationUnknown
+	}
+	return actuationConfirmed
 }
 
 // EnsureResizeSubresource checks that the cluster supports the pods/resize

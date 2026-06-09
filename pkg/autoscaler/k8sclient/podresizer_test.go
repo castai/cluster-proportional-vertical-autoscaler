@@ -1448,3 +1448,128 @@ func TestResizeRunningPods_DryRunNoFallbackDelete(t *testing.T) {
 		t.Errorf("expected pod-a tracker entry to be retained in dry-run")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// actuationState unit tests
+// ---------------------------------------------------------------------------
+
+func TestActuationState_Confirmed(t *testing.T) {
+	res := reqs(t, "100m", "128Mi")
+	pod := makePod("pod-a", v1.PodRunning, nil, res)
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name:    "main",
+		State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Resources: &res,
+	}}
+	if got := actuationState(&pod, map[string]v1.ResourceRequirements{"main": res}); got != actuationConfirmed {
+		t.Errorf("actuationState = %d, want actuationConfirmed", got)
+	}
+}
+
+func TestActuationState_Mismatch(t *testing.T) {
+	oldRes := reqs(t, "50m", "128Mi")
+	newRes := reqs(t, "100m", "128Mi")
+	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name:    "main",
+		State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Resources: &oldRes,
+	}}
+	if got := actuationState(&pod, map[string]v1.ResourceRequirements{"main": newRes}); got != actuationMismatch {
+		t.Errorf("actuationState = %d, want actuationMismatch", got)
+	}
+}
+
+func TestActuationState_NilUnknown(t *testing.T) {
+	res := reqs(t, "100m", "128Mi")
+	pod := makePod("pod-a", v1.PodRunning, nil, res)
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name:    "main",
+		State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Resources: nil,
+	}}
+	if got := actuationState(&pod, map[string]v1.ResourceRequirements{"main": res}); got != actuationUnknown {
+		t.Errorf("actuationState = %d, want actuationUnknown", got)
+	}
+}
+
+func TestActuationState_NotRunning(t *testing.T) {
+	res := reqs(t, "100m", "128Mi")
+	pod := makePod("pod-a", v1.PodRunning, nil, res)
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name:    "main",
+		State:   v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}},
+		Resources: nil,
+	}}
+	if got := actuationState(&pod, map[string]v1.ResourceRequirements{"main": res}); got != actuationConfirmed {
+		t.Errorf("actuationState = %d, want actuationConfirmed (not-running container is ignored)", got)
+	}
+}
+
+func TestActuationState_Unmanaged(t *testing.T) {
+	res := reqs(t, "100m", "128Mi")
+	pod := makePod("pod-a", v1.PodRunning, nil, res)
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name:    "sidecar",
+		State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Resources: nil,
+	}}
+	if got := actuationState(&pod, map[string]v1.ResourceRequirements{"main": res}); got != actuationConfirmed {
+		t.Errorf("actuationState = %d, want actuationConfirmed (unmanaged container is ignored)", got)
+	}
+}
+
+// TestResizeRunningPods_ActuationMismatch triggers the fallback path when the
+// kubelet reports stale resources (actuation mismatch) past the grace period.
+func TestResizeRunningPods_ActuationMismatch(t *testing.T) {
+	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")}}
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+
+	pod := makePod("pod-a", v1.PodRunning, nil, newRes)
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name:    "main",
+		State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Resources: &oldRes,
+	}}
+
+	deleted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
+			deleted = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+
+	// Pre-seed tracker so grace has already elapsed.
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(ctx context.Context) bool { return false },
+		false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.ActuationLag != 1 {
+		t.Errorf("ActuationLag = %d, want 1", result.ActuationLag)
+	}
+	if result.Evicted != 1 {
+		t.Errorf("Evicted = %d, want 1", result.Evicted)
+	}
+	if !deleted {
+		t.Error("pod was NOT deleted after actuation mismatch past grace")
+	}
+}
