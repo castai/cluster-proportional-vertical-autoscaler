@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/clock"
 
 	"github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/autoscaler/k8sclient"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -45,7 +46,7 @@ func TestPollAPIServer_RecreateMode(t *testing.T) {
 
 	kubeconfig := writeTempKubeconfig(t, server.URL)
 	defer os.Remove(kubeconfig)
-	client, err := k8sclient.NewK8sClient("default", "deployment/test-dep", kubeconfig, false, k8sclient.ResizeModeRecreate, k8sclient.ResizeFallbackConfig{})
+	client, err := k8sclient.NewK8sClient("default", "deployment/test-dep", kubeconfig, false, k8sclient.ResizeModeRecreate, k8sclient.ResizeFallbackConfig{}, clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NewK8sClient: %v", err)
 	}
@@ -110,7 +111,7 @@ func TestPollAPIServer_InPlaceMode(t *testing.T) {
 
 	kubeconfig := writeTempKubeconfig(t, server.URL)
 	defer os.Remove(kubeconfig)
-	client, err := k8sclient.NewK8sClient("default", "deployment/test-dep", kubeconfig, false, k8sclient.ResizeModeInPlace, k8sclient.ResizeFallbackConfig{})
+	client, err := k8sclient.NewK8sClient("default", "deployment/test-dep", kubeconfig, false, k8sclient.ResizeModeInPlace, k8sclient.ResizeFallbackConfig{}, clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NewK8sClient: %v", err)
 	}

@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/clock"
 )
 
 // ResizeMode controls how cpvpa applies resource changes to a target.
@@ -70,6 +71,7 @@ type podResizer struct {
 	resizeMode     ResizeMode
 	fallbackConfig ResizeFallbackConfig
 	dryRun         bool
+	clock          clock.PassiveClock
 
 	clientset kubernetes.Interface
 	target    resizeTarget
@@ -107,7 +109,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 
 	result.TargetPods = len(pods.Items)
 	evictedThisCycle := 0
-	now := time.Now()
+	now := r.clock.Now()
 
 	selfHealing := false
 	if r.resizeMode == ResizeModeInPlaceOrRecreate {

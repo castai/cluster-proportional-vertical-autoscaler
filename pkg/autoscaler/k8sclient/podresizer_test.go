@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/utils/clock"
 )
 
 // ---------------------------------------------------------------------------
@@ -383,6 +384,7 @@ func resizeWithFakeTarget(
 		resizeMode:     mode,
 		fallbackConfig: fallback,
 		dryRun:         dryRun,
+		clock:          clock.RealClock{},
 		clientset:      client,
 		target:         fake,
 		tracker:        tracker,
@@ -1036,6 +1038,7 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 		resizeMode:     ResizeModeInPlaceOrRecreate,
 		fallbackConfig: fallback,
 		dryRun:         false,
+		clock:          clock.RealClock{},
 		clientset:      client,
 		target:         fake,
 		tracker:        tracker,
@@ -1111,6 +1114,7 @@ func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 		resizeMode:     ResizeModeInPlaceOrRecreate,
 		fallbackConfig: fallback,
 		dryRun:         false,
+		clock:          clock.RealClock{},
 		clientset:      client,
 		target:         fake,
 		tracker:        tracker,
@@ -1173,6 +1177,7 @@ func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 		resizeMode:     ResizeModeInPlaceOrRecreate,
 		fallbackConfig: fallback,
 		dryRun:         false,
+		clock:          clock.RealClock{},
 		clientset:      client,
 		target:         fake,
 		tracker:        tracker,
@@ -1234,6 +1239,7 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 		resizeMode:     ResizeModeInPlaceOrRecreate,
 		fallbackConfig: fallback,
 		dryRun:         false,
+		clock:          clock.RealClock{},
 		clientset:      client,
 		target:         fake,
 		tracker:        tracker,
@@ -1297,6 +1303,7 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 		resizeMode:     ResizeModeInPlace,
 		fallbackConfig: ResizeFallbackConfig{},
 		dryRun:         false,
+		clock:          clock.RealClock{},
 		clientset:      client,
 		target:         fake,
 		tracker:        tracker,
