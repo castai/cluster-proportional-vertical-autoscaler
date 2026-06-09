@@ -40,9 +40,11 @@ const (
 	// and let the workload controller roll the pods. Always safe.
 	ResizeModeRecreate ResizeMode = "Recreate"
 
-	// ResizeModeInPlace patches the PodTemplate AND each live pod via the
-	// /resize subresource. Pods whose resize is Deferred or Infeasible are
-	// left as-is (they will be retried on the next poll cycle).
+	// ResizeModeInPlace resizes each live pod via the /resize subresource and
+	// deliberately does NOT patch the PodTemplate (patching it would bump the
+	// pod-template-hash and make the controller roll the pods). Newly created
+	// pods start at the stale template size and converge on a later poll. Pods
+	// whose resize is Deferred or Infeasible are retried on the next cycle.
 	ResizeModeInPlace ResizeMode = "InPlace"
 
 	// ResizeModeInPlaceOrRecreate behaves like InPlace, but when a pod's
@@ -180,10 +182,12 @@ func resizeRunningPods(
 
 	// UIDs seen this cycle, used to prune stale tracker entries at the end.
 	live := make(map[types.UID]bool, len(pods.Items))
+	for i := range pods.Items {
+		live[pods.Items[i].UID] = true
+	}
 
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		live[pod.UID] = true
 
 		// A slow pod must not starve the rest. If the per-cycle deadline is
 		// hit, stop cleanly; remaining pods (and any partial failure) are
@@ -237,14 +241,17 @@ func resizeRunningPods(
 			if apierrors.IsNotFound(patchErr) || apierrors.IsConflict(patchErr) {
 				glog.V(2).Infof("resize patch transient error for pod=%s/%s: %v",
 					pod.Namespace, pod.Name, patchErr)
-			} else {
-				glog.Errorf("resize patch error for pod=%s/%s: %v",
-					pod.Namespace, pod.Name, patchErr)
-
-				status := resizeStatusInfeasible
-				accountNotResized(ctx, pod, status, now, mode, fallback, selfHealing,
-					ensureTemplate, &evictedThisCycle, &result, tracker, client)
+				continue
 			}
+			if apierrors.IsInvalid(patchErr) {
+				glog.V(2).Infof("resize rejected as invalid for pod=%s/%s (e.g. QoS class change); routing to fallback: %v",
+					pod.Namespace, pod.Name, patchErr)
+				accountNotResized(ctx, pod, resizeStatusInfeasible, now, mode, fallback, selfHealing,
+					ensureTemplate, &evictedThisCycle, &result, tracker, client)
+				continue
+			}
+			glog.Errorf("resize patch error for pod=%s/%s: %v",
+				pod.Namespace, pod.Name, patchErr)
 			continue
 		} else {
 			result.Applied++
@@ -366,6 +373,13 @@ func maybeFallbackEvict(
 // intentionally do not call the eviction subresource in V1 — that would
 // require PDB handling, 429/retry-after logic, etc. The user opts into
 // this mode knowing pods may be deleted; MaxPodsPerCycle is their throttle.
+// deleteForFallback deletes a pod so its (non-self-healing) controller recreates
+// it at the new size. NOTE: this is a raw Delete, not an eviction, so it does NOT
+// honor PodDisruptionBudgets. It only runs for non-self-healing targets (bare
+// ReplicaSets and OnDelete DaemonSets) — self-healing controllers are handled by
+// a paced template rollout instead — and is throttled by the fallback
+// max-pods-per-cycle. Migrating to the eviction subresource (PolicyV1().Evictions)
+// to respect PDBs is a possible future enhancement.
 func deleteForFallback(ctx context.Context, client kubernetes.Interface, pod *v1.Pod) error {
 	grace := int64(30)
 	if pod.Spec.TerminationGracePeriodSeconds != nil {
