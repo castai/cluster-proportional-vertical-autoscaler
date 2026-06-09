@@ -184,10 +184,10 @@ type targetClient struct {
 // newTargetClient builds a targetClient from a targetSpec and its dependencies.
 func newTargetClient(spec targetSpec, clientset kubernetes.Interface, dryRun bool) *targetClient {
 	return &targetClient{
-		spec:     spec,
+		spec:      spec,
 		clientset: clientset,
-		patcher:  spec.patcher,
-		dryRun:   dryRun,
+		patcher:   spec.patcher,
+		dryRun:    dryRun,
 	}
 }
 
