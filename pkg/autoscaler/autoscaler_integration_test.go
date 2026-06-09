@@ -9,6 +9,7 @@ package autoscaler
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	apiv1 "k8s.io/api/core/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -251,7 +252,7 @@ func newMockAPIServer(t *testing.T, cfg mockServerConfig) *httptest.Server {
 						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "test"}},
 						Spec: apiv1.PodSpec{
 							Containers: []apiv1.Container{{
-								Name:  "main",
+								Name: "main",
 								Resources: apiv1.ResourceRequirements{
 									Requests: apiv1.ResourceList{
 										apiv1.ResourceCPU: resource.MustParse("10m"),
@@ -275,8 +276,10 @@ func newMockAPIServer(t *testing.T, cfg mockServerConfig) *httptest.Server {
 				*cfg.deploymentPatched = true
 			}
 			if cfg.deploymentPatchBuf != nil {
-				body := make([]byte, req.ContentLength)
-				req.Body.Read(body)
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Errorf("read deployment patch body: %v", err)
+				}
 				*cfg.deploymentPatchBuf = body
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -292,7 +295,7 @@ func newMockAPIServer(t *testing.T, cfg mockServerConfig) *httptest.Server {
 					{
 						ObjectMeta: metav1.ObjectMeta{
 							Name: "test-dep-abc", Namespace: "default",
-							UID: types.UID("pod-1"),
+							UID:    types.UID("pod-1"),
 							Labels: map[string]string{"app": "test"},
 						},
 						Spec: apiv1.PodSpec{
