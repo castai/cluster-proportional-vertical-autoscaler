@@ -179,6 +179,8 @@ type targetClient struct {
 
 	cachedSelector      labels.Selector
 	cachedIsSelfHealing *bool
+	cachedUID           types.UID
+	cachedRSUIDs        map[types.UID]bool // Deployment only: UIDs of ReplicaSets owned by the Deployment
 }
 
 // newTargetClient builds a targetClient from a targetSpec and its dependencies.
@@ -209,7 +211,93 @@ func (t *targetClient) GetPodSelector(ctx context.Context) (labels.Selector, err
 	}
 
 	t.cachedSelector = selector
+	t.cachedRSUIDs = nil // begin every cycle with fresh RS ownership data
 	return selector, nil
+}
+
+// OwnsPod reports whether the given pod is owned by this target workload.
+// For ReplicaSet and DaemonSet targets it checks the pod's controller
+// ownerRef UID against the target object's UID. For Deployment targets it
+// checks whether the pod's controller ownerRef UID belongs to a ReplicaSet
+// that is itself owned by the target Deployment.
+func (t *targetClient) OwnsPod(ctx context.Context, pod *v1.Pod) (bool, error) {
+	ctrl := metav1.GetControllerOf(pod)
+	if ctrl == nil {
+		return false, nil
+	}
+
+	switch strings.ToLower(t.spec.Kind) {
+	case "replicaset", "daemonset":
+		uid, err := t.getTargetUID(ctx)
+		if err != nil {
+			return false, err
+		}
+		return ctrl.UID == uid, nil
+	case "deployment":
+		rsUIDs, err := t.getDeploymentRSUIDs(ctx)
+		if err != nil {
+			return false, err
+		}
+		return rsUIDs[ctrl.UID], nil
+	default:
+		return false, fmt.Errorf("unknown target kind: %s", t.spec.Kind)
+	}
+}
+
+// getTargetUID fetches and caches the target object's UID.
+func (t *targetClient) getTargetUID(ctx context.Context) (types.UID, error) {
+	if t.cachedUID != "" {
+		return t.cachedUID, nil
+	}
+	var uid types.UID
+	switch strings.ToLower(t.spec.Kind) {
+	case "replicaset":
+		rs, err := t.clientset.AppsV1().ReplicaSets(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
+		if err != nil {
+			return "", err
+		}
+		uid = rs.UID
+	case "daemonset":
+		ds, err := t.clientset.AppsV1().DaemonSets(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
+		if err != nil {
+			return "", err
+		}
+		uid = ds.UID
+	default:
+		return "", fmt.Errorf("getTargetUID not implemented for kind: %s", t.spec.Kind)
+	}
+	t.cachedUID = uid
+	return uid, nil
+}
+
+// getDeploymentRSUIDs lists ReplicaSets matching the Deployment's selector and
+// builds a set of UIDs for those owned by the Deployment.
+func (t *targetClient) getDeploymentRSUIDs(ctx context.Context) (map[types.UID]bool, error) {
+	if t.cachedRSUIDs != nil {
+		return t.cachedRSUIDs, nil
+	}
+	dep, err := t.clientset.AppsV1().Deployments(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	selector, err := metav1.LabelSelectorAsSelector(dep.Spec.Selector)
+	if err != nil {
+		return nil, err
+	}
+	rsList, err := t.clientset.AppsV1().ReplicaSets(t.spec.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	t.cachedRSUIDs = make(map[types.UID]bool)
+	for i := range rsList.Items {
+		rs := &rsList.Items[i]
+		if owner := metav1.GetControllerOf(rs); owner != nil && owner.UID == dep.UID {
+			t.cachedRSUIDs[rs.UID] = true
+		}
+	}
+	return t.cachedRSUIDs, nil
 }
 
 // getPodSelector fetches the pod selector for the target workload.

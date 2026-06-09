@@ -73,6 +73,7 @@ type resizeTarget interface {
 	IsSelfHealing(ctx context.Context) bool
 	PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) error
 	Namespace() string
+	OwnsPod(ctx context.Context, pod *v1.Pod) (bool, error)
 }
 
 // podResizer orchestrates in-place pod resizing and recreation fallback.
@@ -89,7 +90,7 @@ type podResizer struct {
 }
 
 type resizeResult struct {
-	TargetPods        int // pods owned by the target that we considered
+	TargetPods        int // pods matching the selector that we considered
 	AlreadyOK         int // pods already at the desired resources
 	Applied           int // /resize patches accepted by the API server
 	InProgress        int // kubelet has accepted and is applying
@@ -99,6 +100,7 @@ type resizeResult struct {
 	Evicted           int // pods cpvpa evicted or deleted (fallback)
 	RecreateTriggered int // pods handed to the controller's rollout via a template patch
 	EvictionBlocked   int // pods whose eviction was blocked by PDB
+	SkippedNotOwned   int // pods matching selector but owned by another workload
 	Transient         int // transient errors (404 NotFound, 409 Conflict) per pod
 	Errors            int // any other unexpected error per pod
 }
@@ -155,6 +157,18 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 		}
 
 		if (pod.Status.Phase != v1.PodRunning && pod.Status.Phase != v1.PodPending) || pod.DeletionTimestamp != nil {
+			continue
+		}
+
+		owns, err := r.target.OwnsPod(ctx, pod)
+		if err != nil {
+			glog.Warningf("ownership check failed for pod=%s/%s: %v", pod.Namespace, pod.Name, err)
+			result.Errors++
+			continue
+		}
+		if !owns {
+			glog.Warningf("skipping pod=%s/%s: not owned by target in namespace %s", pod.Namespace, pod.Name, r.target.Namespace())
+			result.SkippedNotOwned++
 			continue
 		}
 
