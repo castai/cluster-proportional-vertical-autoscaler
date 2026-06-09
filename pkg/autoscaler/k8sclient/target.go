@@ -196,49 +196,50 @@ func (t *targetClient) Namespace() string {
 	return t.spec.Namespace
 }
 
-// GetPodSelector returns the label selector for the target workload. The
-// result is cached because selectors are immutable for Deployment, DaemonSet,
-// and ReplicaSet, so the cache never needs invalidation within a process
-// lifetime.
+// GetPodSelector returns the pod selector for the target workload.
 func (t *targetClient) GetPodSelector(ctx context.Context) (labels.Selector, error) {
-	if t.cachedSelector != nil {
-		return t.cachedSelector, nil
-	}
-	selectorStr, err := t.getTargetSelector(ctx)
+	selector, err := t.getPodSelector(ctx)
 	if err != nil {
+		if t.cachedSelector != nil {
+			glog.V(2).Infof("get pod selector: %s/%s: %v; using cached value (%s)",
+				t.spec.Namespace, t.spec.Name, err, t.cachedSelector)
+			return t.cachedSelector, nil
+		}
 		return nil, err
 	}
-	selector, err := labels.Parse(selectorStr)
-	if err != nil {
-		return nil, err
-	}
+
 	t.cachedSelector = selector
 	return selector, nil
 }
 
-// getTargetSelector returns the raw selector string for the target workload.
-func (t *targetClient) getTargetSelector(ctx context.Context) (string, error) {
+// getPodSelector fetches the pod selector for the target workload.
+func (t *targetClient) getPodSelector(ctx context.Context) (labels.Selector, error) {
+	var selector *metav1.LabelSelector
+
 	switch strings.ToLower(t.spec.Kind) {
 	case "deployment":
 		dep, err := t.clientset.AppsV1().Deployments(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return metav1.FormatLabelSelector(dep.Spec.Selector), nil
+		selector = dep.Spec.Selector
 	case "daemonset":
 		ds, err := t.clientset.AppsV1().DaemonSets(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return metav1.FormatLabelSelector(ds.Spec.Selector), nil
+		selector = ds.Spec.Selector
 	case "replicaset":
 		rs, err := t.clientset.AppsV1().ReplicaSets(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return metav1.FormatLabelSelector(rs.Spec.Selector), nil
+		selector = rs.Spec.Selector
+	default:
+		return nil, fmt.Errorf("unknown target kind: %s", t.spec.Kind)
 	}
-	return "", fmt.Errorf("unknown target kind: %s", t.spec.Kind)
+
+	return metav1.LabelSelectorAsSelector(selector)
 }
 
 // IsSelfHealing reports whether the target controller recreates its pods on

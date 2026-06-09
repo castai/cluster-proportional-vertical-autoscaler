@@ -125,7 +125,7 @@ func TestDiscoverAPI(t *testing.T) {
 	}
 }
 
-func TestGetTargetSelector(t *testing.T) {
+func TestGetPodSelector(t *testing.T) {
 	tests := []struct {
 		name       string
 		kind       string
