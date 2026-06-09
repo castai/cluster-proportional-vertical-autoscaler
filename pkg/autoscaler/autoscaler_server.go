@@ -85,24 +85,39 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 // updates the target resource with the expected replicas if necessary.
 func (s *AutoScaler) Run() {
 	ticker := s.clock.NewTicker(s.pollPeriod)
+
+	// Base context for all API work this loop performs, cancelled when the
+	// autoscaler is stopped so in-flight requests abort promptly on shutdown.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-s.stopCh
+		cancel()
+	}()
+
 	s.readyCh <- struct{}{} // For testing.
 
 	// Don't wait for ticker and execute pollAPIServer() for the first time.
-	s.pollAPIServer()
+	s.pollAPIServer(ctx)
 
 	for {
 		select {
 		case <-ticker.C():
-			s.pollAPIServer()
+			s.pollAPIServer(ctx)
 		case <-s.stopCh:
 			return
 		}
 	}
 }
 
-func (s *AutoScaler) pollAPIServer() {
+func (s *AutoScaler) pollAPIServer(ctx context.Context) {
+	// Bound one poll cycle (cluster-size read + resize) by the poll period;
+	// shutdown cancellation is inherited from the ctx passed by Run.
+	ctx, cancel := context.WithTimeout(ctx, s.pollPeriod)
+	defer cancel()
+
 	// Query the apiserver for the cluster status --- number of nodes and cores
-	clusterSize, err := s.k8sClient.GetClusterSize(context.Background())
+	clusterSize, err := s.k8sClient.GetClusterSize(ctx)
 	if err != nil {
 		glog.Errorf("Error getting cluster size: %v", err)
 		return
@@ -159,7 +174,7 @@ func (s *AutoScaler) pollAPIServer() {
 	// UpdateResources is called every cycle for the in-place modes (so newly
 	// created pods converge and stuck resizes are retried); it internally
 	// no-ops when reqsChanged is false in Recreate mode.
-	if err = s.k8sClient.UpdateResources(context.Background(), newReqs, reqsChanged); err != nil {
+	if err = s.k8sClient.UpdateResources(ctx, newReqs, reqsChanged); err != nil {
 		glog.Errorf("Update failure: %s", err)
 	} else {
 		s.lastReqs = newReqs
