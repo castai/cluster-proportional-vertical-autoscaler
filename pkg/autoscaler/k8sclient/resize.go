@@ -8,12 +8,6 @@ You may obtain a copy of the License at
     http://www.apache.org/licenses/LICENSE-2.0
 */
 
-// Package k8sclient — in-place resize extension.
-//
-// This file adds support for the /resize subresource (KEP-1287) on top of
-// the existing PodTemplate-patching behaviour. The existing UpdateResources
-// path is preserved and remains the default; in-place behaviour is opt-in
-// via ResizeMode.
 package k8sclient
 
 import (
