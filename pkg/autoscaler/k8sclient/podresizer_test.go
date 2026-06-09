@@ -1320,3 +1320,56 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 		t.Errorf("Errors = %d, want 1", result.Errors)
 	}
 }
+
+// TestResizeRunningPods_DryRunNoFallbackDelete verifies that in dry-run mode
+// an Infeasible pod past its grace period does not trigger any delete action.
+func TestResizeRunningPods_DryRunNoFallbackDelete(t *testing.T) {
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+
+	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Reason: v1.PodReasonInfeasible,
+	}}, newRes)
+
+	deleted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
+			deleted = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+
+	// Pre-seed tracker so grace has already elapsed.
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(ctx context.Context) bool { return false },
+		true) // dryRun = true
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Infeasible != 1 {
+		t.Errorf("Infeasible = %d, want 1", result.Infeasible)
+	}
+	if deleted {
+		t.Error("pod was deleted in dry-run mode")
+	}
+	// Tracker entry should still be present since we didn't actually evict.
+	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; !ok {
+		t.Errorf("expected pod-a tracker entry to be retained in dry-run")
+	}
+}

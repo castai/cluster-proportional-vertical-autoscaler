@@ -240,6 +240,11 @@ func (r *podResizer) maybeFallbackEvict(
 	if r.resizeMode != ResizeModeInPlaceOrRecreate || age < r.fallbackConfig.GracePeriod {
 		return
 	}
+	if r.dryRun {
+		glog.V(2).Infof("dry-run: would fall back (recreate/delete) pod=%s/%s (not resized for %s)",
+			pod.Namespace, pod.Name, age)
+		return
+	}
 	if !selfHeals && *evictedThisCycle >= r.fallbackConfig.MaxPodsPerCycle {
 		return
 	}
@@ -269,6 +274,9 @@ func (r *podResizer) maybeFallbackEvict(
 
 // deleteForFallback deletes a pod so its controller recreates it at the new size.
 func (r *podResizer) deleteForFallback(ctx context.Context, pod *v1.Pod) error {
+	if r.dryRun {
+		return nil
+	}
 	grace := int64(30)
 	if pod.Spec.TerminationGracePeriodSeconds != nil {
 		grace = *pod.Spec.TerminationGracePeriodSeconds
