@@ -87,6 +87,7 @@ type resizeResult struct {
 	Infeasible        int // kubelet says: never on this node
 	Evicted           int // pods cpvpa deleted directly (bare RS / OnDelete DS fallback)
 	RecreateTriggered int // pods handed to the controller's rollout via a template patch
+	Transient         int // transient errors (404 NotFound, 409 Conflict) per pod
 	Errors            int // any other unexpected error per pod
 }
 
@@ -170,8 +171,8 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 			"resize",
 		)
 		if patchErr != nil {
-			result.Errors++
 			if apierrors.IsNotFound(patchErr) || apierrors.IsConflict(patchErr) {
+				result.Transient++
 				glog.V(2).Infof("resize patch transient error for pod=%s/%s: %v",
 					pod.Namespace, pod.Name, patchErr)
 				continue
@@ -183,6 +184,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 					ensureTemplate, &evictedThisCycle, &result)
 				continue
 			}
+			result.Errors++
 			glog.Errorf("resize patch error for pod=%s/%s: %v",
 				pod.Namespace, pod.Name, patchErr)
 			continue

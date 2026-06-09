@@ -744,8 +744,11 @@ func TestResizeRunningPods_Transient404(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Errors != 1 {
-		t.Errorf("Errors = %d, want 1", result.Errors)
+	if result.Transient != 1 {
+		t.Errorf("Transient = %d, want 1", result.Transient)
+	}
+	if result.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", result.Errors)
 	}
 	if result.Applied != 0 {
 		t.Errorf("Applied = %d, want 0", result.Applied)
@@ -1336,12 +1339,59 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// pod-a's 422 is skipped (not counted as an error); pod-b still resized.
+	// pod-a's 422 is counted as Infeasible (not Errors); pod-b still resized.
 	if result.Applied != 1 {
 		t.Errorf("Applied = %d, want 1 (pod-b processed after pod-a was rejected)", result.Applied)
 	}
+	if result.Infeasible != 1 {
+		t.Errorf("Infeasible = %d, want 1 (pod-a Invalid → Infeasible)", result.Infeasible)
+	}
+	if result.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", result.Errors)
+	}
+}
+
+// TestResizeRunningPods_Unexpected500 verifies that an unclassified error
+// (e.g. 500 Internal Server Error) counts as Errors.
+func TestResizeRunningPods_Unexpected500(t *testing.T) {
+	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")}}
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+
+	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
+		func(ctx context.Context) bool { return false },
+		false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Applied != 0 {
+		t.Errorf("Applied = %d, want 0", result.Applied)
+	}
 	if result.Errors != 1 {
 		t.Errorf("Errors = %d, want 1", result.Errors)
+	}
+	if result.Transient != 0 {
+		t.Errorf("Transient = %d, want 0", result.Transient)
 	}
 }
 
