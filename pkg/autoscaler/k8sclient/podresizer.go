@@ -19,6 +19,7 @@ import (
 
 	"github.com/golang/glog"
 	v1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -59,6 +60,14 @@ type ResizeFallbackConfig struct {
 	MaxPodsPerCycle int
 }
 
+// FallbackDisruptionMethod controls how cpvpa recreates stuck pods.
+type FallbackDisruptionMethod string
+
+const (
+	FallbackDisruptionEviction FallbackDisruptionMethod = "eviction"
+	FallbackDisruptionDelete   FallbackDisruptionMethod = "delete"
+)
+
 type resizeTarget interface {
 	GetPodSelector(ctx context.Context) (labels.Selector, error)
 	IsSelfHealing(ctx context.Context) bool
@@ -68,10 +77,11 @@ type resizeTarget interface {
 
 // podResizer orchestrates in-place pod resizing and recreation fallback.
 type podResizer struct {
-	resizeMode     ResizeMode
-	fallbackConfig ResizeFallbackConfig
-	dryRun         bool
-	clock          clock.PassiveClock
+	resizeMode         ResizeMode
+	fallbackConfig     ResizeFallbackConfig
+	fallbackDisruption FallbackDisruptionMethod
+	dryRun             bool
+	clock              clock.PassiveClock
 
 	clientset kubernetes.Interface
 	target    resizeTarget
@@ -86,8 +96,9 @@ type resizeResult struct {
 	Deferred          int // kubelet says: not now, maybe later (node pressure)
 	Infeasible        int // kubelet says: never on this node
 	ActuationLag      int // kubelet reported resources but they differ from desired
-	Evicted           int // pods cpvpa deleted directly (bare RS / OnDelete DS fallback)
+	Evicted           int // pods cpvpa evicted or deleted (fallback)
 	RecreateTriggered int // pods handed to the controller's rollout via a template patch
+	EvictionBlocked   int // pods whose eviction was blocked by PDB
 	Transient         int // transient errors (404 NotFound, 409 Conflict) per pod
 	Errors            int // any other unexpected error per pod
 }
@@ -288,15 +299,61 @@ func (r *podResizer) maybeFallbackEvict(
 		r.tracker.clear(pod.UID)
 		return
 	}
-	if err := r.deleteForFallback(ctx, pod); err != nil {
-		glog.Errorf("fallback delete failed for pod=%s/%s: %v", pod.Namespace, pod.Name, err)
+	// Perform the disruption: eviction (default in production) or direct delete.
+	var err error
+	if r.fallbackDisruption == FallbackDisruptionEviction {
+		err = r.evictForFallback(ctx, pod)
+	} else {
+		err = r.deleteForFallback(ctx, pod)
+	}
+	if err != nil {
+		if apierrors.IsTooManyRequests(err) {
+			// PDB blocked the eviction. Keep the tracker entry, do NOT consume
+			// MaxPodsPerCycle budget, and record blocked count.
+			result.EvictionBlocked++
+			blockedNow := r.clock.Now()
+			firstBlocked := r.tracker.markEvictionBlocked(pod.UID, blockedNow)
+			blockedAge := blockedNow.Sub(firstBlocked)
+			if blockedAge > 3*r.fallbackConfig.GracePeriod {
+				glog.Errorf("eviction blocked for pod=%s/%s by PDB for longer than %s; manual intervention may be needed",
+					pod.Namespace, pod.Name, blockedAge)
+			} else {
+				glog.V(2).Infof("eviction blocked for pod=%s/%s by PDB (blocked for %s, will retry)",
+					pod.Namespace, pod.Name, blockedAge)
+			}
+			return
+		}
+		if apierrors.IsNotFound(err) {
+			r.tracker.clear(pod.UID)
+			return
+		}
+		glog.Errorf("fallback %s failed for pod=%s/%s: %v",
+			string(r.fallbackDisruption), pod.Namespace, pod.Name, err)
 		result.Errors++
 		return
 	}
-	glog.Infof("fallback-deleted pod=%s/%s (not resized for %s)", pod.Namespace, pod.Name, age)
+	glog.Infof("fallback-%s pod=%s/%s (not resized for %s)",
+		string(r.fallbackDisruption), pod.Namespace, pod.Name, age)
 	result.Evicted++
 	*evictedThisCycle++
 	r.tracker.clear(pod.UID)
+}
+
+// evictForFallback evicts a pod via the Eviction API so the controller
+// recreates it at the new size. The eviction honours PodDisruptionBudgets.
+func (r *podResizer) evictForFallback(ctx context.Context, pod *v1.Pod) error {
+	if r.dryRun {
+		return nil
+	}
+	eviction := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace},
+	}
+	if pod.Spec.TerminationGracePeriodSeconds != nil {
+		eviction.DeleteOptions = &metav1.DeleteOptions{
+			GracePeriodSeconds: pod.Spec.TerminationGracePeriodSeconds,
+		}
+	}
+	return r.clientset.CoreV1().Pods(pod.Namespace).EvictV1(ctx, eviction)
 }
 
 // deleteForFallback deletes a pod so its controller recreates it at the new size.
@@ -319,12 +376,16 @@ func (r *podResizer) deleteForFallback(ctx context.Context, pod *v1.Pod) error {
 // the fallback grace period to any pod that fails to resize in time. It is
 // keyed by pod UID to survive pod-name reuse on DaemonSets.
 type resizeTracker struct {
-	mu              sync.Mutex
-	notResizedSince map[types.UID]time.Time
+	mu                  sync.Mutex
+	notResizedSince     map[types.UID]time.Time
+	evictionBlockedSince map[types.UID]time.Time
 }
 
 func newResizeTracker() *resizeTracker {
-	return &resizeTracker{notResizedSince: make(map[types.UID]time.Time)}
+	return &resizeTracker{
+		notResizedSince:      make(map[types.UID]time.Time),
+		evictionBlockedSince: make(map[types.UID]time.Time),
+	}
 }
 
 // markNotResized records (once) when a pod first entered a not-yet-completed resize state and
@@ -344,6 +405,19 @@ func (t *resizeTracker) clear(uid types.UID) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.notResizedSince, uid)
+	delete(t.evictionBlockedSince, uid)
+}
+
+// markEvictionBlocked records the first time a pod's eviction was blocked
+// by a PodDisruptionBudget. Returns the timestamp (existing or new).
+func (t *resizeTracker) markEvictionBlocked(uid types.UID, now time.Time) time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if first, ok := t.evictionBlockedSince[uid]; ok {
+		return first
+	}
+	t.evictionBlockedSince[uid] = now
+	return now
 }
 
 // retain drops tracker entries for UIDs not present in live, so pods that
@@ -355,6 +429,11 @@ func (t *resizeTracker) retain(live map[types.UID]bool) {
 	for uid := range t.notResizedSince {
 		if !live[uid] {
 			delete(t.notResizedSince, uid)
+		}
+	}
+	for uid := range t.evictionBlockedSince {
+		if !live[uid] {
+			delete(t.evictionBlockedSince, uid)
 		}
 	}
 }

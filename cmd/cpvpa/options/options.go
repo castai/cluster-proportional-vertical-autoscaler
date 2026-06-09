@@ -46,6 +46,7 @@ type AutoScalerConfig struct {
 	ResizeMode                    string
 	ResizeFallbackGracePeriod     time.Duration
 	ResizeFallbackMaxPodsPerCycle int
+	ResizeFallbackDisruption      string
 }
 
 // NewAutoScalerConfig returns a Autoscaler config
@@ -59,6 +60,7 @@ func NewAutoScalerConfig() *AutoScalerConfig {
 		ResizeMode:                    "Recreate",
 		ResizeFallbackGracePeriod:     defaultResizeFallbackGracePeriod,
 		ResizeFallbackMaxPodsPerCycle: defaultResizeFallbackMaxPodsPerCycle,
+		ResizeFallbackDisruption:      "eviction",
 	}
 }
 
@@ -75,6 +77,7 @@ func (c *AutoScalerConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&c.ResizeMode, "resize-mode", c.ResizeMode, "How to apply resource changes. One of: Recreate, InPlace, InPlaceOrRecreate. Recreate is the legacy behaviour. InPlace requires Kubernetes 1.33+.")
 	fs.DurationVar(&c.ResizeFallbackGracePeriod, "resize-fallback-grace-period", c.ResizeFallbackGracePeriod, "Only used with InPlaceOrRecreate. How long a pod must continuously fail to resize (Infeasible, Deferred, or stuck in progress) before cpvpa recreates it so the controller can reschedule it at the new size.")
 	fs.IntVar(&c.ResizeFallbackMaxPodsPerCycle, "resize-fallback-max-pods-per-cycle", c.ResizeFallbackMaxPodsPerCycle, "Only used with InPlaceOrRecreate. Caps how many not-yet-resized pods cpvpa recreates (by direct delete) in a single poll cycle.")
+	fs.StringVar(&c.ResizeFallbackDisruption, "resize-fallback-disruption", c.ResizeFallbackDisruption, "Only used with InPlaceOrRecreate. How to recreate stuck pods: eviction (default, honors PDBs) or delete (ignores PDBs).")
 }
 
 // InitFlags no// WordSepNormalizeFunc changes all flags that contain "_" separators
@@ -127,9 +130,15 @@ func (c *AutoScalerConfig) ValidateFlags() error {
 		errorsFound = true
 		glog.Errorf("--resize-fallback-max-pods-per-cycle must be > 0 (got %d)", c.ResizeFallbackMaxPodsPerCycle)
 	}
+	switch c.ResizeFallbackDisruption {
+	case "eviction", "delete":
+	default:
+		errorsFound = true
+		glog.Errorf("--resize-fallback-disruption must be one of: eviction, delete (got %q)", c.ResizeFallbackDisruption)
+	}
 	if c.ResizeMode != "InPlaceOrRecreate" {
-		if c.ResizeFallbackGracePeriod != defaultResizeFallbackGracePeriod || c.ResizeFallbackMaxPodsPerCycle != defaultResizeFallbackMaxPodsPerCycle {
-			glog.Warningf("--resize-fallback-grace-period and --resize-fallback-max-pods-per-cycle are ignored when --resize-mode=%q", c.ResizeMode)
+		if c.ResizeFallbackGracePeriod != defaultResizeFallbackGracePeriod || c.ResizeFallbackMaxPodsPerCycle != defaultResizeFallbackMaxPodsPerCycle || c.ResizeFallbackDisruption != "eviction" {
+			glog.Warningf("--resize-fallback-grace-period, --resize-fallback-max-pods-per-cycle and --resize-fallback-disruption are ignored when --resize-mode=%q", c.ResizeMode)
 		}
 	}
 

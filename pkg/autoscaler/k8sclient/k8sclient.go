@@ -57,7 +57,7 @@ type k8sClient struct {
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
-func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg ResizeFallbackConfig, clk clock.PassiveClock) (K8sClient, error) {
+func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg ResizeFallbackConfig, fallbackDisruption FallbackDisruptionMethod, clk clock.PassiveClock) (K8sClient, error) {
 	var config *rest.Config
 	var err error
 	if kubeconfig != "" {
@@ -96,13 +96,14 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 	var resizer *podResizer
 	if mode != ResizeModeRecreate {
 		resizer = &podResizer{
-			resizeMode:     mode,
-			fallbackConfig: fallbackCfg,
-			dryRun:         dryRun,
-			clock:          clk,
-			clientset:      clientset,
-			target:         tc,
-			tracker:        newResizeTracker(),
+			resizeMode:         mode,
+			fallbackConfig:     fallbackCfg,
+			fallbackDisruption: fallbackDisruption,
+			dryRun:             dryRun,
+			clock:              clk,
+			clientset:          clientset,
+			target:             tc,
+			tracker:            newResizeTracker(),
 		}
 	}
 

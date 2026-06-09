@@ -67,11 +67,16 @@ rules:
   - apiGroups: [""]
     resources: ["pods/resize"]
     verbs: ["patch"]
-  # Fallback path: only needed for InPlaceOrRecreate. If you're only using
-  # InPlace, you may drop this rule.
+  # Fallback path: only needed for InPlaceOrRecreate. Uses the Eviction API
+  # by default so PodDisruptionBudgets are honoured. If you opt into
+  # --resize-fallback-disruption=delete, uncomment the pods:delete block below
+  # and drop the pods/eviction rule.
   - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["delete"]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  # - apiGroups: [""]
+  #   resources: ["pods"]
+  #   verbs: ["delete"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

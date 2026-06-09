@@ -388,7 +388,12 @@ func resizeWithFakeTarget(
 	tracker *resizeTracker,
 	selfHeals func(ctx context.Context) bool,
 	dryRun bool,
+	fallbackDisruption ...FallbackDisruptionMethod,
 ) (resizeResult, error) {
+	fd := FallbackDisruptionDelete
+	if len(fallbackDisruption) > 0 && fallbackDisruption[0] != "" {
+		fd = fallbackDisruption[0]
+	}
 	fake := &fakeResizeTarget{
 		selector:  selector,
 		namespace: namespace,
@@ -396,13 +401,14 @@ func resizeWithFakeTarget(
 		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
 	}
 	r := &podResizer{
-		resizeMode:     mode,
-		fallbackConfig: fallback,
-		dryRun:         dryRun,
-		clock:          clock.RealClock{},
-		clientset:      client,
-		target:         fake,
-		tracker:        tracker,
+		resizeMode:         mode,
+		fallbackConfig:     fallback,
+		fallbackDisruption: fd,
+		dryRun:             dryRun,
+		clock:              clock.RealClock{},
+		clientset:          client,
+		target:             fake,
+		tracker:            tracker,
 	}
 	return r.resizeRunningPods(ctx, desired)
 }
@@ -1571,5 +1577,259 @@ func TestResizeRunningPods_ActuationMismatch(t *testing.T) {
 	}
 	if !deleted {
 		t.Error("pod was NOT deleted after actuation mismatch past grace")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Eviction API unit tests (T2)
+// ---------------------------------------------------------------------------
+
+func TestResizeRunningPods_EvictionSuccess(t *testing.T) {
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+
+	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
+		Reason: v1.PodReasonInfeasible,
+	}}, newRes)
+
+	evicted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "POST" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/eviction":
+			evicted = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(ctx context.Context) bool { return false },
+		false,
+		FallbackDisruptionEviction)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Evicted != 1 {
+		t.Errorf("Evicted = %d, want 1", result.Evicted)
+	}
+	if !evicted {
+		t.Error("pod was NOT evicted")
+	}
+	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; ok {
+		t.Error("tracker entry should be cleared after successful eviction")
+	}
+}
+
+func TestResizeRunningPods_EvictionBlockedByPDB(t *testing.T) {
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+
+	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
+		Reason: v1.PodReasonInfeasible,
+	}}, newRes)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "POST" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/eviction":
+			w.WriteHeader(http.StatusTooManyRequests) // 429
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(ctx context.Context) bool { return false },
+		false,
+		FallbackDisruptionEviction)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.EvictionBlocked != 1 {
+		t.Errorf("EvictionBlocked = %d, want 1", result.EvictionBlocked)
+	}
+	if result.Evicted != 0 {
+		t.Errorf("Evicted = %d, want 0 (blocked eviction must not count)", result.Evicted)
+	}
+	if result.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", result.Errors)
+	}
+	// Tracker entry must be retained so the pod is retried next cycle.
+	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; !ok {
+		t.Error("tracker entry should be retained when eviction is blocked")
+	}
+	// Eviction blocked must NOT consume MaxPodsPerCycle budget.
+	if result.RecreateTriggered != 0 {
+		t.Errorf("RecreateTriggered = %d, want 0", result.RecreateTriggered)
+	}
+}
+
+func TestResizeRunningPods_EvictionBlockedEscalation(t *testing.T) {
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+
+	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
+		Reason: v1.PodReasonInfeasible,
+	}}, newRes)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "POST" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/eviction":
+			w.WriteHeader(http.StatusTooManyRequests) // 429
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	// Pre-seed eviction blocked time so it exceeds 3× grace (15 min).
+	tracker.evictionBlockedSince[types.UID("pod-a")] = time.Now().Add(-20 * time.Minute)
+
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(ctx context.Context) bool { return false },
+		false,
+		FallbackDisruptionEviction)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.EvictionBlocked != 1 {
+		t.Errorf("EvictionBlocked = %d, want 1", result.EvictionBlocked)
+	}
+	// Escalation logs at Errorf level but does not increment Errors.
+	if result.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", result.Errors)
+	}
+}
+
+func TestResizeRunningPods_EvictionNotFound(t *testing.T) {
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+
+	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
+		Reason: v1.PodReasonInfeasible,
+	}}, newRes)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "POST" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/eviction":
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(ctx context.Context) bool { return false },
+		false,
+		FallbackDisruptionEviction)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Evicted != 0 {
+		t.Errorf("Evicted = %d, want 0", result.Evicted)
+	}
+	if result.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", result.Errors)
+	}
+	// Tracker should be cleared because the pod is already gone.
+	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; ok {
+		t.Error("tracker entry should be cleared when pod is NotFound")
+	}
+}
+
+func TestResizeRunningPods_DeleteModeRegression(t *testing.T) {
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+
+	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
+		Reason: v1.PodReasonInfeasible,
+	}}, newRes)
+
+	deleted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
+			deleted = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
+		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(ctx context.Context) bool { return false },
+		false,
+		FallbackDisruptionDelete)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Evicted != 1 {
+		t.Errorf("Evicted = %d, want 1", result.Evicted)
+	}
+	if !deleted {
+		t.Error("pod was NOT deleted in delete mode")
 	}
 }
