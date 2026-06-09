@@ -26,8 +26,38 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// resizeTarget abstracts the target workload so podResizer can be tested
-// without a full API server. Production code passes a *targetClient.
+// ResizeMode controls how cpvpa applies resource changes to a target.
+type ResizeMode string
+
+const (
+	// ResizeModeRecreate is the legacy behaviour: patch only the PodTemplate
+	// and let the workload controller roll the pods. Always safe.
+	ResizeModeRecreate ResizeMode = "Recreate"
+
+	// ResizeModeInPlace resizes each live pod via the /resize subresource and
+	// deliberately does NOT patch the PodTemplate (patching it would bump the
+	// pod-template-hash and make the controller roll the pods). Newly created
+	// pods start at the stale template size and converge on a later poll. Pods
+	// whose resize is Deferred or Infeasible are retried on the next cycle.
+	ResizeModeInPlace ResizeMode = "InPlace"
+
+	// ResizeModeInPlaceOrRecreate behaves like InPlace, but when a pod's
+	// resize is reported as Infeasible for longer than the fallback grace
+	// period, the pod is deleted so the owning controller can recreate it
+	// (and the scheduler can place it elsewhere).
+	ResizeModeInPlaceOrRecreate ResizeMode = "InPlaceOrRecreate"
+)
+
+// ResizeFallbackConfig governs the InPlaceOrRecreate fallback path.
+type ResizeFallbackConfig struct {
+	// GracePeriod is how long a pod must remain not-resized in-place
+	// before cpvpa will patch the template and delete it.
+	GracePeriod time.Duration
+	// MaxPodsPerCycle caps how many pods cpvpa will evict in a single poll
+	// cycle, to avoid stampedes (especially on DaemonSets). Defaults to 1.
+	MaxPodsPerCycle int
+}
+
 type resizeTarget interface {
 	GetPodSelector(ctx context.Context) (labels.Selector, error)
 	IsSelfHealing(ctx context.Context) bool
@@ -35,8 +65,7 @@ type resizeTarget interface {
 	Namespace() string
 }
 
-// podResizer orchestrates in-place pod resizing and the InPlaceOrRecreate
-// fallback. It owns the resizeTracker, resize mode, and fallback config.
+// podResizer orchestrates in-place pod resizing and recreation fallback.
 type podResizer struct {
 	resizeMode     ResizeMode
 	fallbackConfig ResizeFallbackConfig
@@ -47,10 +76,22 @@ type podResizer struct {
 	tracker   *resizeTracker
 }
 
+type resizeResult struct {
+	TargetPods        int // pods owned by the target that we considered
+	AlreadyOK         int // pods already at the desired resources
+	Applied           int // /resize patches accepted by the API server
+	InProgress        int // kubelet has accepted and is applying
+	Deferred          int // kubelet says: not now, maybe later (node pressure)
+	Infeasible        int // kubelet says: never on this node
+	Evicted           int // pods cpvpa deleted directly (bare RS / OnDelete DS fallback)
+	RecreateTriggered int // pods handed to the controller's rollout via a template patch
+	Errors            int // any other unexpected error per pod
+}
+
 // resizeRunningPods enumerates pods owned by the target controller and
 // brings them to `desired` via the /resize subresource.
-func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v1.ResourceRequirements) (ResizeResult, error) {
-	var result ResizeResult
+func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v1.ResourceRequirements) (resizeResult, error) {
+	var result resizeResult
 
 	selector, err := r.target.GetPodSelector(ctx)
 	if err != nil {
@@ -168,7 +209,7 @@ func (r *podResizer) accountNotResized(
 	selfHeals bool,
 	ensureTemplate func() error,
 	evictedThisCycle *int,
-	result *ResizeResult,
+	result *resizeResult,
 ) {
 	switch status {
 	case resizeStatusInProgress:
@@ -192,7 +233,7 @@ func (r *podResizer) maybeFallbackEvict(
 	selfHeals bool,
 	ensureTemplate func() error,
 	evictedThisCycle *int,
-	result *ResizeResult,
+	result *resizeResult,
 ) {
 	if r.resizeMode != ResizeModeInPlaceOrRecreate || age < r.fallbackConfig.GracePeriod {
 		return
@@ -281,8 +322,6 @@ func (t *resizeTracker) retain(live map[types.UID]bool) {
 	}
 }
 
-// --- patch building ---
-
 // buildResizePatch produces a strategic-merge patch body that brings the
 // pod's containers to `desired`. It returns (nil, false) if nothing needs
 // to change, which lets the caller skip the API call entirely (important
@@ -342,8 +381,6 @@ func resourceListSatisfied(have, want v1.ResourceList) bool {
 	return true
 }
 
-// --- status classification ---
-
 type resizeStatus int
 
 const (
@@ -387,4 +424,26 @@ func classifyResize(pod *v1.Pod) resizeStatus {
 		return resizeStatusInProgress
 	}
 	return resizeStatusOK
+}
+
+// EnsureResizeSubresource checks that the cluster supports the pods/resize
+// subresource (Kubernetes 1.33+). Call at startup when resize mode is not
+// Recreate to fail fast with a clear message.
+//
+// Note: this checks discovery (the API server advertises the subresource),
+// but it cannot confirm the InPlacePodVerticalScaling feature gate is
+// enabled on every kubelet. As of Kubernetes 1.33 the gate is on by
+// default, so discovery presence is a sufficient signal.
+func EnsureResizeSubresource(client kubernetes.Interface) error {
+	resources, err := client.Discovery().ServerResourcesForGroupVersion("v1")
+	if err != nil {
+		return fmt.Errorf("failed to discover v1 API resources: %w", err)
+	}
+	for _, r := range resources.APIResources {
+		if r.Name == "pods/resize" {
+			return nil
+		}
+	}
+	return fmt.Errorf("cluster does not support pods/resize subresource; " +
+		"in-place pod resize requires Kubernetes 1.33+ with InPlacePodVerticalScaling enabled")
 }

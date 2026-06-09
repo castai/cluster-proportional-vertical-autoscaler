@@ -372,7 +372,7 @@ func resizeWithFakeTarget(
 	tracker *resizeTracker,
 	selfHeals func(ctx context.Context) bool,
 	dryRun bool,
-) (ResizeResult, error) {
+) (resizeResult, error) {
 	fake := &fakeResizeTarget{
 		selector:  selector,
 		namespace: namespace,

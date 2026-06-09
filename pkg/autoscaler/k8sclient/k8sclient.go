@@ -22,7 +22,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/version"
 
@@ -80,6 +79,7 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 	if err != nil {
 		return nil, err
 	}
+	tc := newTargetClient(*tgt, clientset, dryRun)
 
 	if mode == ResizeModeInPlace {
 		if err := EnsureResizeSubresource(clientset); err != nil {
@@ -91,8 +91,6 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 			mode = ResizeModeRecreate
 		}
 	}
-
-	tc := newTargetClient(*tgt, clientset, dryRun)
 
 	var resizer *podResizer
 	if mode != ResizeModeRecreate {
@@ -228,9 +226,6 @@ func (k *k8sClient) GetClusterSize(ctx context.Context) (clusterStatus *ClusterS
 }
 
 func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1.ResourceRequirements, reqsChanged bool) error {
-	// Recreate mode: the template is the delivery mechanism. Patch only when
-	// the desired values actually changed and let the workload controller
-	// perform its normal rolling replacement. Nothing else to do.
 	if k.resizeMode == ResizeModeRecreate {
 		if !reqsChanged {
 			return nil
@@ -238,8 +233,6 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 		return k.target.PatchTemplate(ctx, resources)
 	}
 
-	// In-place modes: converge running pods via /resize. The podResizer
-	// handles the dry-run guard internally.
 	result, err := k.podResizer.resizeRunningPods(ctx, resources)
 	glog.V(1).Infof("resize cycle: %+v", result)
 	if err != nil {
@@ -247,71 +240,3 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 	}
 	return nil
 }
-
-// EnsureResizeSubresource checks that the cluster supports the pods/resize
-// subresource (Kubernetes 1.33+). Call at startup when resize mode is not
-// Recreate to fail fast with a clear message.
-//
-// Note: this checks discovery (the API server advertises the subresource),
-// but it cannot confirm the InPlacePodVerticalScaling feature gate is
-// enabled on every kubelet. As of Kubernetes 1.33 the gate is on by
-// default, so discovery presence is a sufficient signal.
-func EnsureResizeSubresource(client kubernetes.Interface) error {
-	resources, err := client.Discovery().ServerResourcesForGroupVersion("v1")
-	if err != nil {
-		return fmt.Errorf("failed to discover v1 API resources: %w", err)
-	}
-	for _, r := range resources.APIResources {
-		if r.Name == "pods/resize" {
-			return nil
-		}
-	}
-	return fmt.Errorf("cluster does not support pods/resize subresource; " +
-		"in-place pod resize requires Kubernetes 1.33+ with InPlacePodVerticalScaling enabled")
-}
-
-// ResizeMode controls how cpvpa applies resource changes to a target.
-type ResizeMode string
-
-const (
-	// ResizeModeRecreate is the legacy behaviour: patch only the PodTemplate
-	// and let the workload controller roll the pods. Always safe.
-	ResizeModeRecreate ResizeMode = "Recreate"
-
-	// ResizeModeInPlace resizes each live pod via the /resize subresource and
-	// deliberately does NOT patch the PodTemplate (patching it would bump the
-	// pod-template-hash and make the controller roll the pods). Newly created
-	// pods start at the stale template size and converge on a later poll. Pods
-	// whose resize is Deferred or Infeasible are retried on the next cycle.
-	ResizeModeInPlace ResizeMode = "InPlace"
-
-	// ResizeModeInPlaceOrRecreate behaves like InPlace, but when a pod's
-	// resize is reported as Infeasible for longer than the fallback grace
-	// period, the pod is deleted so the owning controller can recreate it
-	// (and the scheduler can place it elsewhere).
-	ResizeModeInPlaceOrRecreate ResizeMode = "InPlaceOrRecreate"
-)
-
-// ResizeFallbackConfig governs the InPlaceOrRecreate fallback path.
-type ResizeFallbackConfig struct {
-	// GracePeriod is how long a pod must remain Infeasible before cpvpa
-	// will delete it. Defaults to 5 minutes.
-	GracePeriod time.Duration
-	// MaxPodsPerCycle caps how many pods cpvpa will evict in a single poll
-	// cycle, to avoid stampedes (especially on DaemonSets). Defaults to 1.
-	MaxPodsPerCycle int
-}
-
-// ResizeResult is a per-cycle summary, useful for logging and metrics.
-type ResizeResult struct {
-	TargetPods        int // pods owned by the target that we considered
-	AlreadyOK         int // pods already at the desired resources
-	Applied           int // /resize patches accepted by the API server
-	InProgress        int // kubelet has accepted and is applying
-	Deferred          int // kubelet says: not now, maybe later (node pressure)
-	Infeasible        int // kubelet says: never on this node
-	Evicted           int // pods cpvpa deleted directly (bare RS / OnDelete DS fallback)
-	RecreateTriggered int // pods handed to the controller's rollout via a template patch
-	Errors            int // any other unexpected error per pod
-}
-
