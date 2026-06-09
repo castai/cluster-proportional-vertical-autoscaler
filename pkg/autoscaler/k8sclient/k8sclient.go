@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/version"
 
@@ -267,5 +268,50 @@ func EnsureResizeSubresource(client kubernetes.Interface) error {
 	}
 	return fmt.Errorf("cluster does not support pods/resize subresource; " +
 		"in-place pod resize requires Kubernetes 1.33+ with InPlacePodVerticalScaling enabled")
+}
+
+// ResizeMode controls how cpvpa applies resource changes to a target.
+type ResizeMode string
+
+const (
+	// ResizeModeRecreate is the legacy behaviour: patch only the PodTemplate
+	// and let the workload controller roll the pods. Always safe.
+	ResizeModeRecreate ResizeMode = "Recreate"
+
+	// ResizeModeInPlace resizes each live pod via the /resize subresource and
+	// deliberately does NOT patch the PodTemplate (patching it would bump the
+	// pod-template-hash and make the controller roll the pods). Newly created
+	// pods start at the stale template size and converge on a later poll. Pods
+	// whose resize is Deferred or Infeasible are retried on the next cycle.
+	ResizeModeInPlace ResizeMode = "InPlace"
+
+	// ResizeModeInPlaceOrRecreate behaves like InPlace, but when a pod's
+	// resize is reported as Infeasible for longer than the fallback grace
+	// period, the pod is deleted so the owning controller can recreate it
+	// (and the scheduler can place it elsewhere).
+	ResizeModeInPlaceOrRecreate ResizeMode = "InPlaceOrRecreate"
+)
+
+// ResizeFallbackConfig governs the InPlaceOrRecreate fallback path.
+type ResizeFallbackConfig struct {
+	// GracePeriod is how long a pod must remain Infeasible before cpvpa
+	// will delete it. Defaults to 5 minutes.
+	GracePeriod time.Duration
+	// MaxPodsPerCycle caps how many pods cpvpa will evict in a single poll
+	// cycle, to avoid stampedes (especially on DaemonSets). Defaults to 1.
+	MaxPodsPerCycle int
+}
+
+// ResizeResult is a per-cycle summary, useful for logging and metrics.
+type ResizeResult struct {
+	TargetPods        int // pods owned by the target that we considered
+	AlreadyOK         int // pods already at the desired resources
+	Applied           int // /resize patches accepted by the API server
+	InProgress        int // kubelet has accepted and is applying
+	Deferred          int // kubelet says: not now, maybe later (node pressure)
+	Infeasible        int // kubelet says: never on this node
+	Evicted           int // pods cpvpa deleted directly (bare RS / OnDelete DS fallback)
+	RecreateTriggered int // pods handed to the controller's rollout via a template patch
+	Errors            int // any other unexpected error per pod
 }
 
