@@ -62,7 +62,6 @@ func TestPollAPIServer_RecreateMode(t *testing.T) {
 		pollPeriod:    5 * time.Second,
 		clock:         clocktesting.NewFakeClock(time.Now()),
 		stopCh:        make(chan struct{}),
-		resizeMode:    k8sclient.ResizeModeRecreate,
 	}
 
 	as.pollAPIServer(context.Background())
@@ -128,7 +127,6 @@ func TestPollAPIServer_InPlaceMode(t *testing.T) {
 		pollPeriod:    5 * time.Second,
 		clock:         clocktesting.NewFakeClock(time.Now()),
 		stopCh:        make(chan struct{}),
-		resizeMode:    k8sclient.ResizeModeInPlace,
 	}
 
 	as.pollAPIServer(context.Background())

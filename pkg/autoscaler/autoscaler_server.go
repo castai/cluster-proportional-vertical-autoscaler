@@ -48,7 +48,6 @@ type AutoScaler struct {
 	clock         clock.WithTicker
 	stopCh        chan struct{}
 	readyCh       chan<- struct{} // For testing.
-	resizeMode    k8sclient.ResizeMode
 }
 
 // NewAutoScaler returns a new AutoScaler
@@ -76,7 +75,6 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 		clock:         clock.RealClock{},
 		stopCh:        make(chan struct{}),
 		readyCh:       make(chan struct{}, 1),
-		resizeMode:    mode,
 	}, nil
 }
 
