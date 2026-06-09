@@ -185,24 +185,25 @@ func TestGetTargetSelector(t *testing.T) {
 				},
 			})
 
-			k8scli, err := newK8sClient(client, &targetSpec{
+			tgt := &targetSpec{
 				Kind:         tc.kind,
 				Name:         tc.targetName,
 				Namespace:    "default",
 				GroupVersion: "apps/v1",
-			}, false, ResizeModeRecreate, ResizeFallbackConfig{}, nil)
+			}
+			k8scli, err := newK8sClient(client, newTargetClient(*tgt, client, false), nil, ResizeModeRecreate)
 			if err != nil {
 				t.Fatalf("failed to create k8sClient: %v", err)
 			}
 
-			sel, err := k8scli.getTargetSelector(context.Background())
+			sel, err := k8scli.target.GetPodSelector(context.Background())
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
 			expected := metav1.FormatLabelSelector(tc.selector)
-			if sel != expected {
-				t.Errorf("expected selector %q, got %q", expected, sel)
+			if sel.String() != expected {
+				t.Errorf("expected selector %q, got %q", expected, sel.String())
 			}
 		})
 	}
@@ -292,11 +293,11 @@ func TestUpdateResources(t *testing.T) {
 			ContentConfig: restclient.ContentConfig{
 				GroupVersion: &schema.GroupVersion{Group: tc.kind, Version: "extensions/v1beta1"}}})
 
-		target, err := makeTarget(client, tc.target, "default")
+		tgt, err := makeTarget(client, tc.target, "default")
 		if err != nil {
 			t.Fatalf("error making target %q: %v", tc.target, err)
 		}
-		k8scli, err := newK8sClient(client, target, false, ResizeModeRecreate, ResizeFallbackConfig{}, nil)
+		k8scli, err := newK8sClient(client, newTargetClient(*tgt, client, false), nil, ResizeModeRecreate)
 		if err != nil {
 			t.Fatalf("error creating k8sClient: %v", err)
 		}

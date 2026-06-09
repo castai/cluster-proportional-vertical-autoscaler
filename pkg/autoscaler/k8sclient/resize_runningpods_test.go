@@ -3,6 +3,9 @@ Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
 */
 
 package k8sclient
@@ -25,6 +28,36 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 )
+
+// fakeResizeTarget implements the resizeTarget interface for testing.
+type fakeResizeTarget struct {
+	selector  labels.Selector
+	namespace string
+	selfHeals func(ctx context.Context) bool
+	patcher   func(resources map[string]v1.ResourceRequirements) error
+}
+
+func (f *fakeResizeTarget) GetPodSelector(ctx context.Context) (labels.Selector, error) {
+	return f.selector, nil
+}
+
+func (f *fakeResizeTarget) IsSelfHealing(ctx context.Context) bool {
+	if f.selfHeals != nil {
+		return f.selfHeals(ctx)
+	}
+	return false
+}
+
+func (f *fakeResizeTarget) PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) error {
+	if f.patcher != nil {
+		return f.patcher(resources)
+	}
+	return nil
+}
+
+func (f *fakeResizeTarget) Namespace() string {
+	return f.namespace
+}
 
 // makePod builds a pod with the given phase and resize conditions.
 func makePod(name string, phase v1.PodPhase, conditions []v1.PodCondition, ctrRes v1.ResourceRequirements) v1.Pod {
@@ -72,6 +105,35 @@ func newResizeTestClient(server *httptest.Server) clientset.Interface {
 	})
 }
 
+func resizeWithFakeTarget(
+	ctx context.Context,
+	client clientset.Interface,
+	namespace string,
+	selector labels.Selector,
+	desired map[string]v1.ResourceRequirements,
+	mode ResizeMode,
+	fallback ResizeFallbackConfig,
+	tracker *resizeTracker,
+	selfHeals func(ctx context.Context) bool,
+	dryRun bool,
+) (ResizeResult, error) {
+	fake := &fakeResizeTarget{
+		selector:  selector,
+		namespace: namespace,
+		selfHeals: selfHeals,
+		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
+	}
+	r := &podResizer{
+		resizeMode:     mode,
+		fallbackConfig: fallback,
+		dryRun:         dryRun,
+		clientset:      client,
+		target:         fake,
+		tracker:        tracker,
+	}
+	return r.resizeRunningPods(ctx, desired)
+}
+
 // TestResizeRunningPods_AllAlreadyOK verifies that when every pod already
 // matches the desired resources we get AlreadyOK == pod count.
 func TestResizeRunningPods_AllAlreadyOK(t *testing.T) {
@@ -102,8 +164,7 @@ func TestResizeRunningPods_AllAlreadyOK(t *testing.T) {
 	desired := map[string]v1.ResourceRequirements{"main": res}
 	tracker := newResizeTracker()
 
-	result, err := resizeRunningPods(context.Background(), client, "test", selector, desired, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector, desired, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -147,9 +208,8 @@ func TestResizeRunningPods_InProgress(t *testing.T) {
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -189,9 +249,8 @@ func TestResizeRunningPods_Deferred(t *testing.T) {
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -249,9 +308,8 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	tracker := newResizeTracker()
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -273,9 +331,8 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	deleted = false
-	result, err = resizeRunningPods(context.Background(), client, "test", selector,
+	result, err = resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -356,9 +413,8 @@ func TestResizeRunningPods_SkipTerminalAndDeleting(t *testing.T) {
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -402,9 +458,8 @@ func TestResizeRunningPods_Transient404(t *testing.T) {
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -460,9 +515,8 @@ func TestResizeRunningPods_MaxPodsPerCycle(t *testing.T) {
 	tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute)
 
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -511,9 +565,8 @@ func TestResizeRunningPods_NoPatchButInfeasible(t *testing.T) {
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -557,9 +610,8 @@ func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -610,9 +662,8 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 	tracker := newResizeTracker()
 
 	// First cycle: patch accepted, but no conditions yet → Applied=1.
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
+	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -634,9 +685,8 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 		Status: v1.ConditionTrue,
 	}}
 
-	result, err = resizeRunningPods(context.Background(), client, "test", selector,
+	result, err = resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
 		func(ctx context.Context) bool { return false },
 		false)
 	if err != nil {
@@ -715,11 +765,22 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 	tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute) // past grace
 
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { templatePatches++; return nil },
-		func(ctx context.Context) bool { return false },
-		false)
+	patcher := func(resources map[string]v1.ResourceRequirements) error { templatePatches++; return nil }
+	fake := &fakeResizeTarget{
+		selector:  selector,
+		namespace: "test",
+		selfHeals: func(ctx context.Context) bool { return false },
+		patcher:   patcher,
+	}
+	r := &podResizer{
+		resizeMode:     ResizeModeInPlaceOrRecreate,
+		fallbackConfig: fallback,
+		dryRun:         false,
+		clientset:      client,
+		target:         fake,
+		tracker:        tracker,
+	}
+	result, err := r.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -779,11 +840,22 @@ func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
-		func(ctx context.Context) bool { return true }, // Deployment / RollingUpdate DS
-		false)
+	patcher := func(resources map[string]v1.ResourceRequirements) error { return nil }
+	fake := &fakeResizeTarget{
+		selector:  selector,
+		namespace: "test",
+		selfHeals: func(ctx context.Context) bool { return true }, // Deployment / RollingUpdate DS
+		patcher:   patcher,
+	}
+	r := &podResizer{
+		resizeMode:     ResizeModeInPlaceOrRecreate,
+		fallbackConfig: fallback,
+		dryRun:         false,
+		clientset:      client,
+		target:         fake,
+		tracker:        tracker,
+	}
+	result, err := r.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -830,11 +902,22 @@ func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute) // past grace
 
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { templatePatches++; return nil },
-		func(ctx context.Context) bool { return false },
-		false)
+	patcher := func(resources map[string]v1.ResourceRequirements) error { templatePatches++; return nil }
+	fake := &fakeResizeTarget{
+		selector:  selector,
+		namespace: "test",
+		selfHeals: func(ctx context.Context) bool { return false },
+		patcher:   patcher,
+	}
+	resizer := &podResizer{
+		resizeMode:     ResizeModeInPlaceOrRecreate,
+		fallbackConfig: fallback,
+		dryRun:         false,
+		clientset:      client,
+		target:         fake,
+		tracker:        tracker,
+	}
+	result, err := resizer.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -881,11 +964,21 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 	tracker := newResizeTracker() // not pre-seeded: first time seen, age ~0
 
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
-		func(ctx context.Context) bool { return false },
-		false)
+	fake := &fakeResizeTarget{
+		selector:  selector,
+		namespace: "test",
+		selfHeals: func(ctx context.Context) bool { return false },
+		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
+	}
+	resizer := &podResizer{
+		resizeMode:     ResizeModeInPlaceOrRecreate,
+		fallbackConfig: fallback,
+		dryRun:         false,
+		clientset:      client,
+		target:         fake,
+		tracker:        tracker,
+	}
+	result, err := resizer.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -934,11 +1027,21 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
 
-	result, err := resizeRunningPods(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(resources map[string]v1.ResourceRequirements) error { return nil },
-		func(ctx context.Context) bool { return false },
-		false)
+	fake := &fakeResizeTarget{
+		selector:  selector,
+		namespace: "test",
+		selfHeals: func(ctx context.Context) bool { return false },
+		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
+	}
+	resizer := &podResizer{
+		resizeMode:     ResizeModeInPlace,
+		fallbackConfig: ResizeFallbackConfig{},
+		dryRun:         false,
+		clientset:      client,
+		target:         fake,
+		tracker:        tracker,
+	}
+	result, err := resizer.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
