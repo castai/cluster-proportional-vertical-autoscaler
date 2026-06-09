@@ -58,7 +58,7 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 		GracePeriod:     c.ResizeFallbackGracePeriod,
 		MaxPodsPerCycle: c.ResizeFallbackMaxPodsPerCycle,
 	}
-	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun, mode, fallbackCfg, time.Second*time.Duration(c.PollPeriodSeconds))
+	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun, mode, fallbackCfg)
 	if err != nil {
 		return nil, err
 	}

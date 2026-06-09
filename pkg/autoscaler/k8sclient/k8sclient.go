@@ -23,7 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/version"
 
@@ -62,12 +61,11 @@ type k8sClient struct {
 	tracker        *resizeTracker
 
 	cachedSelector labels.Selector
-	pollPeriod     time.Duration
 	dsSelfHeals    *bool // cached DaemonSet self-heal result; nil until first successful read
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
-func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg ResizeFallbackConfig, pollPeriod time.Duration) (K8sClient, error) {
+func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg ResizeFallbackConfig) (K8sClient, error) {
 	var config *rest.Config
 	var err error
 	if kubeconfig != "" {
@@ -392,15 +390,6 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 		glog.Infof("dry-run: would in-place resize pods of %s/%s", k.target.Kind, k.target.Name)
 		return nil
 	}
-
-	// Bound one reconcile cycle by the poll period (callers pass a real ctx;
-	// see pollAPIServer). The <=0 fallback is for direct construction in tests.
-	timeout := k.pollPeriod
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	selector, err := k.cachedSelectorOrResolve(ctx)
 	if err != nil {
