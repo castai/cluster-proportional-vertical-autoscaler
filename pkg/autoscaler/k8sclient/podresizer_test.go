@@ -166,16 +166,23 @@ func TestClassifyResize(t *testing.T) {
 		{
 			name: "pending Deferred",
 			conditions: []v1.PodCondition{{
-				Type: v1.PodResizePending, Reason: v1.PodReasonDeferred,
+				Type: v1.PodResizePending, Status: v1.ConditionTrue, Reason: v1.PodReasonDeferred,
 			}},
 			want: resizeStatusDeferred,
 		},
 		{
 			name: "pending Infeasible",
 			conditions: []v1.PodCondition{{
-				Type: v1.PodResizePending, Reason: v1.PodReasonInfeasible,
+				Type: v1.PodResizePending, Status: v1.ConditionTrue, Reason: v1.PodReasonInfeasible,
 			}},
 			want: resizeStatusInfeasible,
+		},
+		{
+			name: "pending false",
+			conditions: []v1.PodCondition{{
+				Type: v1.PodResizePending, Status: v1.ConditionFalse, Reason: v1.PodReasonDeferred,
+			}},
+			want: resizeStatusOK,
 		},
 		{
 			name: "in progress true",
@@ -195,9 +202,17 @@ func TestClassifyResize(t *testing.T) {
 			name: "pending wins over in-progress regardless of slice order",
 			conditions: []v1.PodCondition{
 				{Type: v1.PodResizeInProgress, Status: v1.ConditionTrue},
-				{Type: v1.PodResizePending, Reason: v1.PodReasonDeferred},
+				{Type: v1.PodResizePending, Status: v1.ConditionTrue, Reason: v1.PodReasonDeferred},
 			},
 			want: resizeStatusDeferred,
+		},
+		{
+			name: "pending false does not win over in-progress",
+			conditions: []v1.PodCondition{
+				{Type: v1.PodResizeInProgress, Status: v1.ConditionTrue},
+				{Type: v1.PodResizePending, Status: v1.ConditionFalse, Reason: v1.PodReasonDeferred},
+			},
+			want: resizeStatusInProgress,
 		},
 		{
 			name: "in-progress with Error reason is not InProgress",
@@ -493,6 +508,7 @@ func TestResizeRunningPods_Deferred(t *testing.T) {
 
 	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
 		Reason: v1.PodReasonDeferred,
 	}}, newRes)
 
@@ -539,6 +555,7 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
 	infeasiblePod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
 		Reason: v1.PodReasonInfeasible,
 	}}, newRes)
 
@@ -746,10 +763,12 @@ func TestResizeRunningPods_MaxPodsPerCycle(t *testing.T) {
 	// path classifies them and the fallback can fire.
 	podA := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
 		Reason: "Infeasible",
 	}}, newRes)
 	podB := makePod("pod-b", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
 		Reason: "Infeasible",
 	}}, newRes)
 
@@ -802,6 +821,7 @@ func TestResizeRunningPods_NoPatchButInfeasible(t *testing.T) {
 
 	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
 		Reason: "Infeasible",
 	}}, res)
 
@@ -977,6 +997,7 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 	// cycle — it is the "one of many" that fails to resize within the period.
 	podB := makePod("pod-b", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
 		Reason: "Infeasible",
 	}}, newRes)
 
@@ -1079,6 +1100,7 @@ func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
 	podA := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
 		Reason: "Infeasible",
 	}}, newRes)
 
@@ -1141,6 +1163,7 @@ func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 	// Spec already at desired (no-patch branch) but stuck Deferred.
 	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
 		Reason: "Deferred",
 	}}, newRes)
 
@@ -1206,6 +1229,7 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
 	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
 		Reason: "Deferred",
 	}}, newRes)
 
@@ -1328,6 +1352,7 @@ func TestResizeRunningPods_DryRunNoFallbackDelete(t *testing.T) {
 
 	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
 		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
 		Reason: v1.PodReasonInfeasible,
 	}}, newRes)
 

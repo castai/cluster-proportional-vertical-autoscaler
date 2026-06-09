@@ -420,6 +420,9 @@ func classifyResize(pod *v1.Pod) resizeStatus {
 	for _, c := range pod.Status.Conditions {
 		switch c.Type {
 		case v1.PodResizePending:
+			if c.Status != v1.ConditionTrue {
+				continue
+			}
 			if c.Reason == v1.PodReasonInfeasible {
 				return resizeStatusInfeasible
 			}
