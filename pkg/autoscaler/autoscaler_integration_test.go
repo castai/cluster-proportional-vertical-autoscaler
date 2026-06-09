@@ -8,6 +8,7 @@ you may not use this file except in compliance with the License.
 package autoscaler
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -64,7 +65,7 @@ func TestPollAPIServer_RecreateMode(t *testing.T) {
 		resizeMode:    k8sclient.ResizeModeRecreate,
 	}
 
-	as.pollAPIServer()
+	as.pollAPIServer(context.Background())
 
 	if !deployPatched {
 		t.Fatal("deployment template was NOT patched in Recreate mode")
@@ -130,7 +131,7 @@ func TestPollAPIServer_InPlaceMode(t *testing.T) {
 		resizeMode:    k8sclient.ResizeModeInPlace,
 	}
 
-	as.pollAPIServer()
+	as.pollAPIServer(context.Background())
 
 	if !resizePatched {
 		t.Fatal("running pod was not resized")
