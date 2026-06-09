@@ -63,6 +63,7 @@ type k8sClient struct {
 
 	cachedSelector labels.Selector
 	pollPeriod     time.Duration
+	dsSelfHeals    *bool // cached DaemonSet self-heal result; nil until first successful read
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
@@ -392,17 +393,13 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 		return nil
 	}
 
-	// Derive the poll timeout from the configured poll period, with a
-	// fallback for test code that constructs k8sClient directly.
-	baseCtx := ctx
-	if baseCtx == nil {
-		baseCtx = context.Background()
-	}
+	// Bound one reconcile cycle by the poll period (callers pass a real ctx;
+	// see pollAPIServer). The <=0 fallback is for direct construction in tests.
 	timeout := k.pollPeriod
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(baseCtx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	selector, err := k.cachedSelectorOrResolve(ctx)
@@ -482,15 +479,24 @@ func (k *k8sClient) targetSelfHeals(ctx context.Context) bool {
 		ds, err := k.clientset.AppsV1().DaemonSets(k.target.Namespace).
 			Get(ctx, k.target.Name, metav1.GetOptions{})
 		if err != nil {
-			// Unknown strategy: assume NOT self-healing so the fallback deletes
-			// the stuck pod directly. Assuming self-healing here would, for an
-			// OnDelete DaemonSet, patch the template and then wait forever for a
-			// rollout the controller never performs, leaving the pod stuck.
+			// On a transient failure, reuse the last known strategy if we have
+			// one rather than flipping the fallback to direct deletion.
+			if k.dsSelfHeals != nil {
+				glog.V(2).Infof("self-heal check: get daemonset %s/%s: %v; using cached value (%t)",
+					k.target.Namespace, k.target.Name, err, *k.dsSelfHeals)
+				return *k.dsSelfHeals
+			}
+			// No cached value yet: assume NOT self-healing so the fallback
+			// deletes the stuck pod directly. Assuming self-healing here would,
+			// for an OnDelete DaemonSet, patch the template and then wait forever
+			// for a rollout the controller never performs, leaving the pod stuck.
 			glog.Errorf("self-heal check: get daemonset %s/%s: %v; assuming non-self-healing (will delete pods directly)",
 				k.target.Namespace, k.target.Name, err)
 			return false
 		}
-		return ds.Spec.UpdateStrategy.Type != appsv1.OnDeleteDaemonSetStrategyType
+		selfHeals := ds.Spec.UpdateStrategy.Type != appsv1.OnDeleteDaemonSetStrategyType
+		k.dsSelfHeals = &selfHeals
+		return selfHeals
 	default: // bare ReplicaSet — not owned by a higher controller, so autoscaler deletes pods itself
 		return false
 	}
