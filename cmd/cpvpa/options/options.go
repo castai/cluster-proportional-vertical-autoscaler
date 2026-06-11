@@ -22,31 +22,43 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/spf13/pflag"
 )
 
+const (
+	defaultResizeFallbackGracePeriod     = 5 * time.Minute
+	defaultResizeFallbackMaxPodsPerCycle = 1
+)
+
 // AutoScalerConfig configures and runs an autoscaler server
 type AutoScalerConfig struct {
-	Namespace         string
-	Target            string
-	DefaultConfig     string
-	ConfigFile        string
-	PollPeriodSeconds int
-	Kubeconfig        string
-	PrintVer          bool
-	DryRun            bool
+	Namespace                     string
+	Target                        string
+	DefaultConfig                 string
+	ConfigFile                    string
+	PollPeriodSeconds             int
+	Kubeconfig                    string
+	PrintVer                      bool
+	DryRun                        bool
+	ResizeMode                    string
+	ResizeFallbackGracePeriod     time.Duration
+	ResizeFallbackMaxPodsPerCycle int
 }
 
 // NewAutoScalerConfig returns a Autoscaler config
 func NewAutoScalerConfig() *AutoScalerConfig {
 	return &AutoScalerConfig{
 		// Defaults.
-		Namespace:         os.Getenv("MY_NAMESPACE"),
-		PollPeriodSeconds: 10,
-		PrintVer:          false,
-		DryRun:            false,
+		Namespace:                     os.Getenv("MY_NAMESPACE"),
+		PollPeriodSeconds:             10,
+		PrintVer:                      false,
+		DryRun:                        false,
+		ResizeMode:                    "Recreate",
+		ResizeFallbackGracePeriod:     defaultResizeFallbackGracePeriod,
+		ResizeFallbackMaxPodsPerCycle: defaultResizeFallbackMaxPodsPerCycle,
 	}
 }
 
@@ -56,16 +68,19 @@ func (c *AutoScalerConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&c.Namespace, "namespace", c.Namespace, "The Namespace of the --target. Defaults to ${MY_NAMESPACE}.")
 	fs.StringVar(&c.DefaultConfig, "default-config", c.DefaultConfig, "The default configuration (in JSON format).")
 	fs.StringVar(&c.ConfigFile, "config-file", c.ConfigFile, "A config file (in JSON format), which overrides the --default-config.")
-	fs.IntVar(&c.PollPeriodSeconds, "poll-period-seconds", c.PollPeriodSeconds, "The period, in seconds, to poll cluster size and perform autoscaling.")
+	fs.IntVar(&c.PollPeriodSeconds, "poll-period-seconds", c.PollPeriodSeconds, "The period, in seconds, to poll cluster size and perform autoscaling. In InPlace modes it also bounds a single resize cycle; autoscaler resumes on the next poll if a cycle can't finish in time.")
 	fs.StringVar(&c.Kubeconfig, "kubeconfig", c.Kubeconfig, "Path to a kubeconfig. Only required if running out-of-cluster.")
 	fs.BoolVar(&c.PrintVer, "version", c.PrintVer, "Print the version and exit.")
-	fs.BoolVar(&c.DryRun, "dry-run", c.PrintVer, "Calulate updates for a target but does not apply the update.")
+	fs.BoolVar(&c.DryRun, "dry-run", c.DryRun, "Calculate updates for a target but do not apply them.")
+	fs.StringVar(&c.ResizeMode, "resize-mode", c.ResizeMode, "How to apply resource changes. One of: Recreate, InPlace, InPlaceOrRecreate. Recreate is the legacy behaviour. InPlace requires Kubernetes 1.33+.")
+	fs.DurationVar(&c.ResizeFallbackGracePeriod, "resize-fallback-grace-period", c.ResizeFallbackGracePeriod, "Only used with InPlaceOrRecreate. How long a pod must continuously fail to resize (Infeasible, Deferred, or stuck in progress) before cpvpa recreates it so the controller can reschedule it at the new size.")
+	fs.IntVar(&c.ResizeFallbackMaxPodsPerCycle, "resize-fallback-max-pods-per-cycle", c.ResizeFallbackMaxPodsPerCycle, "Only used with InPlaceOrRecreate. Caps how many not-yet-resized pods cpvpa recreates (by direct delete) in a single poll cycle.")
 }
 
 // InitFlags no// WordSepNormalizeFunc changes all flags that contain "_" separators
 func WordSepNormalizeFunc(f *pflag.FlagSet, name string) pflag.NormalizedName {
 	if strings.Contains(name, "_") {
-		return pflag.NormalizedName(strings.Replace(name, "_", "-", -1))
+		return pflag.NormalizedName(strings.ReplaceAll(name, "_", "-"))
 	}
 	return pflag.NormalizedName(name)
 }
@@ -96,6 +111,26 @@ func (c *AutoScalerConfig) ValidateFlags() error {
 	if c.PollPeriodSeconds < 1 {
 		errorsFound = true
 		glog.Errorf("--poll-period-seconds cannot be less than 1")
+	}
+	switch c.ResizeMode {
+	case "Recreate", "InPlace", "InPlaceOrRecreate":
+	default:
+		errorsFound = true
+		glog.Errorf("--resize-mode must be one of: Recreate, InPlace, InPlaceOrRecreate (got %q)", c.ResizeMode)
+	}
+
+	if c.ResizeFallbackGracePeriod <= 0 {
+		errorsFound = true
+		glog.Errorf("--resize-fallback-grace-period must be positive (got %v)", c.ResizeFallbackGracePeriod)
+	}
+	if c.ResizeFallbackMaxPodsPerCycle <= 0 {
+		errorsFound = true
+		glog.Errorf("--resize-fallback-max-pods-per-cycle must be > 0 (got %d)", c.ResizeFallbackMaxPodsPerCycle)
+	}
+	if c.ResizeMode != "InPlaceOrRecreate" {
+		if c.ResizeFallbackGracePeriod != defaultResizeFallbackGracePeriod || c.ResizeFallbackMaxPodsPerCycle != defaultResizeFallbackMaxPodsPerCycle {
+			glog.Warningf("--resize-fallback-grace-period and --resize-fallback-max-pods-per-cycle are ignored when --resize-mode=%q", c.ResizeMode)
+		}
 	}
 
 	// Log all sanity check errors before returning a single error string

@@ -17,9 +17,11 @@ limitations under the License.
 package k8sclient
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	apiv1 "k8s.io/api/core/v1"
@@ -123,6 +125,90 @@ func TestDiscoverAPI(t *testing.T) {
 	}
 }
 
+func TestGetPodSelector(t *testing.T) {
+	tests := []struct {
+		name       string
+		kind       string
+		targetName string
+		selector   *metav1.LabelSelector
+	}{
+		{
+			name:       "deployment",
+			kind:       "Deployment",
+			targetName: "test-dep",
+			selector:   &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+		},
+		{
+			name:       "daemonset",
+			kind:       "DaemonSet",
+			targetName: "test-ds",
+			selector:   &metav1.LabelSelector{MatchLabels: map[string]string{"app": "ds"}},
+		},
+		{
+			name:       "replicaset",
+			kind:       "ReplicaSet",
+			targetName: "test-rs",
+			selector:   &metav1.LabelSelector{MatchLabels: map[string]string{"app": "rs"}},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				var obj interface{}
+				switch req.URL.Path {
+				case "/apis/apps/v1" + "/namespaces/default/" + strings.ToLower(tc.kind) + "s/" + tc.targetName:
+					obj = map[string]interface{}{
+						"metadata": map[string]interface{}{
+							"name":      tc.targetName,
+							"namespace": "default",
+						},
+						"spec": map[string]interface{}{
+							"selector": tc.selector,
+						},
+					}
+				default:
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				output, _ := json.Marshal(obj)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				w.Write(output)
+			}))
+			defer server.Close()
+
+			client := clientset.NewForConfigOrDie(&restclient.Config{
+				Host: server.URL,
+				ContentConfig: restclient.ContentConfig{
+					GroupVersion: &schema.GroupVersion{Group: "apps", Version: "v1"},
+				},
+			})
+
+			tgt := &targetSpec{
+				Kind:         tc.kind,
+				Name:         tc.targetName,
+				Namespace:    "default",
+				GroupVersion: "apps/v1",
+			}
+			k8scli, err := newK8sClient(client, newTargetClient(*tgt, client, false), nil, ResizeModeRecreate)
+			if err != nil {
+				t.Fatalf("failed to create k8sClient: %v", err)
+			}
+
+			sel, err := k8scli.target.GetPodSelector(context.Background())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			expected := metav1.FormatLabelSelector(tc.selector)
+			if sel.String() != expected {
+				t.Errorf("expected selector %q, got %q", expected, sel.String())
+			}
+		})
+	}
+}
+
 func TestUpdateResources(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		var obj interface{}
@@ -207,13 +293,13 @@ func TestUpdateResources(t *testing.T) {
 			ContentConfig: restclient.ContentConfig{
 				GroupVersion: &schema.GroupVersion{Group: tc.kind, Version: "extensions/v1beta1"}}})
 
-		target, err := makeTarget(client, tc.target, "default")
+		tgt, err := makeTarget(client, tc.target, "default")
 		if err != nil {
 			t.Fatalf("error making target %q: %v", tc.target, err)
 		}
-		k8scli := &k8sClient{
-			clientset: client,
-			target:    target,
+		k8scli, err := newK8sClient(client, newTargetClient(*tgt, client, false), nil, ResizeModeRecreate)
+		if err != nil {
+			t.Fatalf("error creating k8sClient: %v", err)
 		}
 
 		newReqs := map[string]apiv1.ResourceRequirements{}
@@ -224,7 +310,7 @@ func TestUpdateResources(t *testing.T) {
 		r := resource.NewQuantity(0, resource.BinarySI)
 		r.SetMilli(10)
 		newReqs["thing"].Requests[apiv1.ResourceName("cpu")] = *r
-		if err := k8scli.UpdateResources(newReqs); err != nil {
+		if err := k8scli.UpdateResources(context.Background(), newReqs, true); err != nil {
 			t.Errorf("failed to update resources for target %q: %v", tc.target, err)
 		}
 	}

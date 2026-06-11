@@ -18,6 +18,7 @@ package autoscaler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -51,7 +52,13 @@ type AutoScaler struct {
 
 // NewAutoScaler returns a new AutoScaler
 func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
-	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun)
+	mode := k8sclient.ResizeMode(c.ResizeMode)
+	fallbackCfg := k8sclient.ResizeFallbackConfig{
+		GracePeriod:     c.ResizeFallbackGracePeriod,
+		MaxPodsPerCycle: c.ResizeFallbackMaxPodsPerCycle,
+	}
+	clk := clock.RealClock{}
+	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun, mode, fallbackCfg, clk)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +73,7 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 		defaultConfig: cfg,
 		configFile:    c.ConfigFile,
 		pollPeriod:    time.Second * time.Duration(c.PollPeriodSeconds),
-		clock:         clock.RealClock{},
+		clock:         clk,
 		stopCh:        make(chan struct{}),
 		readyCh:       make(chan struct{}, 1),
 	}, nil
@@ -77,24 +84,39 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 // updates the target resource with the expected replicas if necessary.
 func (s *AutoScaler) Run() {
 	ticker := s.clock.NewTicker(s.pollPeriod)
+
+	// Base context for all API work this loop performs, cancelled when the
+	// autoscaler is stopped so in-flight requests abort promptly on shutdown.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-s.stopCh
+		cancel()
+	}()
+
 	s.readyCh <- struct{}{} // For testing.
 
 	// Don't wait for ticker and execute pollAPIServer() for the first time.
-	s.pollAPIServer()
+	s.pollAPIServer(ctx)
 
 	for {
 		select {
 		case <-ticker.C():
-			s.pollAPIServer()
+			s.pollAPIServer(ctx)
 		case <-s.stopCh:
 			return
 		}
 	}
 }
 
-func (s *AutoScaler) pollAPIServer() {
+func (s *AutoScaler) pollAPIServer(ctx context.Context) {
+	// Bound one poll cycle (cluster-size read + resize) by the poll period;
+	// shutdown cancellation is inherited from the ctx passed by Run.
+	ctx, cancel := context.WithTimeout(ctx, s.pollPeriod)
+	defer cancel()
+
 	// Query the apiserver for the cluster status --- number of nodes and cores
-	clusterSize, err := s.k8sClient.GetClusterSize()
+	clusterSize, err := s.k8sClient.GetClusterSize(ctx)
 	if err != nil {
 		glog.Errorf("Error getting cluster size: %v", err)
 		return
@@ -140,15 +162,18 @@ func (s *AutoScaler) pollAPIServer() {
 			glog.V(4).Infof("Calculated %s limits[%q] = %v", ctr, res, r)
 		}
 	}
-	if reflect.DeepEqual(s.lastReqs, newReqs) {
-		return
+	reqsChanged := !reflect.DeepEqual(s.lastReqs, newReqs)
+
+	if reqsChanged {
+		glog.V(0).Infof("Updating resource for nodes: %d, cores: %d",
+			clusterSize.Nodes, clusterSize.Cores)
+		logRequirements(newReqs)
 	}
 
-	glog.V(0).Infof("Updating resource for nodes: %d, cores: %d",
-		clusterSize.Nodes, clusterSize.Cores)
-	logRequirements(newReqs)
-	// Update resource target with new resources.
-	if err = s.k8sClient.UpdateResources(newReqs); err != nil {
+	// UpdateResources is called every cycle for the in-place modes (so newly
+	// created pods converge and stuck resizes are retried); it internally
+	// no-ops when reqsChanged is false in Recreate mode.
+	if err = s.k8sClient.UpdateResources(ctx, newReqs, reqsChanged); err != nil {
 		glog.Errorf("Update failure: %s", err)
 	} else {
 		s.lastReqs = newReqs
@@ -261,22 +286,23 @@ type ContainerScaleConfig struct {
 // scaling and the by-nodes scaling, bounded by the max value.
 //
 // Example:
-//   Base = 10
-//   Max = 100
-//   Step = 2
-//   CoresPerStep = 4
-//   NodesPerStep = 2
 //
-//   The core and node counts are rounded up to the next whole step.
+//	Base = 10
+//	Max = 100
+//	Step = 2
+//	CoresPerStep = 4
+//	NodesPerStep = 2
 //
-//   If we find 64 cores and 4 nodes we get scalars of:
-//     by-cores: 10 + (2 * (round(64, 4)/4)) = 10 + 32 = 42
-//     by-nodes: 10 + (2 * (round(4, 2)/2)) = 10 + 4 = 14
-//   The larger is by-cores, and it is less than Max, so the final value is 42.
+//	The core and node counts are rounded up to the next whole step.
 //
-//   If we find 3 cores and 3 nodes we get scalars of:
-//     by-cores: 10 + (2 * (round(3, 4)/4)) = 10 + 2 = 12
-//     by-nodes: 10 + (2 * (round(3, 2)/2)) = 10 + 4 = 14
+//	If we find 64 cores and 4 nodes we get scalars of:
+//	  by-cores: 10 + (2 * (round(64, 4)/4)) = 10 + 32 = 42
+//	  by-nodes: 10 + (2 * (round(4, 2)/2)) = 10 + 4 = 14
+//	The larger is by-cores, and it is less than Max, so the final value is 42.
+//
+//	If we find 3 cores and 3 nodes we get scalars of:
+//	  by-cores: 10 + (2 * (round(3, 4)/4)) = 10 + 2 = 12
+//	  by-nodes: 10 + (2 * (round(3, 2)/2)) = 10 + 4 = 14
 type ResourceScaleConfig struct {
 	// The baseline quantity required.
 	Base *resource.Quantity

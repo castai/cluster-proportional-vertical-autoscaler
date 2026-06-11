@@ -1,0 +1,88 @@
+# RBAC-configs.yaml
+#
+# CPVPA RBAC, split by resize mode. Users running --resize-mode=Recreate
+# (the default) only need the base role. Users opting into InPlace or
+# InPlaceOrRecreate need to ALSO bind the in-place role.
+#
+# Split this way so granting pod-write to cpvpa is an explicit, opt-in
+# decision rather than a side effect of installing it.
+
+---
+# --- Base: required by all modes ---------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cpvpa
+  namespace: kube-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cpvpa
+rules:
+  # Cluster-size signal — unchanged from the existing role.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list", "watch"]
+  # Patching the workload template — also unchanged. This is what triggers
+  # the Recreate path and is what guarantees new pods come up at the right
+  # size in every mode.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "daemonsets"]
+    verbs: ["get", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cpvpa
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cpvpa
+subjects:
+  - kind: ServiceAccount
+    name: cpvpa
+    namespace: kube-system
+
+---
+# --- In-place add-on: only for InPlace / InPlaceOrRecreate -------------------
+#
+# The default `edit` ClusterRole on most distros does NOT include
+# pods/resize, so we have to grant it explicitly here. Without it,
+# the resize patch returns 403.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cpvpa-inplace
+rules:
+  # List pods owned by the target. cpvpa already knows the namespace, but
+  # the role is cluster-scoped because cpvpa may be told to target
+  # workloads in other namespaces via --namespace.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # The actual resize subresource.
+  - apiGroups: [""]
+    resources: ["pods/resize"]
+    verbs: ["patch"]
+  # Fallback path: only needed for InPlaceOrRecreate. If you're only using
+  # InPlace, you may drop this rule.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cpvpa-inplace
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cpvpa-inplace
+subjects:
+  - kind: ServiceAccount
+    name: cpvpa
+    namespace: kube-system

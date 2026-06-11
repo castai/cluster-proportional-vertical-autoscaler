@@ -76,3 +76,37 @@ func TestIsTargetFormatValid(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateFlags(t *testing.T) {
+	t.Run("valid config", func(t *testing.T) {
+		c := NewAutoScalerConfig()
+		c.Target = "deployment/thing"
+		c.Namespace = "default"
+		c.DefaultConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+		if err := c.ValidateFlags(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("invalid grace period", func(t *testing.T) {
+		c := NewAutoScalerConfig()
+		c.Target = "deployment/thing"
+		c.Namespace = "default"
+		c.DefaultConfig = `{"main":{"requests":{"cpu":{"base":"10m"}}}}`
+		c.ResizeFallbackGracePeriod = 0
+		if err := c.ValidateFlags(); err == nil {
+			t.Fatal("expected error for zero grace period")
+		}
+	})
+
+	t.Run("invalid max pods per cycle", func(t *testing.T) {
+		c := NewAutoScalerConfig()
+		c.Target = "deployment/thing"
+		c.Namespace = "default"
+		c.DefaultConfig = `{"main":{"requests":{"cpu":{"base":"10m"}}}}`
+		c.ResizeFallbackMaxPodsPerCycle = 0
+		if err := c.ValidateFlags(); err == nil {
+			t.Fatal("expected error for zero max pods per cycle")
+		}
+	})
+}
