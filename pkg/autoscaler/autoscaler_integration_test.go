@@ -46,7 +46,7 @@ func TestPollAPIServer_RecreateMode(t *testing.T) {
 
 	kubeconfig := writeTempKubeconfig(t, server.URL)
 	defer os.Remove(kubeconfig)
-	client, err := k8sclient.NewK8sClient("default", "deployment/test-dep", kubeconfig, false, k8sclient.ResizeModeRecreate, k8sclient.ResizeFallbackConfig{}, k8sclient.FallbackDisruptionEviction, clock.RealClock{})
+	client, err := k8sclient.NewK8sClient("default", "deployment/test-dep", kubeconfig, false, k8sclient.ResizeModeRecreate, k8sclient.ResizeFallbackConfig{}, clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NewK8sClient: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestPollAPIServer_InPlaceMode(t *testing.T) {
 
 	kubeconfig := writeTempKubeconfig(t, server.URL)
 	defer os.Remove(kubeconfig)
-	client, err := k8sclient.NewK8sClient("default", "deployment/test-dep", kubeconfig, false, k8sclient.ResizeModeInPlace, k8sclient.ResizeFallbackConfig{}, k8sclient.FallbackDisruptionEviction, clock.RealClock{})
+	client, err := k8sclient.NewK8sClient("default", "deployment/test-dep", kubeconfig, false, k8sclient.ResizeModeInPlace, k8sclient.ResizeFallbackConfig{}, clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NewK8sClient: %v", err)
 	}

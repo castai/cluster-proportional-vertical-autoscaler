@@ -396,12 +396,7 @@ func resizeWithFakeTarget(
 	tracker *resizeTracker,
 	selfHeals func(ctx context.Context) bool,
 	dryRun bool,
-	fallbackDisruption ...FallbackDisruptionMethod,
 ) (resizeResult, error) {
-	fd := FallbackDisruptionDelete
-	if len(fallbackDisruption) > 0 && fallbackDisruption[0] != "" {
-		fd = fallbackDisruption[0]
-	}
 	fake := &fakeResizeTarget{
 		selector:  selector,
 		namespace: namespace,
@@ -409,14 +404,13 @@ func resizeWithFakeTarget(
 		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
 	}
 	r := &podResizer{
-		resizeMode:         mode,
-		fallbackConfig:     fallback,
-		fallbackDisruption: fd,
-		dryRun:             dryRun,
-		clock:              clock.RealClock{},
-		clientset:          client,
-		target:             fake,
-		tracker:            tracker,
+		resizeMode:     mode,
+		fallbackConfig: fallback,
+		dryRun:         dryRun,
+		clock:          clock.RealClock{},
+		clientset:      client,
+		target:         fake,
+		tracker:        tracker,
 	}
 	return r.resizeRunningPods(ctx, desired)
 }
@@ -1620,14 +1614,13 @@ func TestResizeRunningPods_EvictionSuccess(t *testing.T) {
 	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionEviction}
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(ctx context.Context) bool { return false },
-		false,
-		FallbackDisruptionEviction)
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1668,14 +1661,13 @@ func TestResizeRunningPods_EvictionBlockedByPDB(t *testing.T) {
 	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionEviction}
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(ctx context.Context) bool { return false },
-		false,
-		FallbackDisruptionEviction)
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1724,7 +1716,7 @@ func TestResizeRunningPods_EvictionBlockedEscalation(t *testing.T) {
 	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionEviction}
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 	// Pre-seed eviction blocked time so it exceeds 3× grace (15 min).
 	tracker.evictionBlockedSince[types.UID("pod-a")] = time.Now().Add(-20 * time.Minute)
@@ -1732,8 +1724,7 @@ func TestResizeRunningPods_EvictionBlockedEscalation(t *testing.T) {
 	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(ctx context.Context) bool { return false },
-		false,
-		FallbackDisruptionEviction)
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1772,14 +1763,13 @@ func TestResizeRunningPods_EvictionNotFound(t *testing.T) {
 	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionEviction}
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(ctx context.Context) bool { return false },
-		false,
-		FallbackDisruptionEviction)
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1823,14 +1813,13 @@ func TestResizeRunningPods_DeleteModeRegression(t *testing.T) {
 	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
 		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
 		func(ctx context.Context) bool { return false },
-		false,
-		FallbackDisruptionDelete)
+		false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1873,7 +1862,7 @@ func TestResizeRunningPods_CrossWorkloadSkipped(t *testing.T) {
 	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	fake := &fakeResizeTarget{
@@ -1884,14 +1873,13 @@ func TestResizeRunningPods_CrossWorkloadSkipped(t *testing.T) {
 		ownsPod:   func(pod *v1.Pod) bool { return false },
 	}
 	resizer := &podResizer{
-		resizeMode:         ResizeModeInPlaceOrRecreate,
-		fallbackConfig:     fallback,
-		fallbackDisruption: FallbackDisruptionDelete,
-		dryRun:             false,
-		clock:              clock.RealClock{},
-		clientset:          client,
-		target:             fake,
-		tracker:            tracker,
+		resizeMode:     ResizeModeInPlaceOrRecreate,
+		fallbackConfig: fallback,
+		dryRun:         false,
+		clock:          clock.RealClock{},
+		clientset:      client,
+		target:         fake,
+		tracker:        tracker,
 	}
 	result, err := resizer.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
@@ -1933,7 +1921,7 @@ func TestResizeRunningPods_OrphanSkipped(t *testing.T) {
 	client := newResizeTestClient(server)
 	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
 	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
 
 	fake := &fakeResizeTarget{
@@ -1944,14 +1932,13 @@ func TestResizeRunningPods_OrphanSkipped(t *testing.T) {
 		ownsPod:   func(pod *v1.Pod) bool { return false },
 	}
 	resizer := &podResizer{
-		resizeMode:         ResizeModeInPlaceOrRecreate,
-		fallbackConfig:     fallback,
-		fallbackDisruption: FallbackDisruptionDelete,
-		dryRun:             false,
-		clock:              clock.RealClock{},
-		clientset:          client,
-		target:             fake,
-		tracker:            tracker,
+		resizeMode:     ResizeModeInPlaceOrRecreate,
+		fallbackConfig: fallback,
+		dryRun:         false,
+		clock:          clock.RealClock{},
+		clientset:      client,
+		target:         fake,
+		tracker:        tracker,
 	}
 	result, err := resizer.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {

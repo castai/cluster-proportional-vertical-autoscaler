@@ -56,10 +56,10 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 	fallbackCfg := k8sclient.ResizeFallbackConfig{
 		GracePeriod:     c.ResizeFallbackGracePeriod,
 		MaxPodsPerCycle: c.ResizeFallbackMaxPodsPerCycle,
+		DisruptionMethod: k8sclient.FallbackDisruptionMethod(c.ResizeFallbackDisruption),
 	}
-	fallbackDisruption := k8sclient.FallbackDisruptionMethod(c.ResizeFallbackDisruption)
 	clk := clock.RealClock{}
-	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun, mode, fallbackCfg, fallbackDisruption, clk)
+	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun, mode, fallbackCfg, clk)
 	if err != nil {
 		return nil, err
 	}

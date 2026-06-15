@@ -50,6 +50,15 @@ const (
 	ResizeModeInPlaceOrRecreate ResizeMode = "InPlaceOrRecreate"
 )
 
+// FallbackDisruptionMethod controls how cpvpa recreates stuck pods.
+type FallbackDisruptionMethod string
+
+const (
+	FallbackDisruptionEviction FallbackDisruptionMethod = "eviction"
+	FallbackDisruptionDelete   FallbackDisruptionMethod = "delete"
+)
+
+
 // ResizeFallbackConfig governs the InPlaceOrRecreate fallback path.
 type ResizeFallbackConfig struct {
 	// GracePeriod is how long a pod must remain not-resized in-place
@@ -58,15 +67,10 @@ type ResizeFallbackConfig struct {
 	// MaxPodsPerCycle caps how many pods cpvpa will evict in a single poll
 	// cycle, to avoid stampedes (especially on DaemonSets). Defaults to 1.
 	MaxPodsPerCycle int
+	// DisruptionMethod controls how cpvpa recreates stuck pods.
+	DisruptionMethod FallbackDisruptionMethod
 }
 
-// FallbackDisruptionMethod controls how cpvpa recreates stuck pods.
-type FallbackDisruptionMethod string
-
-const (
-	FallbackDisruptionEviction FallbackDisruptionMethod = "eviction"
-	FallbackDisruptionDelete   FallbackDisruptionMethod = "delete"
-)
 
 type resizeTarget interface {
 	GetPodSelector(ctx context.Context) (labels.Selector, error)
@@ -80,7 +84,6 @@ type resizeTarget interface {
 type podResizer struct {
 	resizeMode         ResizeMode
 	fallbackConfig     ResizeFallbackConfig
-	fallbackDisruption FallbackDisruptionMethod
 	dryRun             bool
 	clock              clock.PassiveClock
 
@@ -315,7 +318,7 @@ func (r *podResizer) maybeFallbackEvict(
 	}
 	// Perform the disruption: eviction (default in production) or direct delete.
 	var err error
-	if r.fallbackDisruption == FallbackDisruptionEviction {
+	if r.fallbackConfig.DisruptionMethod == FallbackDisruptionEviction {
 		err = r.evictForFallback(ctx, pod)
 	} else {
 		err = r.deleteForFallback(ctx, pod)
@@ -342,12 +345,12 @@ func (r *podResizer) maybeFallbackEvict(
 			return
 		}
 		glog.Errorf("fallback %s failed for pod=%s/%s: %v",
-			string(r.fallbackDisruption), pod.Namespace, pod.Name, err)
+			string(r.fallbackConfig.DisruptionMethod), pod.Namespace, pod.Name, err)
 		result.Errors++
 		return
 	}
 	glog.Infof("fallback-%s pod=%s/%s (not resized for %s)",
-		string(r.fallbackDisruption), pod.Namespace, pod.Name, age)
+		string(r.fallbackConfig.DisruptionMethod), pod.Namespace, pod.Name, age)
 	result.Evicted++
 	*evictedThisCycle++
 	r.tracker.clear(pod.UID)
