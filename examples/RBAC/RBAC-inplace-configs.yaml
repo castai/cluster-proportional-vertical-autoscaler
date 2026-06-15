@@ -31,11 +31,6 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets", "daemonsets"]
     verbs: ["get", "patch"]
-  # Listing ReplicaSets is needed for Deployment targets so cpvpa can verify
-  # pod ownership before resizing or evicting.
-  - apiGroups: ["apps"]
-    resources: ["replicasets"]
-    verbs: ["list"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

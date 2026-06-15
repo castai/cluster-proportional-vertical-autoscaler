@@ -140,8 +140,6 @@ func TestPollAPIServer_InPlaceMode(t *testing.T) {
 	}
 }
 
-func boolPtr(b bool) *bool { return &b }
-
 // mockServerConfig configures the mock API server.
 type mockServerConfig struct {
 	mode               k8sclient.ResizeMode
@@ -245,7 +243,7 @@ func newMockAPIServer(t *testing.T, cfg mockServerConfig) *httptest.Server {
 		// --- deployment get ---
 		if req.Method == "GET" && req.URL.Path == "/apis/apps/v1/namespaces/default/deployments/test-dep" {
 			dep := appsv1.Deployment{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-dep", Namespace: "default", UID: types.UID("dep-1")},
+				ObjectMeta: metav1.ObjectMeta{Name: "test-dep", Namespace: "default"},
 				Spec: appsv1.DeploymentSpec{
 					Selector: &metav1.LabelSelector{
 						MatchLabels: map[string]string{"app": "test"},
@@ -290,27 +288,6 @@ func newMockAPIServer(t *testing.T, cfg mockServerConfig) *httptest.Server {
 			return
 		}
 
-		// --- replicaset list (for ownership check) ---
-		if req.Method == "GET" && req.URL.Path == "/apis/apps/v1/namespaces/default/replicasets" {
-			list := appsv1.ReplicaSetList{
-				Items: []appsv1.ReplicaSet{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "test-dep-rs", Namespace: "default",
-							UID:             types.UID("rs-1"),
-							Labels:          map[string]string{"app": "test"},
-							OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "test-dep", UID: types.UID("dep-1"), Controller: boolPtr(true)}},
-						},
-					},
-				},
-			}
-			b, _ := json.Marshal(list)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(b)
-			return
-		}
-
 		// --- pod list (for resize) ---
 		if req.Method == "GET" && strings.HasPrefix(req.URL.Path, "/api/v1/namespaces/default/pods") {
 			list := apiv1.PodList{
@@ -320,9 +297,6 @@ func newMockAPIServer(t *testing.T, cfg mockServerConfig) *httptest.Server {
 							Name: "test-dep-abc", Namespace: "default",
 							UID:    types.UID("pod-1"),
 							Labels: map[string]string{"app": "test"},
-							OwnerReferences: []metav1.OwnerReference{
-								{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "test-dep-rs", UID: types.UID("rs-1"), Controller: boolPtr(true)},
-							},
 						},
 						Spec: apiv1.PodSpec{
 							Containers: []apiv1.Container{{

@@ -307,7 +307,6 @@ type fakeResizeTarget struct {
 	namespace string
 	selfHeals func(ctx context.Context) bool
 	patcher   func(resources map[string]v1.ResourceRequirements) error
-	ownsPod   func(pod *v1.Pod) bool
 }
 
 func (f *fakeResizeTarget) GetPodSelector(ctx context.Context) (labels.Selector, error) {
@@ -330,13 +329,6 @@ func (f *fakeResizeTarget) PatchTemplate(ctx context.Context, resources map[stri
 
 func (f *fakeResizeTarget) Namespace() string {
 	return f.namespace
-}
-
-func (f *fakeResizeTarget) OwnsPod(ctx context.Context, pod *v1.Pod) (bool, error) {
-	if f.ownsPod != nil {
-		return f.ownsPod(pod), nil
-	}
-	return true, nil
 }
 
 // makePod builds a pod with the given phase and resize conditions.
@@ -1828,129 +1820,5 @@ func TestResizeRunningPods_DeleteModeRegression(t *testing.T) {
 	}
 	if !deleted {
 		t.Error("pod was NOT deleted in delete mode")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Ownership unit tests (T4)
-// ---------------------------------------------------------------------------
-
-func TestResizeRunningPods_CrossWorkloadSkipped(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-
-	pod := makePod("pod-a", v1.PodRunning, nil, newRes)
-	pod.OwnerReferences = []metav1.OwnerReference{{
-		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "other-rs", UID: types.UID("other-rs"), Controller: func(b bool) *bool { return &b }(true),
-	}}
-
-	deleted := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		switch {
-		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podListResponse([]v1.Pod{pod}))
-		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
-			deleted = true
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
-
-	fake := &fakeResizeTarget{
-		selector:  selector,
-		namespace: "test",
-		selfHeals: func(ctx context.Context) bool { return false },
-		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
-		ownsPod:   func(pod *v1.Pod) bool { return false },
-	}
-	resizer := &podResizer{
-		resizeMode:     ResizeModeInPlaceOrRecreate,
-		fallbackConfig: fallback,
-		dryRun:         false,
-		clock:          clock.RealClock{},
-		clientset:      client,
-		target:         fake,
-		tracker:        tracker,
-	}
-	result, err := resizer.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.SkippedNotOwned != 1 {
-		t.Errorf("SkippedNotOwned = %d, want 1", result.SkippedNotOwned)
-	}
-	if result.Evicted != 0 {
-		t.Errorf("Evicted = %d, want 0 (cross-workload pod must not be deleted)", result.Evicted)
-	}
-	if deleted {
-		t.Error("cross-workload pod was deleted")
-	}
-}
-
-func TestResizeRunningPods_OrphanSkipped(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-
-	pod := makePod("pod-a", v1.PodRunning, nil, newRes)
-	// No OwnerReferences — orphan pod.
-
-	deleted := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		switch {
-		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podListResponse([]v1.Pod{pod}))
-		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
-			deleted = true
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
-
-	fake := &fakeResizeTarget{
-		selector:  selector,
-		namespace: "test",
-		selfHeals: func(ctx context.Context) bool { return false },
-		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
-		ownsPod:   func(pod *v1.Pod) bool { return false },
-	}
-	resizer := &podResizer{
-		resizeMode:     ResizeModeInPlaceOrRecreate,
-		fallbackConfig: fallback,
-		dryRun:         false,
-		clock:          clock.RealClock{},
-		clientset:      client,
-		target:         fake,
-		tracker:        tracker,
-	}
-	result, err := resizer.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.SkippedNotOwned != 1 {
-		t.Errorf("SkippedNotOwned = %d, want 1", result.SkippedNotOwned)
-	}
-	if result.Evicted != 0 {
-		t.Errorf("Evicted = %d, want 0 (orphan pod must not be deleted)", result.Evicted)
-	}
-	if deleted {
-		t.Error("orphan pod was deleted")
 	}
 }
