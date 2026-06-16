@@ -187,6 +187,10 @@ By default, cpvpa only patches the workload template; new pods come up at the co
 - Kubernetes 1.33+ with the `InPlacePodVerticalScaling` feature gate enabled (on by default in 1.33).
 - Each container that should resize in-place must declare a `resizePolicy` with `restartPolicy: NotRequired` for the resources you want to resize.
 
+### Pod ownership
+
+cpvpa finds candidate pods via the target's label selector, then acts only on pods it actually owns, verified from each pod's controller `ownerReference` (no extra API calls). For `ReplicaSet` and `DaemonSet` targets this is a direct UID comparison. For `Deployment` targets the pod is owned by a ReplicaSet, so cpvpa matches the ReplicaSet name against the Deployment controller's `<deployment-name>-<pod-template-hash>` convention (which correctly distinguishes e.g. `web` from `web-canary`). This relies on the standard Deployment→ReplicaSet naming, which is stable across releases but is an implementation detail rather than a formal API guarantee; pods that don't match are skipped (counted as `SkippedNotOwned`) and never resized or recreated.
+
 ### RBAC
 
 In-place modes need extra permissions beyond the base role. Apply `examples/RBAC/RBAC-inplace-configs.yaml` in addition to the base role:
