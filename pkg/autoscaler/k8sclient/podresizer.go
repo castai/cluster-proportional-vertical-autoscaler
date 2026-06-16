@@ -171,7 +171,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 					firstSeen := r.tracker.markNotResized(pod.UID, now)
 					age := now.Sub(firstSeen)
 					glog.V(2).Infof("pod=%s/%s actuation mismatch (not resized for %s)", pod.Namespace, pod.Name, age)
-					r.maybeFallbackEvict(ctx, pod, age, selfHealing, ensureTemplate, &evictedThisCycle, &result)
+					r.maybeFallbackEvict(ctx, pod, now, age, selfHealing, ensureTemplate, &evictedThisCycle, &result)
 				case actuationUnknown:
 					glog.Warningf("actuation unknown for pod=%s/%s: kubelet has not reported container resources", pod.Namespace, pod.Name)
 					r.tracker.clear(pod.UID)
@@ -226,7 +226,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 				firstSeen := r.tracker.markNotResized(updated.UID, now)
 				age := now.Sub(firstSeen)
 				glog.V(2).Infof("pod=%s/%s actuation mismatch (not resized for %s)", updated.Namespace, updated.Name, age)
-				r.maybeFallbackEvict(ctx, updated, age, selfHealing, ensureTemplate, &evictedThisCycle, &result)
+				r.maybeFallbackEvict(ctx, updated, now, age, selfHealing, ensureTemplate, &evictedThisCycle, &result)
 			case actuationUnknown:
 				glog.Warningf("actuation unknown for pod=%s/%s: kubelet has not reported container resources", updated.Namespace, updated.Name)
 				r.tracker.clear(updated.UID)
@@ -263,13 +263,14 @@ func (r *podResizer) accountNotResized(
 	firstSeen := r.tracker.markNotResized(pod.UID, now)
 	age := now.Sub(firstSeen)
 	glog.V(2).Infof("pod=%s/%s resize %s (not resized for %s)", pod.Namespace, pod.Name, status, age)
-	r.maybeFallbackEvict(ctx, pod, age, selfHeals, ensureTemplate, evictedThisCycle, result)
+	r.maybeFallbackEvict(ctx, pod, now, age, selfHeals, ensureTemplate, evictedThisCycle, result)
 }
 
 // maybeFallbackEvict handles the InPlaceOrRecreate fallback for one not-resized pod.
 func (r *podResizer) maybeFallbackEvict(
 	ctx context.Context,
 	pod *v1.Pod,
+	now time.Time,
 	age time.Duration,
 	selfHeals bool,
 	ensureTemplate func() error,
@@ -312,7 +313,7 @@ func (r *podResizer) maybeFallbackEvict(
 			// PDB blocked the eviction. Keep the tracker entry, do NOT consume
 			// MaxPodsPerCycle budget, and record blocked count.
 			result.EvictionBlocked++
-			blockedNow := r.clock.Now()
+			blockedNow := now
 			firstBlocked := r.tracker.markEvictionBlocked(pod.UID, blockedNow)
 			blockedAge := blockedNow.Sub(firstBlocked)
 			if blockedAge > 3*r.fallbackConfig.GracePeriod {
