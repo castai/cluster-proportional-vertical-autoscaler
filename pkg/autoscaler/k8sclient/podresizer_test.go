@@ -309,6 +309,9 @@ type fakeResizeTarget struct {
 	patcher   func(resources map[string]v1.ResourceRequirements) error
 	ownsPod   func(pod *v1.Pod) bool
 	clientset clientset.Interface
+	// templateAlreadyCurrent makes PatchTemplate report changed == false,
+	// simulating a workload template that already matches desired.
+	templateAlreadyCurrent bool
 }
 
 func (f *fakeResizeTarget) OwnsPod(pod *v1.Pod) bool {
@@ -350,11 +353,15 @@ func (f *fakeResizeTarget) IsSelfHealing(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func (f *fakeResizeTarget) PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) error {
+func (f *fakeResizeTarget) PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) (bool, error) {
 	if f.patcher != nil {
-		return f.patcher(resources)
+		if err := f.patcher(resources); err != nil {
+			return false, err
+		}
 	}
-	return nil
+	// templateAlreadyCurrent simulates a template that already matches desired,
+	// so the patch is a no-op (changed == false).
+	return !f.templateAlreadyCurrent, nil
 }
 
 func (f *fakeResizeTarget) Namespace() string {
@@ -1257,6 +1264,74 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 	}
 	if templatePatches != 1 {
 		t.Errorf("templatePatches = %d, want 1 (patched once, before the recreate)", templatePatches)
+	}
+}
+
+// TestResizeRunningPods_SelfHealingTemplateAlreadyCurrent verifies that when a
+// self-healing target's template already matches desired (the rollout was
+// triggered earlier or another pod did it) but a pod is still stuck past grace,
+// cpvpa does NOT report a recreate or reset the clock — it counts RecreateStuck
+// and keeps the tracker entry so the wedged state stays visible.
+func TestResizeRunningPods_SelfHealingTemplateAlreadyCurrent(t *testing.T) {
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+	podA := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
+		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
+		Reason: "Infeasible",
+	}}, newRes)
+
+	deleted := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{podA}))
+		case req.Method == "DELETE" || (req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/eviction")):
+			deleted++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	tracker := newResizeTracker()
+	// Stuck well past 3x the grace period, so the escalation branch is exercised.
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-20 * time.Minute)
+
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	fake := &fakeResizeTarget{
+		selector:               selector,
+		namespace:              "test",
+		clientset:              client,
+		selfHeals:              func(ctx context.Context) bool { return true },
+		templateAlreadyCurrent: true, // PatchTemplate is a no-op -> changed == false
+	}
+	r := &podResizer{
+		resizeMode:     ResizeModeInPlaceOrRecreate,
+		fallbackConfig: fallback,
+		clock:          clock.RealClock{},
+		clientset:      client,
+		tracker:        tracker,
+	}
+
+	result, err := r.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RecreateStuck != 1 {
+		t.Errorf("RecreateStuck = %d, want 1", result.RecreateStuck)
+	}
+	if result.RecreateTriggered != 0 {
+		t.Errorf("RecreateTriggered = %d, want 0 (no-op template patch must not count as a recreate)", result.RecreateTriggered)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (self-healing target must never be disrupted directly)", deleted)
+	}
+	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; !ok {
+		t.Errorf("tracker entry was cleared; the wedged pod's stuck duration must be retained")
 	}
 }
 

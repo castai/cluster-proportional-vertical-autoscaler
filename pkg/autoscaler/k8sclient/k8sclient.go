@@ -373,6 +373,10 @@ type targetSpec struct {
 	UID           types.UID
 	PodSelector   labels.Selector
 	IsSelfHealing bool
+	// TemplateResources is the current per-container resources in the
+	// workload's pod template, captured when the spec is fetched. It lets
+	// PatchTemplate detect when a template patch would be a no-op.
+	TemplateResources map[string]v1.ResourceRequirements
 }
 
 // targetClient encapsulates the target workload object and its client
@@ -386,10 +390,20 @@ type targetClient struct {
 }
 
 // PatchTemplate updates spec.template.spec.containers[].resources on the workload.
-func (t *targetClient) PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) error {
+// It returns whether the patch actually changed the template: if the template
+// already matches desired for every managed container, no patch is issued and
+// changed is false.
+func (t *targetClient) PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) (changed bool, err error) {
+	spec, err := t.trySyncSpec(ctx)
+	if err != nil {
+		return false, err
+	}
+	if templateMatches(spec.TemplateResources, resources) {
+		return false, nil // already at desired; patching would be a no-op
+	}
 	if t.dryRun {
 		glog.Infof("dry-run: would patch %s/%s template resources", t.meta.Kind, t.meta.Name)
-		return nil
+		return true, nil
 	}
 	ctrs := make([]interface{}, 0, len(resources))
 	for ctrName, res := range resources {
@@ -415,12 +429,33 @@ func (t *targetClient) PatchTemplate(ctx context.Context, resources map[string]v
 
 	jb, err := json.Marshal(patch)
 	if err != nil {
-		return fmt.Errorf("can't marshal template patch to JSON: %v", err)
+		return false, fmt.Errorf("can't marshal template patch to JSON: %v", err)
 	}
 	if err := t.meta.Patch(ctx, t.clientset, types.StrategicMergePatchType, jb); err != nil {
-		return fmt.Errorf("template patch failed: %v", err)
+		return false, fmt.Errorf("template patch failed: %v", err)
 	}
-	return nil
+	return true, nil
+}
+
+// containerResources extracts a name->resources map from a container list.
+func containerResources(containers []v1.Container) map[string]v1.ResourceRequirements {
+	out := make(map[string]v1.ResourceRequirements, len(containers))
+	for i := range containers {
+		out[containers[i].Name] = containers[i].Resources
+	}
+	return out
+}
+
+// templateMatches reports whether have already satisfies desired for every
+// managed container (a missing container counts as a mismatch).
+func templateMatches(have, desired map[string]v1.ResourceRequirements) bool {
+	for name, want := range desired {
+		got, ok := have[name]
+		if !ok || !resourcesSatisfied(got, want) {
+			return false
+		}
+	}
+	return true
 }
 
 // GetOwnedPods returns the live pods owned by this target.  It fetches the
@@ -513,6 +548,7 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		selector = dep.Spec.Selector
 		spec.UID = dep.UID
 		spec.IsSelfHealing = true
+		spec.TemplateResources = containerResources(dep.Spec.Template.Spec.Containers)
 	case "daemonset":
 		ds, err := t.clientset.AppsV1().DaemonSets(t.meta.Namespace).Get(ctx, t.meta.Name, metav1.GetOptions{})
 		if err != nil {
@@ -521,6 +557,7 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		selector = ds.Spec.Selector
 		spec.UID = ds.UID
 		spec.IsSelfHealing = ds.Spec.UpdateStrategy.Type != appsv1.OnDeleteDaemonSetStrategyType
+		spec.TemplateResources = containerResources(ds.Spec.Template.Spec.Containers)
 	case "replicaset":
 		rs, err := t.clientset.AppsV1().ReplicaSets(t.meta.Namespace).Get(ctx, t.meta.Name, metav1.GetOptions{})
 		if err != nil {
@@ -528,6 +565,7 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		}
 		selector = rs.Spec.Selector
 		spec.UID = rs.UID
+		spec.TemplateResources = containerResources(rs.Spec.Template.Spec.Containers)
 	case "statefulset":
 		ss, err := t.clientset.AppsV1().StatefulSets(t.meta.Namespace).Get(ctx, t.meta.Name, metav1.GetOptions{})
 		if err != nil {
@@ -536,6 +574,7 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		selector = ss.Spec.Selector
 		spec.UID = ss.UID
 		spec.IsSelfHealing = ss.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType
+		spec.TemplateResources = containerResources(ss.Spec.Template.Spec.Containers)
 	default:
 		return nil, fmt.Errorf("unknown target kind: %s", t.meta.Kind)
 	}
@@ -600,7 +639,8 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 		if !reqsChanged {
 			return nil
 		}
-		return target.PatchTemplate(ctx, resources)
+		_, err := target.PatchTemplate(ctx, resources)
+		return err
 	}
 
 	result, err := k.podResizer.resizeRunningPods(ctx, target, resources)

@@ -71,7 +71,7 @@ type ResizeFallbackConfig struct {
 
 type resizeTarget interface {
 	IsSelfHealing(ctx context.Context) (bool, error)
-	PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) error
+	PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) (changed bool, err error)
 	GetOwnedPods(ctx context.Context) ([]v1.Pod, error)
 }
 
@@ -95,6 +95,7 @@ type resizeResult struct {
 	ActuationLag      int // kubelet reported resources but they differ from desired
 	Evicted           int // pods cpvpa evicted or deleted (fallback)
 	RecreateTriggered int // pods handed to the controller's rollout via a template patch
+	RecreateStuck     int // self-healing pods still not resized though the template already matches desired (rollout wedged, likely unschedulable)
 	EvictionBlocked   int // pods whose eviction was blocked by PDB
 	Transient         int // transient errors (404 NotFound, 409 Conflict) per pod
 	Errors            int // any other unexpected error per pod
@@ -123,15 +124,18 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 	}
 
 	templatePatched := false
-	ensureTemplate := func() error {
+	ensureTemplate := func() (bool, error) {
 		if templatePatched {
-			return nil
+			return true, nil // already changed earlier this cycle
 		}
-		if err := target.PatchTemplate(ctx, desired); err != nil {
-			return err
+		changed, err := target.PatchTemplate(ctx, desired)
+		if err != nil {
+			return false, err
 		}
-		templatePatched = true
-		return nil
+		if changed {
+			templatePatched = true
+		}
+		return changed, nil
 	}
 
 	live := make(map[types.UID]bool, len(pods))
@@ -243,7 +247,7 @@ func (r *podResizer) accountNotResized(
 	status resizeStatus,
 	now time.Time,
 	selfHeals bool,
-	ensureTemplate func() error,
+	ensureTemplate func() (bool, error),
 	evictedThisCycle *int,
 	result *resizeResult,
 ) {
@@ -268,7 +272,7 @@ func (r *podResizer) maybeFallbackEvict(
 	now time.Time,
 	age time.Duration,
 	selfHeals bool,
-	ensureTemplate func() error,
+	ensureTemplate func() (bool, error),
 	evictedThisCycle *int,
 	result *resizeResult,
 ) {
@@ -283,21 +287,40 @@ func (r *podResizer) maybeFallbackEvict(
 	if !selfHeals && *evictedThisCycle >= r.fallbackConfig.MaxPodsPerCycle {
 		return
 	}
-	if err := ensureTemplate(); err != nil {
+	changed, err := ensureTemplate()
+	if err != nil {
 		glog.Errorf("fallback: template patch failed, not recreating pod=%s/%s this cycle: %v",
 			pod.Namespace, pod.Name, err)
 		result.Errors++
 		return
 	}
 	if selfHeals {
-		glog.Infof("fallback: template updated; controller will recreate pod=%s/%s (not resized for %s)",
-			pod.Namespace, pod.Name, age)
-		result.RecreateTriggered++
-		r.tracker.clear(pod.UID)
+		if changed {
+			glog.Infof("fallback: template updated; controller will recreate pod=%s/%s (not resized for %s)",
+				pod.Namespace, pod.Name, age)
+			result.RecreateTriggered++
+			r.tracker.clear(pod.UID)
+			return
+		}
+		// The template already matches desired (a prior cycle, or another pod,
+		// triggered the rollout) yet this pod is still stuck past the grace
+		// period. Re-patching is a no-op and would not start a new rollout, so
+		// do NOT report a recreate or reset the clock — that would mask a
+		// permanently wedged pod. The rollout is most likely blocked because the
+		// desired size is unschedulable; surface it instead.
+		result.RecreateStuck++
+		if age > 3*r.fallbackConfig.GracePeriod {
+			glog.Errorf("pod=%s/%s still not resized %s after its template was already brought to the desired size; "+
+				"the rollout is likely wedged (desired size may be unschedulable) — manual intervention may be needed",
+				pod.Namespace, pod.Name, age)
+		} else {
+			glog.V(2).Infof("pod=%s/%s still not resized %s; template already at desired, awaiting controller rollout",
+				pod.Namespace, pod.Name, age)
+		}
 		return
 	}
-	// Perform the disruption: eviction (default in production) or direct delete.
-	var err error
+
+	// Perform the disruption: eviction or direct delete.
 	if r.fallbackConfig.DisruptionMethod == FallbackDisruptionEviction {
 		err = r.evictForFallback(ctx, pod)
 	} else {
