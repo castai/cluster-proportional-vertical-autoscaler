@@ -411,6 +411,82 @@ func resizeWithFakeTarget(
 // resize_runningpods_test.go: podResizer tests
 // ---------------------------------------------------------------------------
 
+// TestResizeRunningPods_RepatchResetsGraceClock guards against premature
+// eviction when a pod that was already being tracked (e.g. stuck reaching a
+// previous desired size) is re-patched to a new desired size after a cluster
+// resize. The successful patch must reset the fallback clock so the new resize
+// attempt gets a full grace period; the post-patch actuation mismatch (kubelet
+// has not actuated yet) must NOT be measured against the stale timestamp.
+func TestResizeRunningPods_RepatchResetsGraceClock(t *testing.T) {
+	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("200m")}}
+
+	// Pod spec is still at the old size (so needsPatch is true for newRes), and
+	// the kubelet has not yet actuated (status still reports old size).
+	runningOldStatus := []v1.ContainerStatus{{
+		Name:      "main",
+		State:     v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Resources: &oldRes,
+	}}
+	listed := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "pod-a", UID: types.UID("pod-a"), Labels: map[string]string{"app": "test"}},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main", Resources: oldRes}}},
+		Status:     v1.PodStatus{Phase: v1.PodRunning, ContainerStatuses: runningOldStatus},
+	}
+	// The object returned by the /resize patch: spec now at newRes, but status
+	// still at oldRes (actuation pending) -> post-patch actuationMismatch.
+	patched := listed
+	patched.Spec = v1.PodSpec{Containers: []v1.Container{{Name: "main", Resources: newRes}}}
+
+	deleteCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{listed}))
+		case req.Method == "PATCH" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/resize":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podResponse(&patched))
+		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
+			deleteCount++
+			w.WriteHeader(http.StatusOK)
+		case req.Method == "POST" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/eviction":
+			deleteCount++ // count eviction as a disruption too
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
+
+	tracker := newResizeTracker()
+	// Stale entry from the previous (now superseded) desired size: well past grace.
+	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+
+	result, err := resizeWithFakeTarget(
+		context.Background(), client, "test", selector, map[string]v1.ResourceRequirements{"main": newRes},
+		ResizeModeInPlaceOrRecreate, fallback, tracker,
+		func(ctx context.Context) bool { return false }, // non-self-healing -> would delete/evict
+		false,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Applied != 1 {
+		t.Errorf("Applied = %d, want 1", result.Applied)
+	}
+	if deleteCount != 0 {
+		t.Errorf("pod was disrupted %d time(s); want 0 — the fresh patch should reset the grace clock", deleteCount)
+	}
+	if _, tracked := tracker.notResizedSince[types.UID("pod-a")]; !tracked {
+		t.Errorf("expected a fresh tracker entry started at patch time, found none")
+	}
+}
+
 // TestResizeRunningPods_AllAlreadyOK verifies that when every pod already
 // matches the desired resources we get AlreadyOK == pod count.
 func TestResizeRunningPods_AllAlreadyOK(t *testing.T) {

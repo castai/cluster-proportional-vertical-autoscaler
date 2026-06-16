@@ -215,6 +215,9 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 			continue
 		} else {
 			result.Applied++
+			// A successful patch is a fresh resize attempt, so reset the
+			// fallback clock.
+			r.tracker.clear(updated.UID)
 		}
 
 		if status := classifyResize(updated); status == resizeStatusOK {
