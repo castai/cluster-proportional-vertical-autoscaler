@@ -31,13 +31,13 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/utils/clock"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 // K8sClient - Wraps all needed client functionalities for autoscaler
@@ -100,13 +100,13 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 	var resizer *podResizer
 	if mode != ResizeModeRecreate {
 		resizer = &podResizer{
-			resizeMode:         mode,
-			fallbackConfig:     fallbackCfg,
-			dryRun:             dryRun,
-			clock:              clk,
-			clientset:          clientset,
-			target:             tc,
-			tracker:            newResizeTracker(),
+			resizeMode:     mode,
+			fallbackConfig: fallbackCfg,
+			dryRun:         dryRun,
+			clock:          clk,
+			clientset:      clientset,
+			target:         tc,
+			tracker:        newResizeTracker(),
 		}
 	}
 
@@ -368,7 +368,6 @@ func findStatefulSetPatcher(groupVersions map[string]bool) (string, patchFunc, e
 	}
 	return "", nil, fmt.Errorf("no supported API group for target: %v", groupVersions)
 }
-
 
 // targetClient encapsulates the target workload object and its client
 // dependencies for querying and patching.

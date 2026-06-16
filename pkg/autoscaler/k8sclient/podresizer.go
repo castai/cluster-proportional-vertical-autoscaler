@@ -58,7 +58,6 @@ const (
 	FallbackDisruptionDelete   FallbackDisruptionMethod = "delete"
 )
 
-
 // ResizeFallbackConfig governs the InPlaceOrRecreate fallback path.
 type ResizeFallbackConfig struct {
 	// GracePeriod is how long a pod must remain not-resized in-place
@@ -71,7 +70,6 @@ type ResizeFallbackConfig struct {
 	DisruptionMethod FallbackDisruptionMethod
 }
 
-
 type resizeTarget interface {
 	GetPodSelector(ctx context.Context) (labels.Selector, error)
 	IsSelfHealing(ctx context.Context) bool
@@ -81,10 +79,10 @@ type resizeTarget interface {
 
 // podResizer orchestrates in-place pod resizing and recreation fallback.
 type podResizer struct {
-	resizeMode         ResizeMode
-	fallbackConfig     ResizeFallbackConfig
-	dryRun             bool
-	clock              clock.PassiveClock
+	resizeMode     ResizeMode
+	fallbackConfig ResizeFallbackConfig
+	dryRun         bool
+	clock          clock.PassiveClock
 
 	clientset kubernetes.Interface
 	target    resizeTarget
@@ -379,8 +377,8 @@ func (r *podResizer) deleteForFallback(ctx context.Context, pod *v1.Pod) error {
 // the fallback grace period to any pod that fails to resize in time. It is
 // keyed by pod UID to survive pod-name reuse on DaemonSets.
 type resizeTracker struct {
-	mu                  sync.Mutex
-	notResizedSince     map[types.UID]time.Time
+	mu                   sync.Mutex
+	notResizedSince      map[types.UID]time.Time
 	evictionBlockedSince map[types.UID]time.Time
 }
 

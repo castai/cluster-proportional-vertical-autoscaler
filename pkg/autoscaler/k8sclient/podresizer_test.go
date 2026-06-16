@@ -1457,8 +1457,8 @@ func TestActuationState_Confirmed(t *testing.T) {
 	res := reqs(t, "100m", "128Mi")
 	pod := makePod("pod-a", v1.PodRunning, nil, res)
 	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
-		Name:    "main",
-		State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Name:      "main",
+		State:     v1.ContainerState{Running: &v1.ContainerStateRunning{}},
 		Resources: &res,
 	}}
 	if got := actuationState(&pod, map[string]v1.ResourceRequirements{"main": res}); got != actuationConfirmed {
@@ -1471,8 +1471,8 @@ func TestActuationState_Mismatch(t *testing.T) {
 	newRes := reqs(t, "100m", "128Mi")
 	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
 	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
-		Name:    "main",
-		State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Name:      "main",
+		State:     v1.ContainerState{Running: &v1.ContainerStateRunning{}},
 		Resources: &oldRes,
 	}}
 	if got := actuationState(&pod, map[string]v1.ResourceRequirements{"main": newRes}); got != actuationMismatch {
@@ -1484,8 +1484,8 @@ func TestActuationState_NilUnknown(t *testing.T) {
 	res := reqs(t, "100m", "128Mi")
 	pod := makePod("pod-a", v1.PodRunning, nil, res)
 	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
-		Name:    "main",
-		State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Name:      "main",
+		State:     v1.ContainerState{Running: &v1.ContainerStateRunning{}},
 		Resources: nil,
 	}}
 	if got := actuationState(&pod, map[string]v1.ResourceRequirements{"main": res}); got != actuationUnknown {
@@ -1497,8 +1497,8 @@ func TestActuationState_NotRunning(t *testing.T) {
 	res := reqs(t, "100m", "128Mi")
 	pod := makePod("pod-a", v1.PodRunning, nil, res)
 	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
-		Name:    "main",
-		State:   v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}},
+		Name:      "main",
+		State:     v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}},
 		Resources: nil,
 	}}
 	if got := actuationState(&pod, map[string]v1.ResourceRequirements{"main": res}); got != actuationConfirmed {
@@ -1510,8 +1510,8 @@ func TestActuationState_Unmanaged(t *testing.T) {
 	res := reqs(t, "100m", "128Mi")
 	pod := makePod("pod-a", v1.PodRunning, nil, res)
 	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
-		Name:    "sidecar",
-		State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Name:      "sidecar",
+		State:     v1.ContainerState{Running: &v1.ContainerStateRunning{}},
 		Resources: nil,
 	}}
 	if got := actuationState(&pod, map[string]v1.ResourceRequirements{"main": res}); got != actuationConfirmed {
@@ -1527,8 +1527,8 @@ func TestResizeRunningPods_ActuationMismatch(t *testing.T) {
 
 	pod := makePod("pod-a", v1.PodRunning, nil, newRes)
 	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
-		Name:    "main",
-		State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		Name:      "main",
+		State:     v1.ContainerState{Running: &v1.ContainerStateRunning{}},
 		Resources: &oldRes,
 	}}
 

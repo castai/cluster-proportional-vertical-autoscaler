@@ -54,8 +54,8 @@ type AutoScaler struct {
 func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 	mode := k8sclient.ResizeMode(c.ResizeMode)
 	fallbackCfg := k8sclient.ResizeFallbackConfig{
-		GracePeriod:     c.ResizeFallbackGracePeriod,
-		MaxPodsPerCycle: c.ResizeFallbackMaxPodsPerCycle,
+		GracePeriod:      c.ResizeFallbackGracePeriod,
+		MaxPodsPerCycle:  c.ResizeFallbackMaxPodsPerCycle,
 		DisruptionMethod: k8sclient.FallbackDisruptionMethod(c.ResizeFallbackDisruption),
 	}
 	clk := clock.RealClock{}
