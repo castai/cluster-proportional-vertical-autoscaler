@@ -526,6 +526,14 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		}
 		selector = rs.Spec.Selector
 		spec.UID = rs.UID
+	case "statefulset":
+		ss, err := t.clientset.AppsV1().StatefulSets(t.meta.Namespace).Get(ctx, t.meta.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		selector = ss.Spec.Selector
+		spec.UID = ss.UID
+		spec.IsSelfHealing = true
 	default:
 		return nil, fmt.Errorf("unknown target kind: %s", t.meta.Kind)
 	}
