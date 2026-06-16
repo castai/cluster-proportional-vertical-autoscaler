@@ -526,7 +526,6 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		}
 		selector = rs.Spec.Selector
 		spec.UID = rs.UID
-		spec.IsSelfHealing = true
 	default:
 		return nil, fmt.Errorf("unknown target kind: %s", t.meta.Kind)
 	}
