@@ -31,7 +31,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// resize_test.go helpers
+// helpers
 // ---------------------------------------------------------------------------
 
 func mustQty(t *testing.T, s string) resource.Quantity {
@@ -48,8 +48,92 @@ func reqs(t *testing.T, cpu, mem string) v1.ResourceRequirements {
 	}
 }
 
+// cpuReq builds a ResourceRequirements with only a CPU request.
+func cpuReq(cpu string) v1.ResourceRequirements {
+	return v1.ResourceRequirements{
+		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse(cpu)},
+	}
+}
+
+// Pod resize condition helpers.
+func infeasibleConds() []v1.PodCondition {
+	return []v1.PodCondition{{Type: v1.PodResizePending, Status: v1.ConditionTrue, Reason: v1.PodReasonInfeasible}}
+}
+func deferredConds() []v1.PodCondition {
+	return []v1.PodCondition{{Type: v1.PodResizePending, Status: v1.ConditionTrue, Reason: v1.PodReasonDeferred}}
+}
+func inProgressConds() []v1.PodCondition {
+	return []v1.PodCondition{{Type: v1.PodResizeInProgress, Status: v1.ConditionTrue}}
+}
+
+// stdFallback is the ResizeFallbackConfig used by most tests:
+// 5-minute grace, at most 1 pod disrupted per cycle, delete method.
+var stdFallback = ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+
+// newPodListServer builds a test server that serves pods on GET
+// /api/v1/namespaces/test/pods and returns 404 for all other requests.
+func newPodListServer(pods []v1.Pod) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse(pods))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+}
+
+// resizeRig bundles the per-test client, selector, and tracker that appear at
+// the top of almost every resizeRunningPods test.
+type resizeRig struct {
+	t        *testing.T
+	client   clientset.Interface
+	selector labels.Selector
+	tracker  *resizeTracker
+}
+
+func newResizeRig(t *testing.T, server *httptest.Server) *resizeRig {
+	t.Helper()
+	return &resizeRig{
+		t:        t,
+		client:   newResizeTestClient(server),
+		selector: labels.SelectorFromSet(map[string]string{"app": "test"}),
+		tracker:  newResizeTracker(),
+	}
+}
+
+// pastGrace pre-seeds the tracker so the named pods appear past the 5-minute
+// fallback grace period (10 minutes ago).
+func (rig *resizeRig) pastGrace(uids ...string) {
+	for _, uid := range uids {
+		rig.tracker.notResizedSince[types.UID(uid)] = time.Now().Add(-10 * time.Minute)
+	}
+}
+
+// run invokes resizeRunningPods via a fakeResizeTarget and fatals on error.
+func (rig *resizeRig) run(desired map[string]v1.ResourceRequirements, mode ResizeMode, fallback ResizeFallbackConfig, selfHeals bool) resizeResult {
+	rig.t.Helper()
+	result, err := resizeWithFakeTarget(context.Background(), rig.client, "test", rig.selector, desired, mode, fallback, rig.tracker,
+		func(ctx context.Context) bool { return selfHeals }, false)
+	if err != nil {
+		rig.t.Fatalf("unexpected error: %v", err)
+	}
+	return result
+}
+
+// runDry is like run but with dryRun = true.
+func (rig *resizeRig) runDry(desired map[string]v1.ResourceRequirements, mode ResizeMode, fallback ResizeFallbackConfig, selfHeals bool) resizeResult {
+	rig.t.Helper()
+	result, err := resizeWithFakeTarget(context.Background(), rig.client, "test", rig.selector, desired, mode, fallback, rig.tracker,
+		func(ctx context.Context) bool { return selfHeals }, true)
+	if err != nil {
+		rig.t.Fatalf("unexpected error: %v", err)
+	}
+	return result
+}
+
 // ---------------------------------------------------------------------------
-// resize_test.go: buildResizePatch tests
+// buildResizePatch tests
 // ---------------------------------------------------------------------------
 
 // Verifies that buildResizePatch is a no-op when the pod is already at
@@ -146,7 +230,7 @@ func TestBuildResizePatch_NoOpWhenPodHasExtraDimensions(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// resize_test.go: classifyResize tests
+// classifyResize tests
 // ---------------------------------------------------------------------------
 
 // Pod condition matrix: makes sure we classify each kubelet-reported
@@ -233,7 +317,7 @@ func TestClassifyResize(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// resize_test.go: resizeTracker tests
+// resizeTracker tests
 // ---------------------------------------------------------------------------
 
 // Tracker contract: the first-seen timestamp is stable across repeat calls
@@ -298,7 +382,7 @@ func TestResizeTracker_Retain(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// resize_runningpods_test.go helpers
+// helpers
 // ---------------------------------------------------------------------------
 
 // fakeResizeTarget implements the resizeTarget interface for testing.
@@ -451,8 +535,8 @@ func resizeWithFakeTarget(
 // TestResizeRunningPods_SkipsNotOwnedPod verifies that a pod matching the
 // selector but not owned by the target is neither resized nor disrupted.
 func TestResizeRunningPods_SkipsNotOwnedPod(t *testing.T) {
-	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("200m")}}
+	oldRes := cpuReq("100m")
+	newRes := cpuReq("200m")
 
 	foreign := makePod("foreign", v1.PodRunning, nil, oldRes) // would need a patch if considered
 
@@ -475,14 +559,12 @@ func TestResizeRunningPods_SkipsNotOwnedPod(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	rig := newResizeRig(t, server)
 	fallback := ResizeFallbackConfig{GracePeriod: time.Millisecond, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
-
 	fake := &fakeResizeTarget{
-		selector:  selector,
+		selector:  rig.selector,
 		namespace: "test",
-		clientset: client,
+		clientset: rig.client,
 		selfHeals: func(ctx context.Context) bool { return false },
 		patcher:   func(map[string]v1.ResourceRequirements) error { return nil },
 		ownsPod:   func(pod *v1.Pod) bool { return false }, // target owns nothing
@@ -491,8 +573,8 @@ func TestResizeRunningPods_SkipsNotOwnedPod(t *testing.T) {
 		resizeMode:     ResizeModeInPlaceOrRecreate,
 		fallbackConfig: fallback,
 		clock:          clock.RealClock{},
-		clientset:      client,
-		tracker:        newResizeTracker(),
+		clientset:      rig.client,
+		tracker:        rig.tracker,
 	}
 
 	result, err := r.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
@@ -555,30 +637,19 @@ func TestResizeRunningPods_RepatchResetsGraceClock(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
-
-	tracker := newResizeTracker()
+	rig := newResizeRig(t, server)
 	// Stale entry from the previous (now superseded) desired size: well past grace.
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	rig.pastGrace("pod-a")
 
-	result, err := resizeWithFakeTarget(
-		context.Background(), client, "test", selector, map[string]v1.ResourceRequirements{"main": newRes},
-		ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false }, // non-self-healing -> would delete/evict
-		false,
-	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, false)
 	if result.Applied != 1 {
 		t.Errorf("Applied = %d, want 1", result.Applied)
 	}
 	if deleteCount != 0 {
 		t.Errorf("pod was disrupted %d time(s); want 0 — the fresh patch should reset the grace clock", deleteCount)
 	}
-	if _, tracked := tracker.notResizedSince[types.UID("pod-a")]; !tracked {
+	if _, tracked := rig.tracker.notResizedSince[types.UID("pod-a")]; !tracked {
 		t.Errorf("expected a fresh tracker entry started at patch time, found none")
 	}
 }
@@ -586,39 +657,16 @@ func TestResizeRunningPods_RepatchResetsGraceClock(t *testing.T) {
 // TestResizeRunningPods_AllAlreadyOK verifies that when every pod already
 // matches the desired resources we get AlreadyOK == pod count.
 func TestResizeRunningPods_AllAlreadyOK(t *testing.T) {
-	res := v1.ResourceRequirements{
-		Requests: v1.ResourceList{
-			v1.ResourceCPU:    resource.MustParse("100m"),
-			v1.ResourceMemory: resource.MustParse("128Mi"),
-		},
-	}
+	res := reqs(t, "100m", "128Mi")
 	pods := []v1.Pod{
 		makePod("pod-a", v1.PodRunning, nil, res),
 		makePod("pod-b", v1.PodRunning, nil, res),
 	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podListResponse(pods))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
+	server := newPodListServer(pods)
 	defer server.Close()
+	rig := newResizeRig(t, server)
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	desired := map[string]v1.ResourceRequirements{"main": res}
-	tracker := newResizeTracker()
-
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector, desired, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
 	if result.TargetPods != 2 {
 		t.Errorf("TargetPods = %d, want 2", result.TargetPods)
 	}
@@ -633,37 +681,14 @@ func TestResizeRunningPods_AllAlreadyOK(t *testing.T) {
 // TestResizeRunningPods_InProgress verifies that a pod already at desired
 // spec but showing InProgress is counted correctly via the no-patch path.
 func TestResizeRunningPods_InProgress(t *testing.T) {
-	newRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
-	}
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, inProgressConds(), res)
 
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizeInProgress,
-		Status: v1.ConditionTrue,
-	}}, newRes)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podListResponse([]v1.Pod{pod}))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
+	server := newPodListServer([]v1.Pod{pod})
 	defer server.Close()
+	rig := newResizeRig(t, server)
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
 	if result.Applied != 0 {
 		t.Errorf("Applied = %d, want 0 (no patch needed)", result.Applied)
 	}
@@ -674,38 +699,14 @@ func TestResizeRunningPods_InProgress(t *testing.T) {
 
 // TestResizeRunningPods_Deferred verifies Deferred counting via the no-patch path.
 func TestResizeRunningPods_Deferred(t *testing.T) {
-	newRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
-	}
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, deferredConds(), res)
 
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: v1.PodReasonDeferred,
-	}}, newRes)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podListResponse([]v1.Pod{pod}))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
+	server := newPodListServer([]v1.Pod{pod})
 	defer server.Close()
+	rig := newResizeRig(t, server)
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
 	if result.Applied != 0 {
 		t.Errorf("Applied = %d, want 0 (no patch needed)", result.Applied)
 	}
@@ -717,26 +718,16 @@ func TestResizeRunningPods_Deferred(t *testing.T) {
 // TestResizeRunningPods_InfeasibleTracksGrace verifies that an Infeasible
 // pod is tracked and NOT deleted before the grace period expires.
 func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
-	oldRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")},
-	}
-	newRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
-	}
+	oldRes := cpuReq("50m")
+	newRes := cpuReq("100m")
 
 	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
-	infeasiblePod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: v1.PodReasonInfeasible,
-	}}, newRes)
 
 	deleted := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
 			p := pod
@@ -753,19 +744,11 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
+	rig := newResizeRig(t, server)
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	// Phase 1: patch sent; no conditions yet → Applied=1, no delete.
+	result := rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, false)
 	if result.Applied != 1 {
 		t.Errorf("Applied = %d, want 1", result.Applied)
 	}
@@ -773,22 +756,15 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 		t.Error("pod was deleted before grace period expired")
 	}
 
-	// Simulate the next poll: kubelet has now written the Infeasible
-	// condition. The pod spec already matches desired, so the no-patch
-	// path classifies it. Pre-seed tracker so grace has elapsed.
+	// Phase 2: kubelet wrote Infeasible; spec already matches desired.
+	// Pre-seed tracker so grace has elapsed.
 	pod.Spec.Containers = append([]v1.Container(nil), pod.Spec.Containers...)
 	pod.Spec.Containers[0].Resources = newRes
-	pod.Status.Conditions = infeasiblePod.Status.Conditions
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	pod.Status.Conditions = infeasibleConds()
+	rig.pastGrace("pod-a")
 
 	deleted = false
-	result, err = resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result = rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, false)
 	if result.Infeasible != 1 {
 		t.Errorf("Infeasible = %d, want 1", result.Infeasible)
 	}
@@ -803,12 +779,8 @@ func TestResizeRunningPods_InfeasibleTracksGrace(t *testing.T) {
 // TestResizeRunningPods_SkipTerminalAndDeleting verifies pods in terminal
 // phases or with a DeletionTimestamp are ignored.
 func TestResizeRunningPods_SkipTerminalAndDeleting(t *testing.T) {
-	res := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")},
-	}
-	newRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
-	}
+	res := cpuReq("50m")
+	newRes := cpuReq("100m")
 
 	now := metav1.Now()
 	pods := []v1.Pod{
@@ -826,7 +798,6 @@ func TestResizeRunningPods_SkipTerminalAndDeleting(t *testing.T) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse(pods))
 		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
 			var p v1.Pod
@@ -859,18 +830,9 @@ func TestResizeRunningPods_SkipTerminalAndDeleting(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	rig := newResizeRig(t, server)
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
 	if result.TargetPods != 4 {
 		t.Errorf("TargetPods = %d, want 4", result.TargetPods)
 	}
@@ -882,40 +844,23 @@ func TestResizeRunningPods_SkipTerminalAndDeleting(t *testing.T) {
 // TestResizeRunningPods_Transient404 verifies that a 404 during patch is
 // treated as transient (not counted as an error).
 func TestResizeRunningPods_Transient404(t *testing.T) {
-	oldRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")},
-	}
-	newRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
-	}
-
+	oldRes := cpuReq("50m")
+	newRes := cpuReq("100m")
 	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
-		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
-			w.WriteHeader(http.StatusNotFound)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer server.Close()
+	rig := newResizeRig(t, server)
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
 	if result.Transient != 1 {
 		t.Errorf("Transient = %d, want 1", result.Transient)
 	}
@@ -930,29 +875,17 @@ func TestResizeRunningPods_Transient404(t *testing.T) {
 // TestResizeRunningPods_MaxPodsPerCycle verifies that MaxPodsPerCycle
 // limits fallback deletes in a single cycle.
 func TestResizeRunningPods_MaxPodsPerCycle(t *testing.T) {
-	newRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
-	}
-
+	res := cpuReq("100m")
 	// Pods already have desired spec but are Infeasible so the no-patch
 	// path classifies them and the fallback can fire.
-	podA := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: "Infeasible",
-	}}, newRes)
-	podB := makePod("pod-b", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: "Infeasible",
-	}}, newRes)
+	podA := makePod("pod-a", v1.PodRunning, infeasibleConds(), res)
+	podB := makePod("pod-b", v1.PodRunning, infeasibleConds(), res)
 
 	deleteCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{podA, podB}))
 		case req.Method == "DELETE" && strings.HasPrefix(req.URL.Path, "/api/v1/namespaces/test/pods/"):
 			deleteCount++
@@ -962,22 +895,10 @@ func TestResizeRunningPods_MaxPodsPerCycle(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a", "pod-b")
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-	// Pre-seed tracker so both pods are past grace period.
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
-	tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute)
-
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, stdFallback, false)
 	if result.Evicted != 1 {
 		t.Errorf("Evicted = %d, want 1", result.Evicted)
 	}
@@ -990,22 +911,14 @@ func TestResizeRunningPods_MaxPodsPerCycle(t *testing.T) {
 // pods whose spec already matches desired but are Infeasible from a
 // previous cycle are still tracked and can be fallback-deleted.
 func TestResizeRunningPods_NoPatchButInfeasible(t *testing.T) {
-	res := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
-	}
-
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: "Infeasible",
-	}}, res)
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, infeasibleConds(), res)
 
 	deleted := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
 			deleted = true
@@ -1015,20 +928,10 @@ func TestResizeRunningPods_NoPatchButInfeasible(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
-
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, stdFallback, false)
 	if result.Infeasible != 1 {
 		t.Errorf("Infeasible = %d, want 1", result.Infeasible)
 	}
@@ -1043,37 +946,14 @@ func TestResizeRunningPods_NoPatchButInfeasible(t *testing.T) {
 // TestResizeRunningPods_PendingPodIncluded verifies that Pending pods are
 // included for convergence.
 func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
-	newRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
-	}
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodPending, inProgressConds(), res)
 
-	pod := makePod("pod-a", v1.PodPending, []v1.PodCondition{{
-		Type:   v1.PodResizeInProgress,
-		Status: v1.ConditionTrue,
-	}}, newRes)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(podListResponse([]v1.Pod{pod}))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
+	server := newPodListServer([]v1.Pod{pod})
 	defer server.Close()
+	rig := newResizeRig(t, server)
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
 	if result.Applied != 0 {
 		t.Errorf("Applied = %d, want 0 (no patch needed)", result.Applied)
 	}
@@ -1086,12 +966,8 @@ func TestResizeRunningPods_PendingPodIncluded(t *testing.T) {
 // written asynchronously by the kubelet are detected on the *next* poll
 // cycle via the no-patch path.
 func TestResizeRunningPods_AsyncClassification(t *testing.T) {
-	oldRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")},
-	}
-	newRes := v1.ResourceRequirements{
-		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
-	}
+	oldRes := cpuReq("50m")
+	newRes := cpuReq("100m")
 
 	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
 
@@ -1099,7 +975,6 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
 			p := pod
@@ -1113,19 +988,10 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
+	rig := newResizeRig(t, server)
 
 	// First cycle: patch accepted, but no conditions yet → Applied=1.
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
 	if result.Applied != 1 {
 		t.Errorf("Applied = %d, want 1", result.Applied)
 	}
@@ -1137,18 +1003,9 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 	// desired, so the no-patch path classifies it.
 	pod.Spec.Containers = append([]v1.Container(nil), pod.Spec.Containers...)
 	pod.Spec.Containers[0].Resources = newRes
-	pod.Status.Conditions = []v1.PodCondition{{
-		Type:   v1.PodResizeInProgress,
-		Status: v1.ConditionTrue,
-	}}
+	pod.Status.Conditions = inProgressConds()
 
-	result, err = resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result = rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
 	if result.Applied != 0 {
 		t.Errorf("Applied = %d, want 0 (no patch needed)", result.Applied)
 	}
@@ -1162,19 +1019,15 @@ func TestResizeRunningPods_AsyncClassification(t *testing.T) {
 // recreated via the fallback while the OTHER pods are resized in place and
 // left running.
 func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
-	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")}}
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+	oldRes := cpuReq("50m")
+	newRes := cpuReq("100m")
 
 	// pod-a and pod-c still need a resize and will accept it in place.
 	podA := makePod("pod-a", v1.PodRunning, nil, oldRes)
 	podC := makePod("pod-c", v1.PodRunning, nil, oldRes)
 	// pod-b is already at the desired spec but stuck Infeasible from a prior
 	// cycle — it is the "one of many" that fails to resize within the period.
-	podB := makePod("pod-b", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: "Infeasible",
-	}}, newRes)
+	podB := makePod("pod-b", v1.PodRunning, infeasibleConds(), newRes)
 
 	inProgress := func(name string) *v1.Pod {
 		p := makePod(name, v1.PodRunning, []v1.PodCondition{{
@@ -1217,27 +1070,24 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-	tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute) // past grace
+	rig := newResizeRig(t, server)
+	rig.tracker.notResizedSince[types.UID("pod-b")] = time.Now().Add(-10 * time.Minute) // past grace
 
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	patcher := func(resources map[string]v1.ResourceRequirements) error { templatePatches++; return nil }
 	fake := &fakeResizeTarget{
-		selector:  selector,
+		selector:  rig.selector,
 		namespace: "test",
-		clientset: client,
+		clientset: rig.client,
 		selfHeals: func(ctx context.Context) bool { return false },
 		patcher:   patcher,
 	}
 	r := &podResizer{
 		resizeMode:     ResizeModeInPlaceOrRecreate,
 		fallbackConfig: fallback,
-		dryRun:         false,
 		clock:          clock.RealClock{},
-		clientset:      client,
-		tracker:        tracker,
+		clientset:      rig.client,
+		tracker:        rig.tracker,
 	}
 	result, err := r.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
@@ -1273,12 +1123,8 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 // cpvpa does NOT report a recreate or reset the clock — it counts RecreateStuck
 // and keeps the tracker entry so the wedged state stays visible.
 func TestResizeRunningPods_SelfHealingTemplateAlreadyCurrent(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-	podA := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: "Infeasible",
-	}}, newRes)
+	newRes := cpuReq("100m")
+	podA := makePod("pod-a", v1.PodRunning, infeasibleConds(), newRes)
 
 	deleted := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -1295,17 +1141,15 @@ func TestResizeRunningPods_SelfHealingTemplateAlreadyCurrent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
+	rig := newResizeRig(t, server)
 	// Stuck well past 3x the grace period, so the escalation branch is exercised.
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-20 * time.Minute)
+	rig.tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-20 * time.Minute)
 
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	fake := &fakeResizeTarget{
-		selector:               selector,
+		selector:               rig.selector,
 		namespace:              "test",
-		clientset:              client,
+		clientset:              rig.client,
 		selfHeals:              func(ctx context.Context) bool { return true },
 		templateAlreadyCurrent: true, // PatchTemplate is a no-op -> changed == false
 	}
@@ -1313,8 +1157,8 @@ func TestResizeRunningPods_SelfHealingTemplateAlreadyCurrent(t *testing.T) {
 		resizeMode:     ResizeModeInPlaceOrRecreate,
 		fallbackConfig: fallback,
 		clock:          clock.RealClock{},
-		clientset:      client,
-		tracker:        tracker,
+		clientset:      rig.client,
+		tracker:        rig.tracker,
 	}
 
 	result, err := r.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
@@ -1330,7 +1174,7 @@ func TestResizeRunningPods_SelfHealingTemplateAlreadyCurrent(t *testing.T) {
 	if deleted != 0 {
 		t.Errorf("deleted = %d, want 0 (self-healing target must never be disrupted directly)", deleted)
 	}
-	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; !ok {
+	if _, ok := rig.tracker.notResizedSince[types.UID("pod-a")]; !ok {
 		t.Errorf("tracker entry was cleared; the wedged pod's stuck duration must be retained")
 	}
 }
@@ -1340,12 +1184,8 @@ func TestResizeRunningPods_SelfHealingTemplateAlreadyCurrent(t *testing.T) {
 // patches the template and lets the controller recreate the pod, WITHOUT a
 // manual delete.
 func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-	podA := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: "Infeasible",
-	}}, newRes)
+	res := cpuReq("100m")
+	podA := makePod("pod-a", v1.PodRunning, infeasibleConds(), res)
 
 	deleted := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -1361,33 +1201,10 @@ func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
-
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	patcher := func(resources map[string]v1.ResourceRequirements) error { return nil }
-	fake := &fakeResizeTarget{
-		selector:  selector,
-		namespace: "test",
-		clientset: client,
-		selfHeals: func(ctx context.Context) bool { return true }, // Deployment / RollingUpdate DS
-		patcher:   patcher,
-	}
-	r := &podResizer{
-		resizeMode:     ResizeModeInPlaceOrRecreate,
-		fallbackConfig: fallback,
-		dryRun:         false,
-		clock:          clock.RealClock{},
-		clientset:      client,
-		tracker:        tracker,
-	}
-	result, err := r.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, stdFallback, true)
 	if result.RecreateTriggered != 1 {
 		t.Errorf("RecreateTriggered = %d, want 1 (recreate handed to the controller)", result.RecreateTriggered)
 	}
@@ -1402,13 +1219,9 @@ func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 // TestResizeRunningPods_PersistentDeferredRecreated verifies the unified
 // fallback rule: a pod stuck Deferred past the grace period is recreated.
 func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+	res := cpuReq("100m")
 	// Spec already at desired (no-patch branch) but stuck Deferred.
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: "Deferred",
-	}}, newRes)
+	pod := makePod("pod-a", v1.PodRunning, deferredConds(), res)
 
 	deleteCount := 0
 	templatePatches := 0
@@ -1426,29 +1239,26 @@ func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute) // past grace
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
 
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
 	patcher := func(resources map[string]v1.ResourceRequirements) error { templatePatches++; return nil }
 	fake := &fakeResizeTarget{
-		selector:  selector,
+		selector:  rig.selector,
 		namespace: "test",
-		clientset: client,
+		clientset: rig.client,
 		selfHeals: func(ctx context.Context) bool { return false },
 		patcher:   patcher,
 	}
 	resizer := &podResizer{
 		resizeMode:     ResizeModeInPlaceOrRecreate,
 		fallbackConfig: fallback,
-		dryRun:         false,
 		clock:          clock.RealClock{},
-		clientset:      client,
-		tracker:        tracker,
+		clientset:      rig.client,
+		tracker:        rig.tracker,
 	}
-	result, err := resizer.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
+	result, err := resizer.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": res})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1469,12 +1279,8 @@ func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 // TestResizeRunningPods_TransientDeferredNotRecreated verifies the grace
 // period protects a transient Deferred.
 func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: "Deferred",
-	}}, newRes)
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, deferredConds(), res)
 
 	deleteCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -1490,31 +1296,9 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	rig := newResizeRig(t, server) // tracker not pre-seeded: first time seen, age ~0
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker() // not pre-seeded: first time seen, age ~0
-
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-	fake := &fakeResizeTarget{
-		selector:  selector,
-		namespace: "test",
-		clientset: client,
-		selfHeals: func(ctx context.Context) bool { return false },
-		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
-	}
-	resizer := &podResizer{
-		resizeMode:     ResizeModeInPlaceOrRecreate,
-		fallbackConfig: fallback,
-		dryRun:         false,
-		clock:          clock.RealClock{},
-		clientset:      client,
-		tracker:        tracker,
-	}
-	result, err := resizer.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, stdFallback, false)
 	if result.Deferred != 1 {
 		t.Errorf("Deferred = %d, want 1", result.Deferred)
 	}
@@ -1525,7 +1309,7 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 		t.Errorf("deleteCount = %d, want 0", deleteCount)
 	}
 	// And the pod is now tracked, so a later cycle past grace can act on it.
-	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; !ok {
+	if _, ok := rig.tracker.notResizedSince[types.UID("pod-a")]; !ok {
 		t.Errorf("expected pod-a to be tracked as not resized")
 	}
 }
@@ -1533,8 +1317,8 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 // TestResizeRunningPods_InvalidPatchNoPanic is a regression test: a synchronous
 // Invalid (HTTP 422) rejection from the /resize patch must not panic the loop.
 func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
-	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")}}
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+	oldRes := cpuReq("50m")
+	newRes := cpuReq("100m")
 
 	podA := makePod("pod-a", v1.PodRunning, nil, oldRes) // /resize rejected with 422
 	podB := makePod("pod-b", v1.PodRunning, nil, oldRes) // /resize succeeds
@@ -1555,30 +1339,9 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	rig := newResizeRig(t, server)
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-
-	fake := &fakeResizeTarget{
-		selector:  selector,
-		namespace: "test",
-		clientset: client,
-		selfHeals: func(ctx context.Context) bool { return false },
-		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
-	}
-	resizer := &podResizer{
-		resizeMode:     ResizeModeInPlace,
-		fallbackConfig: ResizeFallbackConfig{},
-		dryRun:         false,
-		clock:          clock.RealClock{},
-		clientset:      client,
-		tracker:        tracker,
-	}
-	result, err := resizer.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
 	// pod-a's 422 is counted as Infeasible (not Errors); pod-b still resized.
 	if result.Applied != 1 {
 		t.Errorf("Applied = %d, want 1 (pod-b processed after pod-a was rejected)", result.Applied)
@@ -1594,16 +1357,14 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 // TestResizeRunningPods_Unexpected500 verifies that an unclassified error
 // (e.g. 500 Internal Server Error) counts as Errors.
 func TestResizeRunningPods_Unexpected500(t *testing.T) {
-	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")}}
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-
+	oldRes := cpuReq("50m")
+	newRes := cpuReq("100m")
 	pod := makePod("pod-a", v1.PodRunning, nil, oldRes)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1612,18 +1373,9 @@ func TestResizeRunningPods_Unexpected500(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	rig := newResizeRig(t, server)
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
 	if result.Applied != 0 {
 		t.Errorf("Applied = %d, want 0", result.Applied)
 	}
@@ -1638,20 +1390,14 @@ func TestResizeRunningPods_Unexpected500(t *testing.T) {
 // TestResizeRunningPods_DryRunNoFallbackDelete verifies that in dry-run mode
 // an Infeasible pod past its grace period does not trigger any delete action.
 func TestResizeRunningPods_DryRunNoFallbackDelete(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: v1.PodReasonInfeasible,
-	}}, newRes)
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, infeasibleConds(), res)
 
 	deleted := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
 			deleted = true
@@ -1661,30 +1407,17 @@ func TestResizeRunningPods_DryRunNoFallbackDelete(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-
-	// Pre-seed tracker so grace has already elapsed.
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
-
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		true) // dryRun = true
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.runDry(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, stdFallback, false)
 	if result.Infeasible != 1 {
 		t.Errorf("Infeasible = %d, want 1", result.Infeasible)
 	}
 	if deleted {
 		t.Error("pod was deleted in dry-run mode")
 	}
-	// Tracker entry should still be present since we didn't actually evict.
-	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; !ok {
+	if _, ok := rig.tracker.notResizedSince[types.UID("pod-a")]; !ok {
 		t.Errorf("expected pod-a tracker entry to be retained in dry-run")
 	}
 }
@@ -1762,8 +1495,8 @@ func TestActuationState_Unmanaged(t *testing.T) {
 // TestResizeRunningPods_ActuationMismatch triggers the fallback path when the
 // kubelet reports stale resources (actuation mismatch) past the grace period.
 func TestResizeRunningPods_ActuationMismatch(t *testing.T) {
-	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("50m")}}
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+	oldRes := cpuReq("50m")
+	newRes := cpuReq("100m")
 
 	pod := makePod("pod-a", v1.PodRunning, nil, newRes)
 	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
@@ -1777,7 +1510,6 @@ func TestResizeRunningPods_ActuationMismatch(t *testing.T) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
 			deleted = true
@@ -1787,22 +1519,10 @@ func TestResizeRunningPods_ActuationMismatch(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
 
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
-	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
-
-	// Pre-seed tracker so grace has already elapsed.
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
-
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, stdFallback, false)
 	if result.ActuationLag != 1 {
 		t.Errorf("ActuationLag = %d, want 1", result.ActuationLag)
 	}
@@ -1819,20 +1539,14 @@ func TestResizeRunningPods_ActuationMismatch(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestResizeRunningPods_EvictionSuccess(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: v1.PodReasonInfeasible,
-	}}, newRes)
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, infeasibleConds(), res)
 
 	evicted := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "POST" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/eviction":
 			evicted = true
@@ -1842,45 +1556,30 @@ func TestResizeRunningPods_EvictionSuccess(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionEviction}
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
 
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, fallback, false)
 	if result.Evicted != 1 {
 		t.Errorf("Evicted = %d, want 1", result.Evicted)
 	}
 	if !evicted {
 		t.Error("pod was NOT evicted")
 	}
-	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; ok {
+	if _, ok := rig.tracker.notResizedSince[types.UID("pod-a")]; ok {
 		t.Error("tracker entry should be cleared after successful eviction")
 	}
 }
 
 func TestResizeRunningPods_EvictionBlockedByPDB(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: v1.PodReasonInfeasible,
-	}}, newRes)
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, infeasibleConds(), res)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "POST" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/eviction":
 			w.WriteHeader(http.StatusTooManyRequests) // 429
@@ -1889,20 +1588,11 @@ func TestResizeRunningPods_EvictionBlockedByPDB(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionEviction}
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
 
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, fallback, false)
 	if result.EvictionBlocked != 1 {
 		t.Errorf("EvictionBlocked = %d, want 1", result.EvictionBlocked)
 	}
@@ -1912,30 +1602,22 @@ func TestResizeRunningPods_EvictionBlockedByPDB(t *testing.T) {
 	if result.Errors != 0 {
 		t.Errorf("Errors = %d, want 0", result.Errors)
 	}
-	// Tracker entry must be retained so the pod is retried next cycle.
-	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; !ok {
+	if _, ok := rig.tracker.notResizedSince[types.UID("pod-a")]; !ok {
 		t.Error("tracker entry should be retained when eviction is blocked")
 	}
-	// Eviction blocked must NOT consume MaxPodsPerCycle budget.
 	if result.RecreateTriggered != 0 {
 		t.Errorf("RecreateTriggered = %d, want 0", result.RecreateTriggered)
 	}
 }
 
 func TestResizeRunningPods_EvictionBlockedEscalation(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: v1.PodReasonInfeasible,
-	}}, newRes)
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, infeasibleConds(), res)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "POST" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/eviction":
 			w.WriteHeader(http.StatusTooManyRequests) // 429
@@ -1944,22 +1626,13 @@ func TestResizeRunningPods_EvictionBlockedEscalation(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionEviction}
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
 	// Pre-seed eviction blocked time so it exceeds 3× grace (15 min).
-	tracker.evictionBlockedSince[types.UID("pod-a")] = time.Now().Add(-20 * time.Minute)
+	rig.tracker.evictionBlockedSince[types.UID("pod-a")] = time.Now().Add(-20 * time.Minute)
 
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, fallback, false)
 	if result.EvictionBlocked != 1 {
 		t.Errorf("EvictionBlocked = %d, want 1", result.EvictionBlocked)
 	}
@@ -1970,19 +1643,13 @@ func TestResizeRunningPods_EvictionBlockedEscalation(t *testing.T) {
 }
 
 func TestResizeRunningPods_EvictionNotFound(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: v1.PodReasonInfeasible,
-	}}, newRes)
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, infeasibleConds(), res)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "POST" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a/eviction":
 			w.WriteHeader(http.StatusNotFound)
@@ -1991,20 +1658,11 @@ func TestResizeRunningPods_EvictionNotFound(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionEviction}
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
 
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, fallback, false)
 	if result.Evicted != 0 {
 		t.Errorf("Evicted = %d, want 0", result.Evicted)
 	}
@@ -2012,26 +1670,20 @@ func TestResizeRunningPods_EvictionNotFound(t *testing.T) {
 		t.Errorf("Errors = %d, want 0", result.Errors)
 	}
 	// Tracker should be cleared because the pod is already gone.
-	if _, ok := tracker.notResizedSince[types.UID("pod-a")]; ok {
+	if _, ok := rig.tracker.notResizedSince[types.UID("pod-a")]; ok {
 		t.Error("tracker entry should be cleared when pod is NotFound")
 	}
 }
 
 func TestResizeRunningPods_DeleteModeRegression(t *testing.T) {
-	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
-
-	pod := makePod("pod-a", v1.PodRunning, []v1.PodCondition{{
-		Type:   v1.PodResizePending,
-		Status: v1.ConditionTrue,
-		Reason: v1.PodReasonInfeasible,
-	}}, newRes)
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, infeasibleConds(), res)
 
 	deleted := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			w.Write(podListResponse([]v1.Pod{pod}))
 		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-a":
 			deleted = true
@@ -2041,20 +1693,11 @@ func TestResizeRunningPods_DeleteModeRegression(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
-	client := newResizeTestClient(server)
-	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
-	tracker := newResizeTracker()
 	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
-	tracker.notResizedSince[types.UID("pod-a")] = time.Now().Add(-10 * time.Minute)
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
 
-	result, err := resizeWithFakeTarget(context.Background(), client, "test", selector,
-		map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlaceOrRecreate, fallback, tracker,
-		func(ctx context.Context) bool { return false },
-		false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res}, ResizeModeInPlaceOrRecreate, fallback, false)
 	if result.Evicted != 1 {
 		t.Errorf("Evicted = %d, want 1", result.Evicted)
 	}
