@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	apiv1 "k8s.io/api/core/v1"
@@ -127,90 +126,6 @@ func TestDiscoverAPI(t *testing.T) {
 			t.Errorf("Expect error, got no error for kind: %q", tc.kind)
 			continue
 		}
-	}
-}
-
-func TestGetPodSelector(t *testing.T) {
-	tests := []struct {
-		name       string
-		kind       string
-		targetName string
-		selector   *metav1.LabelSelector
-	}{
-		{
-			name:       "deployment",
-			kind:       "Deployment",
-			targetName: "test-dep",
-			selector:   &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
-		},
-		{
-			name:       "daemonset",
-			kind:       "DaemonSet",
-			targetName: "test-ds",
-			selector:   &metav1.LabelSelector{MatchLabels: map[string]string{"app": "ds"}},
-		},
-		{
-			name:       "replicaset",
-			kind:       "ReplicaSet",
-			targetName: "test-rs",
-			selector:   &metav1.LabelSelector{MatchLabels: map[string]string{"app": "rs"}},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				var obj interface{}
-				switch req.URL.Path {
-				case "/apis/apps/v1" + "/namespaces/default/" + strings.ToLower(tc.kind) + "s/" + tc.targetName:
-					obj = map[string]interface{}{
-						"metadata": map[string]interface{}{
-							"name":      tc.targetName,
-							"namespace": "default",
-						},
-						"spec": map[string]interface{}{
-							"selector": tc.selector,
-						},
-					}
-				default:
-					w.WriteHeader(http.StatusNotFound)
-					return
-				}
-				output, _ := json.Marshal(obj)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusOK)
-				w.Write(output)
-			}))
-			defer server.Close()
-
-			client := clientset.NewForConfigOrDie(&restclient.Config{
-				Host: server.URL,
-				ContentConfig: restclient.ContentConfig{
-					GroupVersion: &schema.GroupVersion{Group: "apps", Version: "v1"},
-				},
-			})
-
-			tgt := &targetSpec{
-				Kind:         tc.kind,
-				Name:         tc.targetName,
-				Namespace:    "default",
-				GroupVersion: "apps/v1",
-			}
-			k8scli, err := newK8sClient(client, newTargetClient(*tgt, client, false), nil, ResizeModeRecreate)
-			if err != nil {
-				t.Fatalf("failed to create k8sClient: %v", err)
-			}
-
-			sel, err := k8scli.target.GetPodSelector(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			expected := metav1.FormatLabelSelector(tc.selector)
-			if sel.String() != expected {
-				t.Errorf("expected selector %q, got %q", expected, sel.String())
-			}
-		})
 	}
 }
 
@@ -330,7 +245,7 @@ func TestUpdateResources(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error making target %q: %v", tc.target, err)
 		}
-		k8scli, err := newK8sClient(client, newTargetClient(*tgt, client, false), nil, ResizeModeRecreate)
+		k8scli, err := newK8sClient(client, tgt, nil, ResizeModeRecreate)
 		if err != nil {
 			t.Fatalf("error creating k8sClient: %v", err)
 		}

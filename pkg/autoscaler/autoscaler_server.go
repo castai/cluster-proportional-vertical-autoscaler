@@ -325,7 +325,7 @@ func (sc ScaleConfig) String() string {
 	var buf bytes.Buffer
 	buf.WriteString("{ ")
 	for k, v := range sc {
-		buf.WriteString(fmt.Sprintf("[%s]: %s, ", k, v))
+		fmt.Fprintf(&buf, "[%s]: %s, ", k, v)
 	}
 	buf.WriteString("}")
 	return buf.String()
@@ -335,11 +335,11 @@ func (csc ContainerScaleConfig) String() string {
 	var buf bytes.Buffer
 	buf.WriteString("{ requests: { ")
 	for k, v := range csc.Requests {
-		buf.WriteString(fmt.Sprintf("[%s]: %s, ", k, v))
+		fmt.Fprintf(&buf, "[%s]: %s, ", k, v)
 	}
 	buf.WriteString("}, limits: { ")
 	for k, v := range csc.Limits {
-		buf.WriteString(fmt.Sprintf("[%s]: %s", k, v))
+		fmt.Fprintf(&buf, "[%s]: %s", k, v)
 	}
 	buf.WriteString("} }")
 	return buf.String()
@@ -349,19 +349,19 @@ func (rsc ResourceScaleConfig) String() string {
 	var buf bytes.Buffer
 	buf.WriteString("{ ")
 	if rsc.Base != nil {
-		buf.WriteString(fmt.Sprintf("base=%s ", rsc.Base.String()))
+		fmt.Fprintf(&buf, "base=%s ", rsc.Base.String())
 	}
 	if rsc.Max != nil {
-		buf.WriteString(fmt.Sprintf("max=%s ", rsc.Max.String()))
+		fmt.Fprintf(&buf, "max=%s ", rsc.Max.String())
 	}
 	if rsc.Step != nil {
-		buf.WriteString(fmt.Sprintf("incr=%s ", rsc.Step.String()))
+		fmt.Fprintf(&buf, "incr=%s ", rsc.Step.String())
 	}
 	if rsc.CoresPerStep != nil {
-		buf.WriteString(fmt.Sprintf("cores_incr=%d ", *rsc.CoresPerStep))
+		fmt.Fprintf(&buf, "cores_incr=%d ", *rsc.CoresPerStep)
 	}
 	if rsc.NodesPerStep != nil {
-		buf.WriteString(fmt.Sprintf("nodes_incr=%d ", *rsc.NodesPerStep))
+		fmt.Fprintf(&buf, "nodes_incr=%d ", *rsc.NodesPerStep)
 	}
 	buf.WriteString("}")
 	return buf.String()

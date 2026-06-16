@@ -81,10 +81,8 @@ type podResizer struct {
 	fallbackConfig ResizeFallbackConfig
 	dryRun         bool
 	clock          clock.PassiveClock
-
-	clientset kubernetes.Interface
-	target    resizeTarget
-	tracker   *resizeTracker
+	clientset      kubernetes.Interface
+	tracker        *resizeTracker
 }
 
 type resizeResult struct {
@@ -104,10 +102,10 @@ type resizeResult struct {
 
 // resizeRunningPods enumerates pods owned by the target controller and
 // brings them to `desired` via the /resize subresource.
-func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v1.ResourceRequirements) (resizeResult, error) {
+func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget, desired map[string]v1.ResourceRequirements) (resizeResult, error) {
 	var result resizeResult
 
-	pods, err := r.target.GetOwnedPods(ctx)
+	pods, err := target.GetOwnedPods(ctx)
 	if err != nil {
 		return result, fmt.Errorf("get owned pods: %w", err)
 	}
@@ -118,7 +116,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 
 	selfHealing := false
 	if r.resizeMode == ResizeModeInPlaceOrRecreate {
-		selfHealing = r.target.IsSelfHealing(ctx)
+		selfHealing = target.IsSelfHealing(ctx)
 	}
 
 	templatePatched := false
@@ -126,7 +124,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 		if templatePatched {
 			return nil
 		}
-		if err := r.target.PatchTemplate(ctx, desired); err != nil {
+		if err := target.PatchTemplate(ctx, desired); err != nil {
 			return err
 		}
 		templatePatched = true

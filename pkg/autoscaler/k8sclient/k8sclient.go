@@ -54,9 +54,10 @@ type K8sClient interface {
 
 // k8sClient - Wraps all Kubernetes API client functionality.
 type k8sClient struct {
+	target     *targetMeta
 	clientset  kubernetes.Interface
+	dryRun     bool
 	resizeMode ResizeMode
-	target     *targetClient
 	podResizer *podResizer
 }
 
@@ -84,13 +85,13 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 	if err != nil {
 		return nil, err
 	}
-	tc := newTargetClient(*tgt, clientset, dryRun)
 
-	if mode == ResizeModeInPlace {
+	switch mode {
+	case ResizeModeInPlace:
 		if err := EnsureResizeSubresource(clientset); err != nil {
 			return nil, fmt.Errorf("in-place resize requires the pods/resize subresource: %w", err)
 		}
-	} else if mode == ResizeModeInPlaceOrRecreate {
+	case ResizeModeInPlaceOrRecreate:
 		if err := EnsureResizeSubresource(clientset); err != nil {
 			glog.Warningf("pods/resize unavailable (%v); %s degrading to %s", err, mode, ResizeModeRecreate)
 			mode = ResizeModeRecreate
@@ -105,18 +106,17 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 			dryRun:         dryRun,
 			clock:          clk,
 			clientset:      clientset,
-			target:         tc,
 			tracker:        newResizeTracker(),
 		}
 	}
 
-	return newK8sClient(clientset, tc, resizer, mode)
+	return newK8sClient(clientset, tgt, resizer, mode)
 }
 
 // newK8sClient builds a k8sClient from its core dependencies.
 func newK8sClient(
 	clientset kubernetes.Interface,
-	target *targetClient,
+	target *targetMeta,
 	podResizer *podResizer,
 	mode ResizeMode,
 ) (*k8sClient, error) {
@@ -139,7 +139,7 @@ func userAgent() string {
 	return command + "/" + version.Version
 }
 
-func makeTarget(client kubernetes.Interface, target, namespace string) (*targetSpec, error) {
+func makeTarget(client kubernetes.Interface, target, namespace string) (*targetMeta, error) {
 	splits := strings.Split(target, "/")
 	if len(splits) != 2 {
 		return nil, fmt.Errorf("target format error: %v", target)
@@ -152,7 +152,7 @@ func makeTarget(client kubernetes.Interface, target, namespace string) (*targetS
 		return nil, err
 	}
 
-	tgt, err := newTargetSpec(kind, groupVersions, namespace, name)
+	tgt, err := newTargetMeta(kind, groupVersions, namespace, name)
 	if err != nil {
 		return nil, err
 	}
@@ -204,8 +204,8 @@ func discoverAPI(client kubernetes.Interface, kindArg string) (kind string, grou
 	return kind, groupVersions, nil
 }
 
-// targetSpec stores the scalable target resource.
-type targetSpec struct {
+// targetMeta stores the scalable target resource.
+type targetMeta struct {
 	Kind         string
 	GroupVersion string
 	Namespace    string
@@ -217,13 +217,13 @@ type targetSpec struct {
 // resource-specific patch method.
 type patchFunc func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error
 
-func newTargetSpec(kind string, groupVersions map[string]bool, namespace, name string) (*targetSpec, error) {
+func newTargetMeta(kind string, groupVersions map[string]bool, namespace, name string) (*targetMeta, error) {
 	groupVer, patcher, err := findPatcher(kind, groupVersions)
 	if err != nil {
 		return nil, err
 	}
 
-	return &targetSpec{
+	return &targetMeta{
 		Kind:         kind,
 		GroupVersion: groupVer,
 		Namespace:    namespace,
@@ -232,7 +232,7 @@ func newTargetSpec(kind string, groupVersions map[string]bool, namespace, name s
 	}, nil
 }
 
-func (tgt *targetSpec) Patch(ctx context.Context, client kubernetes.Interface, pt types.PatchType, data []byte) error {
+func (tgt *targetMeta) Patch(ctx context.Context, client kubernetes.Interface, pt types.PatchType, data []byte) error {
 	return tgt.patcher(ctx, client, tgt.Namespace, tgt.Name, pt, data)
 }
 
@@ -369,198 +369,26 @@ func findStatefulSetPatcher(groupVersions map[string]bool) (string, patchFunc, e
 	return "", nil, fmt.Errorf("no supported API group for target: %v", groupVersions)
 }
 
+type targetSpec struct {
+	UID           types.UID
+	PodSelector   labels.Selector
+	IsSelfHealing bool
+}
+
 // targetClient encapsulates the target workload object and its client
 // dependencies for querying and patching.
 type targetClient struct {
-	spec targetSpec
-
+	meta      targetMeta
 	clientset kubernetes.Interface
-	patcher   patchFunc
 	dryRun    bool
 
-	cachedSelector      labels.Selector
-	cachedIsSelfHealing *bool
-	cachedUID           types.UID // target object UID, captured during getPodSelector (no extra API call)
+	cachedSpec *targetSpec
 }
 
-// newTargetClient builds a targetClient from a targetSpec and its dependencies.
-func newTargetClient(spec targetSpec, clientset kubernetes.Interface, dryRun bool) *targetClient {
-	return &targetClient{
-		spec:      spec,
-		clientset: clientset,
-		patcher:   spec.patcher,
-		dryRun:    dryRun,
-	}
-}
-
-// Namespace returns the namespace of the target workload.
-func (t *targetClient) Namespace() string {
-	return t.spec.Namespace
-}
-
-// GetOwnedPods returns the live pods owned by this target.  It fetches the
-// selector, lists pods in the target namespace, and filters out pods not
-// owned by the target.
-func (t *targetClient) GetOwnedPods(ctx context.Context) ([]v1.Pod, error) {
-	selector, err := t.GetPodSelector(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	list, err := t.clientset.CoreV1().Pods(t.spec.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: selector.String(),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	var owned []v1.Pod
-	for i := range list.Items {
-		pod := &list.Items[i]
-		if !t.OwnsPod(pod) {
-			continue
-		}
-		owned = append(owned, *pod)
-	}
-	return owned, nil
-}
-
-// GetPodSelector returns the pod selector for the target workload.
-func (t *targetClient) GetPodSelector(ctx context.Context) (labels.Selector, error) {
-	selector, err := t.getPodSelector(ctx)
-	if err != nil {
-		if t.cachedSelector != nil {
-			glog.V(2).Infof("get pod selector: %s/%s: %v; using cached value (%s)",
-				t.spec.Namespace, t.spec.Name, err, t.cachedSelector)
-			return t.cachedSelector, nil
-		}
-		return nil, err
-	}
-
-	t.cachedSelector = selector
-	return selector, nil
-}
-
-// OwnsPod reports whether pod is controlled by this target, using only the
-// pod's controller ownerReference and metadata already cached by
-// GetPodSelector — it makes no API calls.
-//
-// For ReplicaSet and DaemonSet targets the pod's controller is the target
-// itself, so we compare UIDs directly (authoritative, since UIDs are unique).
-//
-// For Deployment targets the pod is owned by a ReplicaSet, which is in turn
-// owned by the Deployment. We only have the pod's ownerReference (the RS name
-// and UID), not the RS object, so verifying the RS->Deployment link by UID
-// would require an extra API call. Instead we rely on the Deployment
-// controller's RS naming convention "<deployment-name>-<pod-template-hash>",
-// where the hash is a single token containing no '-'. This is an
-// implementation detail of the Deployment controller (stable for many
-// releases, but not a formal API guarantee); it disambiguates e.g. Deployment
-// "web" from "web-canary", whose RS names are "web-canary-<hash>".
-func (t *targetClient) OwnsPod(pod *v1.Pod) bool {
-	ctrl := metav1.GetControllerOf(pod)
-	if ctrl == nil {
-		return false // orphan or no controlling owner
-	}
-	switch strings.ToLower(t.spec.Kind) {
-	case "replicaset":
-		return ctrl.Kind == "ReplicaSet" && t.cachedUID != "" && ctrl.UID == t.cachedUID
-	case "daemonset":
-		return ctrl.Kind == "DaemonSet" && t.cachedUID != "" && ctrl.UID == t.cachedUID
-	case "deployment":
-		return ctrl.Kind == "ReplicaSet" && rsNameOwnedByDeployment(ctrl.Name, t.spec.Name)
-	default:
-		return false
-	}
-}
-
-// rsNameOwnedByDeployment reports whether a ReplicaSet name matches the
-// Deployment controller's "<deployment-name>-<pod-template-hash>" convention
-// for the given deployment, where the hash segment contains no '-'.
-func rsNameOwnedByDeployment(rsName, deployName string) bool {
-	prefix := deployName + "-"
-	if !strings.HasPrefix(rsName, prefix) {
-		return false
-	}
-	hash := rsName[len(prefix):]
-	return hash != "" && !strings.Contains(hash, "-")
-}
-
-// getPodSelector fetches the pod selector for the target workload.
-func (t *targetClient) getPodSelector(ctx context.Context) (labels.Selector, error) {
-	var selector *metav1.LabelSelector
-
-	switch strings.ToLower(t.spec.Kind) {
-	case "deployment":
-		dep, err := t.clientset.AppsV1().Deployments(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
-		if err != nil {
-			return nil, err
-		}
-		selector = dep.Spec.Selector
-		t.cachedUID = dep.UID
-	case "daemonset":
-		ds, err := t.clientset.AppsV1().DaemonSets(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
-		if err != nil {
-			return nil, err
-		}
-		selector = ds.Spec.Selector
-		t.cachedUID = ds.UID
-	case "replicaset":
-		rs, err := t.clientset.AppsV1().ReplicaSets(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
-		if err != nil {
-			return nil, err
-		}
-		selector = rs.Spec.Selector
-		t.cachedUID = rs.UID
-	default:
-		return nil, fmt.Errorf("unknown target kind: %s", t.spec.Kind)
-	}
-
-	return metav1.LabelSelectorAsSelector(selector)
-}
-
-// IsSelfHealing reports whether the target controller recreates its pods on
-// its own in response to a template change. Deployments and RollingUpdate
-// DaemonSets do (the controller paces the replacement via maxUnavailable/PDB,
-// so cpvpa must NOT delete pods itself). Bare ReplicaSets/ReplicationControllers
-// and OnDelete DaemonSets do not, so cpvpa must delete the pod to force a
-// recreate.
-//
-// On API error it falls back internally: if a cached value exists it is
-// reused; otherwise it returns false (safe default: direct delete).
-func (t *targetClient) IsSelfHealing(ctx context.Context) bool {
-	switch strings.ToLower(t.spec.Kind) {
-	case "deployment":
-		return true
-	case "daemonset":
-		ds, err := t.clientset.AppsV1().DaemonSets(t.spec.Namespace).
-			Get(ctx, t.spec.Name, metav1.GetOptions{})
-		if err != nil {
-			if t.cachedIsSelfHealing != nil {
-				glog.V(2).Infof("self-heal check: get daemonset %s/%s: %v; using cached value (%t)",
-					t.spec.Namespace, t.spec.Name, err, *t.cachedIsSelfHealing)
-				return *t.cachedIsSelfHealing
-			}
-			glog.Errorf("self-heal check: get daemonset %s/%s: %v; assuming non-self-healing (will delete pods directly)",
-				t.spec.Namespace, t.spec.Name, err)
-			return false
-		}
-		selfHeals := ds.Spec.UpdateStrategy.Type != appsv1.OnDeleteDaemonSetStrategyType
-		t.cachedIsSelfHealing = &selfHeals
-		return selfHeals
-	default: // bare ReplicaSet — not owned by a higher controller, so autoscaler deletes pods itself
-		return false
-	}
-}
-
-// PatchTemplate updates spec.template.spec.containers[].resources on the
-// workload. On a Deployment or RollingUpdate DaemonSet this bumps the
-// pod-template-hash and triggers the controller's rolling recreate, so it is
-// only ever called on the Recreate path and the InPlaceOrRecreate fallback —
-// never on a successful in-place resize.
+// PatchTemplate updates spec.template.spec.containers[].resources on the workload.
 func (t *targetClient) PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) error {
 	if t.dryRun {
-		glog.Infof("dry-run: would patch %s/%s template resources", t.spec.Kind, t.spec.Name)
+		glog.Infof("dry-run: would patch %s/%s template resources", t.meta.Kind, t.meta.Name)
 		return nil
 	}
 	ctrs := make([]interface{}, 0, len(resources))
@@ -571,10 +399,10 @@ func (t *targetClient) PatchTemplate(ctx context.Context, resources map[string]v
 		})
 	}
 	patch := map[string]interface{}{
-		"apiVersion": t.spec.GroupVersion,
-		"kind":       t.spec.Kind,
+		"apiVersion": t.meta.GroupVersion,
+		"kind":       t.meta.Kind,
 		"metadata": map[string]interface{}{
-			"name": t.spec.Name,
+			"name": t.meta.Name,
 		},
 		"spec": map[string]interface{}{
 			"template": map[string]interface{}{
@@ -589,10 +417,138 @@ func (t *targetClient) PatchTemplate(ctx context.Context, resources map[string]v
 	if err != nil {
 		return fmt.Errorf("can't marshal template patch to JSON: %v", err)
 	}
-	if err := t.spec.Patch(ctx, t.clientset, types.StrategicMergePatchType, jb); err != nil {
+	if err := t.meta.Patch(ctx, t.clientset, types.StrategicMergePatchType, jb); err != nil {
 		return fmt.Errorf("template patch failed: %v", err)
 	}
 	return nil
+}
+
+// GetOwnedPods returns the live pods owned by this target.  It fetches the
+// selector, lists pods in the target namespace, and filters out pods not
+// owned by the target.
+func (t *targetClient) GetOwnedPods(ctx context.Context) ([]v1.Pod, error) {
+	spec, err := t.trySyncSpec(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := t.clientset.CoreV1().Pods(t.meta.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: spec.PodSelector.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var owned []v1.Pod
+	for i := range list.Items {
+		pod := &list.Items[i]
+		if !t.ownsPod(*spec, pod) {
+			continue
+		}
+		owned = append(owned, *pod)
+	}
+	return owned, nil
+}
+
+// ownsPod reports whether pod is controlled by this target.
+//
+// For ReplicaSet and DaemonSet targets the pod's controller is the target
+// itself, so we compare UIDs directly.
+//
+// For Deployment targets the pod is owned by a ReplicaSet, which is in turn
+// owned by the Deployment. We rely on the Deployment
+// controller's RS naming convention "<deployment-name>-<pod-template-hash>".
+func (t *targetClient) ownsPod(spec targetSpec, pod *v1.Pod) bool {
+	ctrl := metav1.GetControllerOf(pod)
+	if ctrl == nil {
+		return false // orphan or no controlling owner
+	}
+	ctrlKind := strings.ToLower(ctrl.Kind)
+	switch strings.ToLower(t.meta.Kind) {
+	case "replicaset":
+		return ctrlKind == "replicaset" && spec.UID != "" && ctrl.UID == spec.UID
+	case "daemonset":
+		return ctrlKind == "daemonset" && spec.UID != "" && ctrl.UID == spec.UID
+	case "deployment":
+		if ctrlKind != "replicaset" {
+			return false
+		}
+		prefix := t.meta.Name + "-"
+		if !strings.HasPrefix(ctrl.Name, prefix) {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *targetClient) trySyncSpec(ctx context.Context) (*targetSpec, error) {
+	if t.cachedSpec != nil {
+		return t.cachedSpec, nil
+	}
+
+	spec, err := t.fetchSpec(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	t.cachedSpec = spec
+	return spec, nil
+}
+
+func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
+	var spec targetSpec
+	var selector *metav1.LabelSelector
+
+	switch strings.ToLower(t.meta.Kind) {
+	case "deployment":
+		dep, err := t.clientset.AppsV1().Deployments(t.meta.Namespace).Get(ctx, t.meta.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		selector = dep.Spec.Selector
+		spec.UID = dep.UID
+		spec.IsSelfHealing = true
+	case "daemonset":
+		ds, err := t.clientset.AppsV1().DaemonSets(t.meta.Namespace).Get(ctx, t.meta.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		selector = ds.Spec.Selector
+		spec.UID = ds.UID
+		spec.IsSelfHealing = ds.Spec.UpdateStrategy.Type != appsv1.OnDeleteDaemonSetStrategyType
+	case "replicaset":
+		rs, err := t.clientset.AppsV1().ReplicaSets(t.meta.Namespace).Get(ctx, t.meta.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		selector = rs.Spec.Selector
+		spec.UID = rs.UID
+		spec.IsSelfHealing = true
+	default:
+		return nil, fmt.Errorf("unknown target kind: %s", t.meta.Kind)
+	}
+
+	if selector, err := metav1.LabelSelectorAsSelector(selector); err != nil {
+		return nil, err
+	} else {
+		spec.PodSelector = selector
+	}
+
+	return &spec, nil
+}
+
+// IsSelfHealing reports whether the target controller recreates its pods on
+// its own in response to a template change.
+func (t *targetClient) IsSelfHealing(ctx context.Context) bool {
+	spec, err := t.trySyncSpec(ctx)
+	if err != nil {
+		glog.Warningf("self-heal check for %s %s/%s: %v; assuming non-self-healing (will delete pods directly)",
+			t.meta.Kind, t.meta.Namespace, t.meta.Name, err)
+		return false
+	}
+	return spec.IsSelfHealing
 }
 
 // ClusterSize defines the cluster status.
@@ -626,14 +582,20 @@ func (k *k8sClient) GetClusterSize(ctx context.Context) (clusterStatus *ClusterS
 }
 
 func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1.ResourceRequirements, reqsChanged bool) error {
+	target := &targetClient{
+		meta:      *k.target,
+		clientset: k.clientset,
+		dryRun:    k.dryRun,
+	}
+
 	if k.resizeMode == ResizeModeRecreate {
 		if !reqsChanged {
 			return nil
 		}
-		return k.target.PatchTemplate(ctx, resources)
+		return target.PatchTemplate(ctx, resources)
 	}
 
-	result, err := k.podResizer.resizeRunningPods(ctx, resources)
+	result, err := k.podResizer.resizeRunningPods(ctx, target, resources)
 	glog.V(1).Infof("resize cycle: %+v", result)
 	if err != nil {
 		return fmt.Errorf("in-place resize: %w", err)

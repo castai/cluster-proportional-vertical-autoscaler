@@ -65,7 +65,9 @@ func TestPollAPIServer_RecreateMode(t *testing.T) {
 		stopCh:        make(chan struct{}),
 	}
 
-	as.pollAPIServer(context.Background())
+	if err := as.pollAPIServer(context.Background()); err != nil {
+		t.Fatalf("poll API server: %v", err)
+	}
 
 	if !deployPatched {
 		t.Fatal("deployment template was NOT patched in Recreate mode")
@@ -129,7 +131,6 @@ func TestPollAPIServer_InPlaceMode(t *testing.T) {
 		clock:         clocktesting.NewFakeClock(time.Now()),
 		stopCh:        make(chan struct{}),
 	}
-
 
 	if err := as.pollAPIServer(context.Background()); err != nil {
 		t.Fatalf("poll API server: %v", err)
@@ -303,8 +304,8 @@ func newMockAPIServer(t *testing.T, cfg mockServerConfig) *httptest.Server {
 							Labels: map[string]string{"app": "test"},
 							OwnerReferences: []metav1.OwnerReference{
 								{
-									Name: "test-dep-abc",
-									Kind: "ReplicaSet",
+									Name:       "test-dep-abc",
+									Kind:       "ReplicaSet",
 									Controller: &true,
 								},
 							},

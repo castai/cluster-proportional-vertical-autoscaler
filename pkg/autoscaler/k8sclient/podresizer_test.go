@@ -432,10 +432,9 @@ func resizeWithFakeTarget(
 		dryRun:         dryRun,
 		clock:          clock.RealClock{},
 		clientset:      client,
-		target:         fake,
 		tracker:        tracker,
 	}
-	return r.resizeRunningPods(ctx, desired)
+	return r.resizeRunningPods(ctx, fake, desired)
 }
 
 // ---------------------------------------------------------------------------
@@ -486,11 +485,10 @@ func TestResizeRunningPods_SkipsNotOwnedPod(t *testing.T) {
 		fallbackConfig: fallback,
 		clock:          clock.RealClock{},
 		clientset:      client,
-		target:         fake,
 		tracker:        newResizeTracker(),
 	}
 
-	result, err := r.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
+	result, err := r.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1232,10 +1230,9 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 		dryRun:         false,
 		clock:          clock.RealClock{},
 		clientset:      client,
-		target:         fake,
 		tracker:        tracker,
 	}
-	result, err := r.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
+	result, err := r.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1310,10 +1307,9 @@ func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 		dryRun:         false,
 		clock:          clock.RealClock{},
 		clientset:      client,
-		target:         fake,
 		tracker:        tracker,
 	}
-	result, err := r.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
+	result, err := r.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1375,10 +1371,9 @@ func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 		dryRun:         false,
 		clock:          clock.RealClock{},
 		clientset:      client,
-		target:         fake,
 		tracker:        tracker,
 	}
-	result, err := resizer.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
+	result, err := resizer.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1439,10 +1434,9 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 		dryRun:         false,
 		clock:          clock.RealClock{},
 		clientset:      client,
-		target:         fake,
 		tracker:        tracker,
 	}
-	result, err := resizer.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
+	result, err := resizer.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1504,10 +1498,9 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 		dryRun:         false,
 		clock:          clock.RealClock{},
 		clientset:      client,
-		target:         fake,
 		tracker:        tracker,
 	}
-	result, err := resizer.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
+	result, err := resizer.resizeRunningPods(context.Background(), fake, map[string]v1.ResourceRequirements{"main": newRes})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
