@@ -469,6 +469,8 @@ func (t *targetClient) ownsPod(spec targetSpec, pod *v1.Pod) bool {
 		return ctrlKind == "replicaset" && spec.UID != "" && ctrl.UID == spec.UID
 	case "daemonset":
 		return ctrlKind == "daemonset" && spec.UID != "" && ctrl.UID == spec.UID
+	case "statefulset":
+		return ctrlKind == "statefulset" && spec.UID != "" && ctrl.UID == spec.UID
 	case "deployment":
 		if ctrlKind != "replicaset" {
 			return false
