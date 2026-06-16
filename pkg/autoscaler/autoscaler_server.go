@@ -85,6 +85,7 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 // updates the target resource with the expected replicas if necessary.
 func (s *AutoScaler) Run() {
 	ticker := s.clock.NewTicker(s.pollPeriod)
+	defer ticker.Stop()
 
 	// Base context for all API work this loop performs, cancelled when the
 	// autoscaler is stopped so in-flight requests abort promptly on shutdown.
