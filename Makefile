@@ -40,7 +40,7 @@ REGISTRY_USERNAME ?= oauth2accesstoken
 REGISTRY_PASSWORD ?= $$(gcloud auth print-access-token)
 
 # This version-strategy uses git tags to set the version string
-VERSION ?= "v0.9.0-alpha.3"
+VERSION ?= $(shell git describe --tags --always --dirty)
 #
 # This version-strategy uses a manual value to set the version string
 #VERSION ?= 1.2.3
@@ -322,7 +322,7 @@ push: container
 
 # This depends on github.com/estesp/manifest-tool.
 manifest-list: # @HELP builds a manifest list of containers for all platforms
-manifest-list: all-push
+manifest-list: all-push manifest-tool
 	for bin in $(BINS); do                                    \
 	    platforms=$$(echo $(ALL_PLATFORMS) | sed 's/ /,/g');  \
 	    bin/tools/manifest-tool                               \

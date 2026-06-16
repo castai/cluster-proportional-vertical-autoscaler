@@ -138,7 +138,6 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 	for i := range pods {
 		live[pods[i].UID] = true
 	}
-	defer r.tracker.retain(live)
 
 	for i := range pods {
 		pod := &pods[i]
@@ -233,6 +232,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 		}
 	}
 
+	r.tracker.retain(live)
 	return result, nil
 }
 
