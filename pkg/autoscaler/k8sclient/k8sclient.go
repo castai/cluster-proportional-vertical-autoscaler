@@ -535,7 +535,7 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		}
 		selector = ss.Spec.Selector
 		spec.UID = ss.UID
-		spec.IsSelfHealing = true
+		spec.IsSelfHealing = ss.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType
 	default:
 		return nil, fmt.Errorf("unknown target kind: %s", t.meta.Kind)
 	}
