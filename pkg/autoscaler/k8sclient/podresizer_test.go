@@ -343,11 +343,11 @@ func (f *fakeResizeTarget) GetPodSelector(ctx context.Context) (labels.Selector,
 	return f.selector, nil
 }
 
-func (f *fakeResizeTarget) IsSelfHealing(ctx context.Context) bool {
+func (f *fakeResizeTarget) IsSelfHealing(ctx context.Context) (bool, error) {
 	if f.selfHeals != nil {
-		return f.selfHeals(ctx)
+		return f.selfHeals(ctx), nil
 	}
-	return false
+	return false, nil
 }
 
 func (f *fakeResizeTarget) PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) error {

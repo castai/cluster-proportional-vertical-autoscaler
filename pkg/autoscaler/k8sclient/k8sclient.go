@@ -541,14 +541,12 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 
 // IsSelfHealing reports whether the target controller recreates its pods on
 // its own in response to a template change.
-func (t *targetClient) IsSelfHealing(ctx context.Context) bool {
+func (t *targetClient) IsSelfHealing(ctx context.Context) (bool, error) {
 	spec, err := t.trySyncSpec(ctx)
 	if err != nil {
-		glog.Warningf("self-heal check for %s %s/%s: %v; assuming non-self-healing (will delete pods directly)",
-			t.meta.Kind, t.meta.Namespace, t.meta.Name, err)
-		return false
+		return false, err
 	}
-	return spec.IsSelfHealing
+	return spec.IsSelfHealing, nil
 }
 
 // ClusterSize defines the cluster status.

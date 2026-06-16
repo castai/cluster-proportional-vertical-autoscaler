@@ -70,7 +70,7 @@ type ResizeFallbackConfig struct {
 }
 
 type resizeTarget interface {
-	IsSelfHealing(ctx context.Context) bool
+	IsSelfHealing(ctx context.Context) (bool, error)
 	PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) error
 	GetOwnedPods(ctx context.Context) ([]v1.Pod, error)
 }
@@ -116,7 +116,10 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 
 	selfHealing := false
 	if r.resizeMode == ResizeModeInPlaceOrRecreate {
-		selfHealing = target.IsSelfHealing(ctx)
+		selfHealing, err = target.IsSelfHealing(ctx)
+		if err != nil {
+			return result, fmt.Errorf("self-heal check: %w", err)
+		}
 	}
 
 	templatePatched := false
