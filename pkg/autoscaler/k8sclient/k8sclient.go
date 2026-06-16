@@ -456,8 +456,8 @@ func (t *targetClient) GetOwnedPods(ctx context.Context) ([]v1.Pod, error) {
 // itself, so we compare UIDs directly.
 //
 // For Deployment targets the pod is owned by a ReplicaSet, which is in turn
-// owned by the Deployment. We rely on the Deployment
-// controller's RS naming convention "<deployment-name>-<pod-template-hash>".
+// owned by the Deployment. We rely on the Deployment controller's RS naming
+// convention "<deployment-name>-<pod-template-hash>".
 func (t *targetClient) ownsPod(spec targetSpec, pod *v1.Pod) bool {
 	ctrl := metav1.GetControllerOf(pod)
 	if ctrl == nil {
@@ -477,7 +477,8 @@ func (t *targetClient) ownsPod(spec targetSpec, pod *v1.Pod) bool {
 		if !strings.HasPrefix(ctrl.Name, prefix) {
 			return false
 		}
-		return true
+		hash := ctrl.Name[len(prefix):]
+		return hash != "" && !strings.Contains(hash, "-")
 	default:
 		return false
 	}
