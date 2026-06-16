@@ -22,7 +22,6 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/clock"
@@ -71,10 +70,9 @@ type ResizeFallbackConfig struct {
 }
 
 type resizeTarget interface {
-	GetPodSelector(ctx context.Context) (labels.Selector, error)
 	IsSelfHealing(ctx context.Context) bool
 	PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) error
-	Namespace() string
+	GetOwnedPods(ctx context.Context) ([]v1.Pod, error)
 }
 
 // podResizer orchestrates in-place pod resizing and recreation fallback.
@@ -109,19 +107,12 @@ type resizeResult struct {
 func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v1.ResourceRequirements) (resizeResult, error) {
 	var result resizeResult
 
-	selector, err := r.target.GetPodSelector(ctx)
+	pods, err := r.target.GetOwnedPods(ctx)
 	if err != nil {
-		return result, fmt.Errorf("resolve selector: %w", err)
+		return result, fmt.Errorf("get owned pods: %w", err)
 	}
 
-	pods, err := r.clientset.CoreV1().Pods(r.target.Namespace()).List(ctx, metav1.ListOptions{
-		LabelSelector: selector.String(),
-	})
-	if err != nil {
-		return result, fmt.Errorf("list pods: %w", err)
-	}
-
-	result.TargetPods = len(pods.Items)
+	result.TargetPods = len(pods)
 	evictedThisCycle := 0
 	now := r.clock.Now()
 
@@ -142,16 +133,16 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, desired map[string]v
 		return nil
 	}
 
-	live := make(map[types.UID]bool, len(pods.Items))
-	for i := range pods.Items {
-		live[pods.Items[i].UID] = true
+	live := make(map[types.UID]bool, len(pods))
+	for i := range pods {
+		live[pods[i].UID] = true
 	}
 
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 
 		if err := ctx.Err(); err != nil {
-			glog.Warningf("resize cycle truncated after %d/%d pods: %v", i, len(pods.Items), err)
+			glog.Warningf("resize cycle truncated after %d/%d pods: %v", i, len(pods), err)
 			break
 		}
 

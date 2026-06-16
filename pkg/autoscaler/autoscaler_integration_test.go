@@ -130,7 +130,10 @@ func TestPollAPIServer_InPlaceMode(t *testing.T) {
 		stopCh:        make(chan struct{}),
 	}
 
-	as.pollAPIServer(context.Background())
+
+	if err := as.pollAPIServer(context.Background()); err != nil {
+		t.Fatalf("poll API server: %v", err)
+	}
 
 	if !resizePatched {
 		t.Fatal("running pod was not resized")
@@ -290,13 +293,21 @@ func newMockAPIServer(t *testing.T, cfg mockServerConfig) *httptest.Server {
 
 		// --- pod list (for resize) ---
 		if req.Method == "GET" && strings.HasPrefix(req.URL.Path, "/api/v1/namespaces/default/pods") {
+			true := true
 			list := apiv1.PodList{
 				Items: []apiv1.Pod{
 					{
 						ObjectMeta: metav1.ObjectMeta{
-							Name: "test-dep-abc", Namespace: "default",
+							Name: "test-dep-abc-def", Namespace: "default",
 							UID:    types.UID("pod-1"),
 							Labels: map[string]string{"app": "test"},
+							OwnerReferences: []metav1.OwnerReference{
+								{
+									Name: "test-dep-abc",
+									Kind: "ReplicaSet",
+									Controller: &true,
+								},
+							},
 						},
 						Spec: apiv1.PodSpec{
 							Containers: []apiv1.Container{{

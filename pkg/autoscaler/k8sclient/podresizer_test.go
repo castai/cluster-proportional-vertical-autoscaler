@@ -307,6 +307,36 @@ type fakeResizeTarget struct {
 	namespace string
 	selfHeals func(ctx context.Context) bool
 	patcher   func(resources map[string]v1.ResourceRequirements) error
+	ownsPod   func(pod *v1.Pod) bool
+	clientset clientset.Interface
+}
+
+func (f *fakeResizeTarget) OwnsPod(pod *v1.Pod) bool {
+	if f.ownsPod != nil {
+		return f.ownsPod(pod)
+	}
+	return true // default: the target owns every selector-matched pod
+}
+
+func (f *fakeResizeTarget) GetOwnedPods(ctx context.Context) ([]v1.Pod, error) {
+	if f.clientset == nil {
+		return nil, nil
+	}
+	list, err := f.clientset.CoreV1().Pods(f.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: f.selector.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	var owned []v1.Pod
+	for i := range list.Items {
+		pod := &list.Items[i]
+		if f.ownsPod != nil && !f.ownsPod(pod) {
+			continue
+		}
+		owned = append(owned, *pod)
+	}
+	return owned, nil
 }
 
 func (f *fakeResizeTarget) GetPodSelector(ctx context.Context) (labels.Selector, error) {
@@ -393,6 +423,7 @@ func resizeWithFakeTarget(
 		selector:  selector,
 		namespace: namespace,
 		selfHeals: selfHeals,
+		clientset: client,
 		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
 	}
 	r := &podResizer{
@@ -410,6 +441,66 @@ func resizeWithFakeTarget(
 // ---------------------------------------------------------------------------
 // resize_runningpods_test.go: podResizer tests
 // ---------------------------------------------------------------------------
+
+// TestResizeRunningPods_SkipsNotOwnedPod verifies that a pod matching the
+// selector but not owned by the target is neither resized nor disrupted.
+func TestResizeRunningPods_SkipsNotOwnedPod(t *testing.T) {
+	oldRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")}}
+	newRes := v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("200m")}}
+
+	foreign := makePod("foreign", v1.PodRunning, nil, oldRes) // would need a patch if considered
+
+	patchCount, disruptCount := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{foreign}))
+		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
+			patchCount++
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podResponse(&foreign))
+		case req.Method == "DELETE" || (req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/eviction")):
+			disruptCount++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newResizeTestClient(server)
+	selector := labels.SelectorFromSet(map[string]string{"app": "test"})
+	fallback := ResizeFallbackConfig{GracePeriod: time.Millisecond, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
+
+	fake := &fakeResizeTarget{
+		selector:  selector,
+		namespace: "test",
+		clientset: client,
+		selfHeals: func(ctx context.Context) bool { return false },
+		patcher:   func(map[string]v1.ResourceRequirements) error { return nil },
+		ownsPod:   func(pod *v1.Pod) bool { return false }, // target owns nothing
+	}
+	r := &podResizer{
+		resizeMode:     ResizeModeInPlaceOrRecreate,
+		fallbackConfig: fallback,
+		clock:          clock.RealClock{},
+		clientset:      client,
+		target:         fake,
+		tracker:        newResizeTracker(),
+	}
+
+	result, err := r.resizeRunningPods(context.Background(), map[string]v1.ResourceRequirements{"main": newRes})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if patchCount != 0 || disruptCount != 0 {
+		t.Errorf("foreign pod was touched: patches=%d disruptions=%d, want 0/0", patchCount, disruptCount)
+	}
+	if result.Applied != 0 || result.Evicted != 0 {
+		t.Errorf("Applied=%d Evicted=%d, want 0/0", result.Applied, result.Evicted)
+	}
+}
 
 // TestResizeRunningPods_RepatchResetsGraceClock guards against premature
 // eviction when a pod that was already being tracked (e.g. stuck reaching a
@@ -1131,6 +1222,7 @@ func TestResizeRunningPods_PartialFailure_OneOfMany(t *testing.T) {
 	fake := &fakeResizeTarget{
 		selector:  selector,
 		namespace: "test",
+		clientset: client,
 		selfHeals: func(ctx context.Context) bool { return false },
 		patcher:   patcher,
 	}
@@ -1208,6 +1300,7 @@ func TestResizeRunningPods_FallbackSelfHealingNoDelete(t *testing.T) {
 	fake := &fakeResizeTarget{
 		selector:  selector,
 		namespace: "test",
+		clientset: client,
 		selfHeals: func(ctx context.Context) bool { return true }, // Deployment / RollingUpdate DS
 		patcher:   patcher,
 	}
@@ -1272,6 +1365,7 @@ func TestResizeRunningPods_PersistentDeferredRecreated(t *testing.T) {
 	fake := &fakeResizeTarget{
 		selector:  selector,
 		namespace: "test",
+		clientset: client,
 		selfHeals: func(ctx context.Context) bool { return false },
 		patcher:   patcher,
 	}
@@ -1335,6 +1429,7 @@ func TestResizeRunningPods_TransientDeferredNotRecreated(t *testing.T) {
 	fake := &fakeResizeTarget{
 		selector:  selector,
 		namespace: "test",
+		clientset: client,
 		selfHeals: func(ctx context.Context) bool { return false },
 		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
 	}
@@ -1399,6 +1494,7 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 	fake := &fakeResizeTarget{
 		selector:  selector,
 		namespace: "test",
+		clientset: client,
 		selfHeals: func(ctx context.Context) bool { return false },
 		patcher:   func(resources map[string]v1.ResourceRequirements) error { return nil },
 	}

@@ -98,19 +98,23 @@ func (s *AutoScaler) Run() {
 	s.readyCh <- struct{}{} // For testing.
 
 	// Don't wait for ticker and execute pollAPIServer() for the first time.
-	s.pollAPIServer(ctx)
+	if err := s.pollAPIServer(ctx); err != nil {
+		glog.Errorf("Error: %v", err)
+	}
 
 	for {
 		select {
 		case <-ticker.C():
-			s.pollAPIServer(ctx)
+			if err := s.pollAPIServer(ctx); err != nil {
+				glog.Errorf("Error: %v", err)
+			}
 		case <-s.stopCh:
 			return
 		}
 	}
 }
 
-func (s *AutoScaler) pollAPIServer(ctx context.Context) {
+func (s *AutoScaler) pollAPIServer(ctx context.Context) error {
 	// Bound one poll cycle (cluster-size read + resize) by the poll period;
 	// shutdown cancellation is inherited from the ctx passed by Run.
 	ctx, cancel := context.WithTimeout(ctx, s.pollPeriod)
@@ -119,23 +123,20 @@ func (s *AutoScaler) pollAPIServer(ctx context.Context) {
 	// Query the apiserver for the cluster status --- number of nodes and cores
 	clusterSize, err := s.k8sClient.GetClusterSize(ctx)
 	if err != nil {
-		glog.Errorf("Error getting cluster size: %v", err)
-		return
+		return fmt.Errorf("get cluster size: %v", err)
 	}
 	glog.V(4).Infof("Nodes %5d", clusterSize.Nodes)
 	glog.V(4).Infof("Cores %5d", clusterSize.Cores)
 
 	fileBytes, err := s.readConfigFileIfChanged()
 	if err != nil {
-		glog.Errorf("Failed to read config file %q: %v", s.configFile, err)
-		return
+		return fmt.Errorf("read config file %q: %v", s.configFile, err)
 	}
 	if s.currentConfig == nil || len(fileBytes) > 0 {
 		cfg := s.defaultConfig.DeepCopy()
 		if len(fileBytes) > 0 {
 			if err := json.Unmarshal(fileBytes, &cfg); err != nil {
-				glog.Errorf("Failed to unmarshal config file %q: %v", s.configFile, err)
-				return
+				return fmt.Errorf("unmarshal config file %q: %v", s.configFile, err)
 			}
 		}
 		s.currentConfig = cfg
@@ -175,10 +176,12 @@ func (s *AutoScaler) pollAPIServer(ctx context.Context) {
 	// created pods converge and stuck resizes are retried); it internally
 	// no-ops when reqsChanged is false in Recreate mode.
 	if err = s.k8sClient.UpdateResources(ctx, newReqs, reqsChanged); err != nil {
-		glog.Errorf("Update failure: %s", err)
+		return fmt.Errorf("update resources: %s", err)
 	} else {
 		s.lastReqs = newReqs
 	}
+
+	return nil
 }
 
 func logRequirements(reqs map[string]apiv1.ResourceRequirements) {

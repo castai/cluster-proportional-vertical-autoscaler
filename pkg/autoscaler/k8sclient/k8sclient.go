@@ -380,6 +380,7 @@ type targetClient struct {
 
 	cachedSelector      labels.Selector
 	cachedIsSelfHealing *bool
+	cachedUID           types.UID // target object UID, captured during getPodSelector (no extra API call)
 }
 
 // newTargetClient builds a targetClient from a targetSpec and its dependencies.
@@ -395,6 +396,33 @@ func newTargetClient(spec targetSpec, clientset kubernetes.Interface, dryRun boo
 // Namespace returns the namespace of the target workload.
 func (t *targetClient) Namespace() string {
 	return t.spec.Namespace
+}
+
+// GetOwnedPods returns the live pods owned by this target.  It fetches the
+// selector, lists pods in the target namespace, and filters out pods not
+// owned by the target.
+func (t *targetClient) GetOwnedPods(ctx context.Context) ([]v1.Pod, error) {
+	selector, err := t.GetPodSelector(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := t.clientset.CoreV1().Pods(t.spec.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var owned []v1.Pod
+	for i := range list.Items {
+		pod := &list.Items[i]
+		if !t.OwnsPod(pod) {
+			continue
+		}
+		owned = append(owned, *pod)
+	}
+	return owned, nil
 }
 
 // GetPodSelector returns the pod selector for the target workload.
@@ -413,6 +441,51 @@ func (t *targetClient) GetPodSelector(ctx context.Context) (labels.Selector, err
 	return selector, nil
 }
 
+// OwnsPod reports whether pod is controlled by this target, using only the
+// pod's controller ownerReference and metadata already cached by
+// GetPodSelector — it makes no API calls.
+//
+// For ReplicaSet and DaemonSet targets the pod's controller is the target
+// itself, so we compare UIDs directly (authoritative, since UIDs are unique).
+//
+// For Deployment targets the pod is owned by a ReplicaSet, which is in turn
+// owned by the Deployment. We only have the pod's ownerReference (the RS name
+// and UID), not the RS object, so verifying the RS->Deployment link by UID
+// would require an extra API call. Instead we rely on the Deployment
+// controller's RS naming convention "<deployment-name>-<pod-template-hash>",
+// where the hash is a single token containing no '-'. This is an
+// implementation detail of the Deployment controller (stable for many
+// releases, but not a formal API guarantee); it disambiguates e.g. Deployment
+// "web" from "web-canary", whose RS names are "web-canary-<hash>".
+func (t *targetClient) OwnsPod(pod *v1.Pod) bool {
+	ctrl := metav1.GetControllerOf(pod)
+	if ctrl == nil {
+		return false // orphan or no controlling owner
+	}
+	switch strings.ToLower(t.spec.Kind) {
+	case "replicaset":
+		return ctrl.Kind == "ReplicaSet" && t.cachedUID != "" && ctrl.UID == t.cachedUID
+	case "daemonset":
+		return ctrl.Kind == "DaemonSet" && t.cachedUID != "" && ctrl.UID == t.cachedUID
+	case "deployment":
+		return ctrl.Kind == "ReplicaSet" && rsNameOwnedByDeployment(ctrl.Name, t.spec.Name)
+	default:
+		return false
+	}
+}
+
+// rsNameOwnedByDeployment reports whether a ReplicaSet name matches the
+// Deployment controller's "<deployment-name>-<pod-template-hash>" convention
+// for the given deployment, where the hash segment contains no '-'.
+func rsNameOwnedByDeployment(rsName, deployName string) bool {
+	prefix := deployName + "-"
+	if !strings.HasPrefix(rsName, prefix) {
+		return false
+	}
+	hash := rsName[len(prefix):]
+	return hash != "" && !strings.Contains(hash, "-")
+}
+
 // getPodSelector fetches the pod selector for the target workload.
 func (t *targetClient) getPodSelector(ctx context.Context) (labels.Selector, error) {
 	var selector *metav1.LabelSelector
@@ -424,18 +497,21 @@ func (t *targetClient) getPodSelector(ctx context.Context) (labels.Selector, err
 			return nil, err
 		}
 		selector = dep.Spec.Selector
+		t.cachedUID = dep.UID
 	case "daemonset":
 		ds, err := t.clientset.AppsV1().DaemonSets(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
 		selector = ds.Spec.Selector
+		t.cachedUID = ds.UID
 	case "replicaset":
 		rs, err := t.clientset.AppsV1().ReplicaSets(t.spec.Namespace).Get(ctx, t.spec.Name, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
 		selector = rs.Spec.Selector
+		t.cachedUID = rs.UID
 	default:
 		return nil, fmt.Errorf("unknown target kind: %s", t.spec.Kind)
 	}
