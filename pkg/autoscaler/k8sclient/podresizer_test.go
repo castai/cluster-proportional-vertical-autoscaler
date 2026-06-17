@@ -299,11 +299,11 @@ func TestClassifyResize(t *testing.T) {
 			want: resizeStatusInProgress,
 		},
 		{
-			name: "in-progress with Error reason is not InProgress",
+			name: "in-progress with Error reason is treated as Infeasible (stuck)",
 			conditions: []v1.PodCondition{{
 				Type: v1.PodResizeInProgress, Status: v1.ConditionTrue, Reason: v1.PodReasonError,
 			}},
-			want: resizeStatusOK,
+			want: resizeStatusInfeasible,
 		},
 	}
 	for _, tc := range cases {

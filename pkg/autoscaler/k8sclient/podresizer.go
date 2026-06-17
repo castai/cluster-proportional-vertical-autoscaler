@@ -554,9 +554,13 @@ func classifyResize(pod *v1.Pod) resizeStatus {
 			}
 			return resizeStatusDeferred
 		case v1.PodResizeInProgress:
-			if c.Status == v1.ConditionTrue && c.Reason != v1.PodReasonError {
-				hasInProgress = true
+			if c.Status != v1.ConditionTrue {
+				continue
 			}
+			if c.Reason == v1.PodReasonError {
+				return resizeStatusInfeasible
+			}
+			hasInProgress = true
 		}
 	}
 	if hasInProgress {
