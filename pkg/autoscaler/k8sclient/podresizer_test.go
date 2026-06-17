@@ -305,6 +305,22 @@ func TestClassifyResize(t *testing.T) {
 			}},
 			want: resizeStatusInfeasible,
 		},
+		{
+			name: "Error in-progress outranks Deferred pending (Error first)",
+			conditions: []v1.PodCondition{
+				{Type: v1.PodResizeInProgress, Status: v1.ConditionTrue, Reason: v1.PodReasonError},
+				{Type: v1.PodResizePending, Status: v1.ConditionTrue, Reason: v1.PodReasonDeferred},
+			},
+			want: resizeStatusInfeasible,
+		},
+		{
+			name: "Error in-progress outranks Deferred pending (Deferred first)",
+			conditions: []v1.PodCondition{
+				{Type: v1.PodResizePending, Status: v1.ConditionTrue, Reason: v1.PodReasonDeferred},
+				{Type: v1.PodResizeInProgress, Status: v1.ConditionTrue, Reason: v1.PodReasonError},
+			},
+			want: resizeStatusInfeasible,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

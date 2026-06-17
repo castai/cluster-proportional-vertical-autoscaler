@@ -542,31 +542,39 @@ const (
 // we treat it as an error state rather than InProgress so the tracker
 // stays active and the pod may be fallback-deleted if infeasible.
 func classifyResize(pod *v1.Pod) resizeStatus {
-	var hasInProgress bool
-	for _, c := range pod.Status.Conditions {
-		switch c.Type {
-		case v1.PodResizePending:
-			if c.Status != v1.ConditionTrue {
-				continue
-			}
-			if c.Reason == v1.PodReasonInfeasible {
-				return resizeStatusInfeasible
-			}
-			return resizeStatusDeferred
-		case v1.PodResizeInProgress:
-			if c.Status != v1.ConditionTrue {
-				continue
-			}
-			if c.Reason == v1.PodReasonError {
-				return resizeStatusInfeasible
-			}
-			hasInProgress = true
+	// Scan every condition and keep the most severe state, so the result does
+	// not depend on the order of pod.Status.Conditions. The two resize
+	// conditions are mutually exclusive in normal kubelet behaviour; computing a
+	// precedence is defensive against a pod ever carrying conflicting ones.
+	worst := resizeStatusOK
+	consider := func(s resizeStatus) {
+		if s > worst {
+			worst = s
 		}
 	}
-	if hasInProgress {
-		return resizeStatusInProgress
+	for _, c := range pod.Status.Conditions {
+		if c.Status != v1.ConditionTrue {
+			continue
+		}
+		switch c.Type {
+		case v1.PodResizePending:
+			if c.Reason == v1.PodReasonInfeasible {
+				consider(resizeStatusInfeasible)
+			} else {
+				consider(resizeStatusDeferred)
+			}
+		case v1.PodResizeInProgress:
+			if c.Reason == v1.PodReasonError {
+				// An actuation error will not resolve on its own, so treat it
+				// like Infeasible: it must accumulate toward the fallback grace
+				// period rather than be classified OK.
+				consider(resizeStatusInfeasible)
+			} else {
+				consider(resizeStatusInProgress)
+			}
+		}
 	}
-	return resizeStatusOK
+	return worst
 }
 
 // actuation describes whether the kubelet has actually enacted the desired
