@@ -391,14 +391,16 @@ type targetClient struct {
 
 // PatchTemplate updates spec.template.spec.containers[].resources on the workload.
 // It returns whether the patch actually changed the template: if the template
-// already matches desired for every managed container, no patch is issued and
-// changed is false.
+// is already known to match desired for every managed container, no patch is
+// issued and changed is false.
+//
+// This method deliberately does NOT fetch the spec here as it resolves the target
+// via apps/v1, which is correct for the in-place modes (they require Kubernetes
+// 1.33+, where these kinds exist only in apps/v1) but not necessarily for
+// Recreate mode, which must keep working on older clusters whose target lives
+// in an older API group.
 func (t *targetClient) PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) (changed bool, err error) {
-	spec, err := t.trySyncSpec(ctx)
-	if err != nil {
-		return false, err
-	}
-	if templateMatches(spec.TemplateResources, resources) {
+	if t.cachedSpec != nil && templateMatches(t.cachedSpec.TemplateResources, resources) {
 		return false, nil // already at desired; patching would be a no-op
 	}
 	if t.dryRun {
