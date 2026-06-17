@@ -124,20 +124,20 @@ func (s *AutoScaler) pollAPIServer(ctx context.Context) error {
 	// Query the apiserver for the cluster status --- number of nodes and cores
 	clusterSize, err := s.k8sClient.GetClusterSize(ctx)
 	if err != nil {
-		return fmt.Errorf("get cluster size: %v", err)
+		return fmt.Errorf("get cluster size: %w", err)
 	}
 	glog.V(4).Infof("Nodes %5d", clusterSize.Nodes)
 	glog.V(4).Infof("Cores %5d", clusterSize.Cores)
 
 	fileBytes, err := s.readConfigFileIfChanged()
 	if err != nil {
-		return fmt.Errorf("read config file %q: %v", s.configFile, err)
+		return fmt.Errorf("read config file %q: %w", s.configFile, err)
 	}
 	if s.currentConfig == nil || len(fileBytes) > 0 {
 		cfg := s.defaultConfig.DeepCopy()
 		if len(fileBytes) > 0 {
 			if err := json.Unmarshal(fileBytes, &cfg); err != nil {
-				return fmt.Errorf("unmarshal config file %q: %v", s.configFile, err)
+				return fmt.Errorf("unmarshal config file %q: %w", s.configFile, err)
 			}
 		}
 		s.currentConfig = cfg
@@ -177,7 +177,7 @@ func (s *AutoScaler) pollAPIServer(ctx context.Context) error {
 	// created pods converge and stuck resizes are retried); it internally
 	// no-ops when reqsChanged is false in Recreate mode.
 	if err = s.k8sClient.UpdateResources(ctx, newReqs, reqsChanged); err != nil {
-		return fmt.Errorf("update resources: %s", err)
+		return fmt.Errorf("update resources: %w", err)
 	} else {
 		s.lastReqs = newReqs
 	}
