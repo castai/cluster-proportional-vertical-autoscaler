@@ -1,11 +1,15 @@
 /*
-Copyright 2026 The Kubernetes Authors.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 */
 
 package k8sclient
@@ -460,9 +464,7 @@ func (t *resizeTracker) retain(live map[types.UID]bool) {
 
 // buildResizePatch produces a strategic-merge patch body that brings the
 // pod's containers to `desired`. It returns (nil, false) if nothing needs
-// to change, which lets the caller skip the API call entirely (important
-// because cpvpa polls every 10s and most cycles will be no-ops).
-//
+// to change, which lets the caller skip the API call entirely.
 // The patch is scoped to containers cpvpa actually manages — containers in
 // the pod that aren't in `desired` are left alone.
 func buildResizePatch(pod *v1.Pod, desired map[string]v1.ResourceRequirements) ([]byte, bool) {
@@ -528,19 +530,6 @@ const (
 
 // classifyResize inspects the pod conditions added by the kubelet to
 // figure out what state the resize is in.
-//
-// As of v1.33 beta the relevant condition types are:
-//   - PodResizePending  (reason=Deferred | Infeasible)
-//   - PodResizeInProgress
-//
-// Absence of both means: either the kubelet has caught up, or it hasn't
-// observed the spec change yet. We treat absence as OK; if the kubelet
-// is just slow, the next poll will reclassify.
-//
-// Precedence: PodResizePending (Infeasible > Deferred) wins over
-// PodResizeInProgress. If PodResizeInProgress has Reason PodReasonError
-// we treat it as an error state rather than InProgress so the tracker
-// stays active and the pod may be fallback-deleted if infeasible.
 func classifyResize(pod *v1.Pod) resizeStatus {
 	// Scan every condition and keep the most severe state, so the result does
 	// not depend on the order of pod.Status.Conditions. The two resize
