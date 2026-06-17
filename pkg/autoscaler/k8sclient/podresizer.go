@@ -180,7 +180,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 		}
 
 		if r.dryRun {
-			glog.V(2).Infof("dry-run: would patch /resize for pod=%s/%s: %s",
+			glog.Infof("dry-run: would patch /resize for pod=%s/%s: %s",
 				pod.Namespace, pod.Name, string(patchBody))
 			continue
 		}
@@ -280,7 +280,7 @@ func (r *podResizer) maybeFallbackEvict(
 		return
 	}
 	if r.dryRun {
-		glog.V(2).Infof("dry-run: would fall back (recreate/delete) pod=%s/%s (not resized for %s)",
+		glog.Infof("dry-run: would fall back (recreate/delete) pod=%s/%s (not resized for %s)",
 			pod.Namespace, pod.Name, age)
 		return
 	}
