@@ -33,7 +33,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/clock"
 
 	"github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/autoscaler/k8sclient"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -124,6 +123,25 @@ func (r *requestRecorder) lastTemplatePatch() (recordedPatch, bool) {
 	return r.templatePatches[len(r.templatePatches)-1], true
 }
 
+func (r *requestRecorder) resizePatchCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.resizePatches)
+}
+
+// resizedPodNames returns the pod names extracted from the recorded /resize
+// patch paths (.../pods/<name>/resize).
+func (r *requestRecorder) resizedPodNames() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	names := make([]string, 0, len(r.resizePatches))
+	for _, p := range r.resizePatches {
+		trimmed := strings.TrimSuffix(p.Path, "/resize")
+		names = append(names, trimmed[strings.LastIndex(trimmed, "/")+1:])
+	}
+	return names
+}
+
 // ---------------------------------------------------------------------------
 // Typed patch assertions: replace interface{} type-assertion ladders.
 // ---------------------------------------------------------------------------
@@ -182,15 +200,56 @@ func ctr(name, cpu string) apiv1.Container {
 	}
 }
 
+// targetUID is the deterministic UID assigned to a built workload, so a pod's
+// controller ownerRef can reference it (DaemonSet/StatefulSet/ReplicaSet
+// ownership is matched by UID).
+func targetUID(name string) types.UID { return types.UID(name + "-uid") }
+
+func podTemplateSpec(containers ...apiv1.Container) apiv1.PodTemplateSpec {
+	return apiv1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "test"}},
+		Spec:       apiv1.PodSpec{Containers: containers},
+	}
+}
+
 func deployment(name string, containers ...apiv1.Container) *appsv1.Deployment {
 	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, UID: targetUID(name)},
 		Spec: appsv1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
-			Template: apiv1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "test"}},
-				Spec:       apiv1.PodSpec{Containers: containers},
-			},
+			Template: podTemplateSpec(containers...),
+		},
+	}
+}
+
+func daemonset(name string, strategy appsv1.DaemonSetUpdateStrategyType, containers ...apiv1.Container) *appsv1.DaemonSet {
+	return &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, UID: targetUID(name)},
+		Spec: appsv1.DaemonSetSpec{
+			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: strategy},
+			Template:       podTemplateSpec(containers...),
+		},
+	}
+}
+
+func statefulset(name string, strategy appsv1.StatefulSetUpdateStrategyType, containers ...apiv1.Container) *appsv1.StatefulSet {
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, UID: targetUID(name)},
+		Spec: appsv1.StatefulSetSpec{
+			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{Type: strategy},
+			Template:       podTemplateSpec(containers...),
+		},
+	}
+}
+
+func replicaset(name string, containers ...apiv1.Container) *appsv1.ReplicaSet {
+	return &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, UID: targetUID(name)},
+		Spec: appsv1.ReplicaSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+			Template: podTemplateSpec(containers...),
 		},
 	}
 }
@@ -210,6 +269,30 @@ func ownedPod(name, rsName string, container apiv1.Container, conds ...apiv1.Pod
 			UID:             types.UID(name),
 			Labels:          map[string]string{"app": "test"},
 			OwnerReferences: []metav1.OwnerReference{controllerRef("ReplicaSet", rsName)},
+		},
+		Spec:   apiv1.PodSpec{Containers: []apiv1.Container{container}},
+		Status: apiv1.PodStatus{Phase: apiv1.PodRunning, Conditions: conds},
+	}
+}
+
+// directlyOwnedPod builds a Running pod whose controller ownerRef points at the
+// given workload (DaemonSet/StatefulSet/ReplicaSet ownership is matched by UID).
+func directlyOwnedPod(t *testing.T, name string, target runtime.Object, container apiv1.Container, conds ...apiv1.PodCondition) apiv1.Pod {
+	t.Helper()
+	kind, _, tname := targetInfo(t, target)
+	controller := true
+	return apiv1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: testNamespace,
+			UID:       types.UID(name),
+			Labels:    map[string]string{"app": "test"},
+			OwnerReferences: []metav1.OwnerReference{{
+				Kind:       kind,
+				Name:       tname,
+				UID:        targetUID(tname),
+				Controller: &controller,
+			}},
 		},
 		Spec:   apiv1.PodSpec{Containers: []apiv1.Container{container}},
 		Status: apiv1.PodStatus{Phase: apiv1.PodRunning, Conditions: conds},
@@ -359,7 +442,8 @@ type scenario struct {
 	fallback k8sclient.ResizeFallbackConfig
 	config   string // ScaleConfig JSON
 	dryRun   bool
-	cycles   int // number of pollAPIServer calls; defaults to 1
+	cycles   int           // number of pollAPIServer calls; defaults to 1
+	advance  time.Duration // resizer-clock step applied before each cycle after the first
 }
 
 // runPoll stands up the mock server, builds a real k8sClient + AutoScaler from
@@ -375,8 +459,13 @@ func runPoll(t *testing.T, s scenario) (*requestRecorder, error) {
 	server := httptest.NewServer(s.cluster.handler(t, rec))
 	defer server.Close()
 
+	// The resizer clock drives the fallback grace period. A fake clock makes
+	// multi-cycle fallback deterministic: a stuck pod is tracked on the first
+	// cycle, then the clock is advanced past the grace period before the next.
+	resizerClock := clocktesting.NewFakeClock(time.Now())
+
 	kubeconfig := writeTempKubeconfig(t, server.URL)
-	client, err := k8sclient.NewK8sClient(testNamespace, s.cluster.targetRef(t), kubeconfig, s.dryRun, s.mode, s.fallback, clock.RealClock{})
+	client, err := k8sclient.NewK8sClient(testNamespace, s.cluster.targetRef(t), kubeconfig, s.dryRun, s.mode, s.fallback, resizerClock)
 	if err != nil {
 		t.Fatalf("NewK8sClient: %v", err)
 	}
@@ -396,6 +485,9 @@ func runPoll(t *testing.T, s scenario) (*requestRecorder, error) {
 
 	var pollErr error
 	for i := 0; i < s.cycles; i++ {
+		if i > 0 && s.advance > 0 {
+			resizerClock.Step(s.advance)
+		}
 		if pollErr = as.pollAPIServer(context.Background()); pollErr != nil {
 			break
 		}
@@ -434,13 +526,38 @@ current-context: mock
 func TestPollAPIServer(t *testing.T) {
 	// base 10m + step 1m per core; 4 nodes / 7 cores -> 17m desired.
 	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+	standardCores := []int{2, 2, 2, 1}
 
 	standardCluster := func() fakeCluster {
 		return fakeCluster{
-			cores:     []int{2, 2, 2, 1},
+			cores:     standardCores,
 			target:    deployment("test-dep", ctr("main", "10m")),
 			pods:      []apiv1.Pod{ownedPod("test-dep-abc-def", "test-dep-abc", ctr("main", "10m"))},
 			hasResize: true,
+		}
+	}
+
+	// In-place resize of a pod owned directly by a non-Deployment workload; used
+	// to exercise selector/UID/ownership wiring per target kind.
+	dsTarget := daemonset("test-ds", appsv1.RollingUpdateDaemonSetStrategyType, ctr("main", "10m"))
+	ssTarget := statefulset("test-ss", appsv1.RollingUpdateStatefulSetStrategyType, ctr("main", "10m"))
+	rsTarget := replicaset("test-rs", ctr("main", "10m"))
+
+	kindCluster := func(target runtime.Object, podName string) fakeCluster {
+		return fakeCluster{
+			cores:     standardCores,
+			target:    target,
+			pods:      []apiv1.Pod{directlyOwnedPod(t, podName, target, ctr("main", "10m"))},
+			hasResize: true,
+		}
+	}
+
+	assertResizedNoTemplate := func(t *testing.T, rec *requestRecorder) {
+		if !rec.resizePatched() {
+			t.Fatal("pod was not resized via /resize")
+		}
+		if rec.templatePatched() {
+			t.Error("template was patched unexpectedly in InPlace mode")
 		}
 	}
 
@@ -472,12 +589,193 @@ func TestPollAPIServer(t *testing.T) {
 		{
 			name:     "in-place mode resizes the pod and leaves the template untouched",
 			scenario: scenario{cluster: standardCluster(), mode: k8sclient.ResizeModeInPlace, config: baseConfig},
+			assert:   assertResizedNoTemplate,
+		},
+		{
+			name:     "dry-run performs no mutating calls",
+			scenario: scenario{cluster: standardCluster(), mode: k8sclient.ResizeModeInPlace, config: baseConfig, dryRun: true},
 			assert: func(t *testing.T, rec *requestRecorder) {
-				if !rec.resizePatched() {
-					t.Fatal("running pod was not resized via /resize")
+				if rec.resizePatched() {
+					t.Error("dry-run issued a /resize")
 				}
 				if rec.templatePatched() {
-					t.Error("deployment template was patched unexpectedly in InPlace mode")
+					t.Error("dry-run patched the template")
+				}
+				if rec.deleteCount() != 0 || rec.evictionCount() != 0 {
+					t.Error("dry-run disrupted pods")
+				}
+			},
+		},
+		{
+			name: "foreign pod is skipped, owned pod is resized",
+			scenario: scenario{
+				cluster: fakeCluster{
+					cores:  standardCores,
+					target: deployment("test-dep", ctr("main", "10m")),
+					pods: []apiv1.Pod{
+						ownedPod("test-dep-abc-def", "test-dep-abc", ctr("main", "10m")),
+						ownedPod("foreign-pod", "other-rs", ctr("main", "10m")),
+					},
+					hasResize: true,
+				},
+				mode:   k8sclient.ResizeModeInPlace,
+				config: baseConfig,
+			},
+			assert: func(t *testing.T, rec *requestRecorder) {
+				if got := rec.resizePatchCount(); got != 1 {
+					t.Fatalf("resize patch count = %d, want 1 (only the owned pod)", got)
+				}
+				if names := rec.resizedPodNames(); len(names) != 1 || names[0] != "test-dep-abc-def" {
+					t.Errorf("resized pods = %v, want [test-dep-abc-def]", names)
+				}
+			},
+		},
+		{
+			name: "InPlaceOrRecreate degrades to Recreate when pods/resize is absent",
+			scenario: scenario{
+				cluster: fakeCluster{
+					cores:     standardCores,
+					target:    deployment("test-dep", ctr("main", "10m")),
+					pods:      []apiv1.Pod{ownedPod("test-dep-abc-def", "test-dep-abc", ctr("main", "10m"))},
+					hasResize: false,
+				},
+				mode:   k8sclient.ResizeModeInPlaceOrRecreate,
+				config: baseConfig,
+			},
+			assert: func(t *testing.T, rec *requestRecorder) {
+				if !rec.templatePatched() {
+					t.Fatal("expected a template patch after degrading to Recreate")
+				}
+				if rec.resizePatched() {
+					t.Error("unexpected /resize after degradation")
+				}
+			},
+		},
+		{
+			name:     "in-place resizes a DaemonSet pod",
+			scenario: scenario{cluster: kindCluster(dsTarget, "test-ds-pod"), mode: k8sclient.ResizeModeInPlace, config: baseConfig},
+			assert:   assertResizedNoTemplate,
+		},
+		{
+			name:     "in-place resizes a StatefulSet pod",
+			scenario: scenario{cluster: kindCluster(ssTarget, "test-ss-pod"), mode: k8sclient.ResizeModeInPlace, config: baseConfig},
+			assert:   assertResizedNoTemplate,
+		},
+		{
+			name:     "in-place resizes a ReplicaSet pod",
+			scenario: scenario{cluster: kindCluster(rsTarget, "test-rs-pod"), mode: k8sclient.ResizeModeInPlace, config: baseConfig},
+			assert:   assertResizedNoTemplate,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, err := runPoll(t, tc.scenario)
+			if err != nil {
+				t.Fatalf("pollAPIServer: %v", err)
+			}
+			tc.assert(t, rec)
+		})
+	}
+}
+
+// TestPollAPIServer_Fallback covers the InPlaceOrRecreate fallback end-to-end.
+// Each case runs two cycles: the first tracks a stuck pod (age below grace, no
+// action), then the resizer clock is advanced past the grace period so the
+// second cycle takes the fallback path.
+func TestPollAPIServer_Fallback(t *testing.T) {
+	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+	standardCores := []int{2, 2, 2, 1}
+	const grace = 5 * time.Minute
+
+	// A stuck pod: spec already at the desired 17m (cpvpa resized it on an
+	// earlier cycle) but the kubelet reports the resize as Infeasible, so no
+	// /resize is issued and it accumulates toward the fallback.
+	stuck := apiv1.PodCondition{Type: apiv1.PodResizePending, Status: apiv1.ConditionTrue, Reason: apiv1.PodReasonInfeasible}
+
+	dsTarget := daemonset("test-ds", appsv1.OnDeleteDaemonSetStrategyType, ctr("main", "10m"))
+	rsTarget := replicaset("test-rs", ctr("main", "10m"))
+
+	cases := []struct {
+		name     string
+		scenario scenario
+		assert   func(t *testing.T, rec *requestRecorder)
+	}{
+		{
+			name: "self-healing target: stuck pod triggers a template rollout, no disruption",
+			scenario: scenario{
+				cluster: fakeCluster{
+					cores:     standardCores,
+					target:    deployment("test-dep", ctr("main", "10m")),
+					pods:      []apiv1.Pod{ownedPod("test-dep-abc-def", "test-dep-abc", ctr("main", "17m"), stuck)},
+					hasResize: true,
+				},
+				mode:     k8sclient.ResizeModeInPlaceOrRecreate,
+				fallback: k8sclient.ResizeFallbackConfig{GracePeriod: grace, MaxPodsPerCycle: 1},
+				config:   baseConfig,
+				cycles:   2,
+				advance:  grace + time.Minute,
+			},
+			assert: func(t *testing.T, rec *requestRecorder) {
+				if !rec.templatePatched() {
+					t.Fatal("expected a template rollout for the stuck self-healing pod")
+				}
+				if rec.evictionCount() != 0 || rec.deleteCount() != 0 {
+					t.Error("self-healing target must not be disrupted directly")
+				}
+				if rec.resizePatched() {
+					t.Error("pod already at desired spec; no /resize expected")
+				}
+			},
+		},
+		{
+			name: "non-self-healing target (OnDelete DaemonSet): stuck pod is evicted",
+			scenario: scenario{
+				cluster: fakeCluster{
+					cores:     standardCores,
+					target:    dsTarget,
+					pods:      []apiv1.Pod{directlyOwnedPod(t, "test-ds-pod", dsTarget, ctr("main", "17m"), stuck)},
+					hasResize: true,
+				},
+				mode:     k8sclient.ResizeModeInPlaceOrRecreate,
+				fallback: k8sclient.ResizeFallbackConfig{GracePeriod: grace, MaxPodsPerCycle: 1, DisruptionMethod: k8sclient.FallbackDisruptionEviction},
+				config:   baseConfig,
+				cycles:   2,
+				advance:  grace + time.Minute,
+			},
+			assert: func(t *testing.T, rec *requestRecorder) {
+				if rec.evictionCount() != 1 {
+					t.Errorf("eviction count = %d, want 1", rec.evictionCount())
+				}
+				if rec.deleteCount() != 0 {
+					t.Errorf("delete count = %d, want 0 (eviction configured)", rec.deleteCount())
+				}
+				if !rec.templatePatched() {
+					t.Error("template should be patched so the recreated pod gets the new size")
+				}
+			},
+		},
+		{
+			name: "non-self-healing target (ReplicaSet): stuck pod is deleted",
+			scenario: scenario{
+				cluster: fakeCluster{
+					cores:     standardCores,
+					target:    rsTarget,
+					pods:      []apiv1.Pod{directlyOwnedPod(t, "test-rs-pod", rsTarget, ctr("main", "17m"), stuck)},
+					hasResize: true,
+				},
+				mode:     k8sclient.ResizeModeInPlaceOrRecreate,
+				fallback: k8sclient.ResizeFallbackConfig{GracePeriod: grace, MaxPodsPerCycle: 1, DisruptionMethod: k8sclient.FallbackDisruptionDelete},
+				config:   baseConfig,
+				cycles:   2,
+				advance:  grace + time.Minute,
+			},
+			assert: func(t *testing.T, rec *requestRecorder) {
+				if rec.deleteCount() != 1 {
+					t.Errorf("delete count = %d, want 1", rec.deleteCount())
+				}
+				if rec.evictionCount() != 0 {
+					t.Errorf("eviction count = %d, want 0 (delete configured)", rec.evictionCount())
 				}
 			},
 		},
