@@ -348,10 +348,12 @@ manifest-tool:
 	    --env GOCACHE="/.cache/gocache"        \
 	    --env GOMODCACHE="/.cache/gomodcache"  \
 	    --env CGO_ENABLED=0                    \
+	    --env GOOS="$(OS)"                     \
+	    --env GOARCH="$(ARCH)"                 \
 	    --env HTTP_PROXY="$(HTTP_PROXY)"       \
 	    --env HTTPS_PROXY="$(HTTPS_PROXY)"     \
 	    $(BUILD_IMAGE)                         \
-	    go install github.com/estesp/manifest-tool/v2/cmd/manifest-tool
+	    go build -o /go/bin/manifest-tool github.com/estesp/manifest-tool/v2/cmd/manifest-tool
 
 version: # @HELP outputs the version string
 version:
