@@ -17,6 +17,7 @@ limitations under the License.
 package k8sclient
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -240,13 +241,13 @@ func TestUpdateResources(t *testing.T) {
 			ContentConfig: restclient.ContentConfig{
 				GroupVersion: &schema.GroupVersion{Group: tc.kind, Version: "extensions/v1beta1"}}})
 
-		target, err := makeTarget(client, tc.target, "default")
+		tgt, err := makeTarget(client, tc.target, "default")
 		if err != nil {
 			t.Fatalf("error making target %q: %v", tc.target, err)
 		}
-		k8scli := &k8sClient{
-			clientset: client,
-			target:    target,
+		k8scli, err := newK8sClient(client, tgt, nil, ResizeModeRecreate)
+		if err != nil {
+			t.Fatalf("error creating k8sClient: %v", err)
 		}
 
 		newReqs := map[string]apiv1.ResourceRequirements{}
@@ -257,7 +258,7 @@ func TestUpdateResources(t *testing.T) {
 		r := resource.NewQuantity(0, resource.BinarySI)
 		r.SetMilli(10)
 		newReqs["thing"].Requests[apiv1.ResourceName("cpu")] = *r
-		if err := k8scli.UpdateResources(newReqs); err != nil {
+		if err := k8scli.UpdateResources(context.Background(), newReqs, true); err != nil {
 			t.Errorf("failed to update resources for target %q: %v", tc.target, err)
 		}
 	}

@@ -1,0 +1,104 @@
+# cpvpa-inplace-example.yaml
+#
+# End-to-end example: a target Deployment whose containers declare a
+# resizePolicy, plus a cpvpa controller pointed at it in InPlaceOrRecreate
+# mode. Requires Kubernetes 1.33+ (InPlacePodVerticalScaling on by default).
+#
+# IMPORTANT: apply examples/RBAC/RBAC-inplace-configs.yaml first. The
+# InPlaceOrRecreate mode needs extra permissions (pods/resize, pods/delete)
+# beyond the base RBAC role.
+
+---
+# Target workload. The interesting bit is resizePolicy on each container.
+# Without it, the kubelet defaults to RestartContainer for memory, which
+# turns a "live resize" into a container restart — defeating the point.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thing
+  namespace: kube-system
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      k8s-app: thing
+  template:
+    metadata:
+      labels:
+        k8s-app: thing
+    spec:
+      containers:
+        - name: thing
+          image: nginx
+          resources:
+            requests: { cpu: "250m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+          # Live resize for both — no restart for CPU, no restart for
+          # memory increases. (Memory decreases may still be deferred by
+          # the kubelet; that's expected.)
+          resizePolicy:
+            - resourceName: cpu
+              restartPolicy: NotRequired
+            - resourceName: memory
+              restartPolicy: NotRequired
+
+---
+# Scaling config — unchanged in shape from the existing cpvpa.
+# CPU base 250m, +100m every 10 nodes, capped at 2 cores.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thing-cpvpa
+  namespace: kube-system
+data:
+  thing-cpvpa: |-
+    {
+      "thing": {
+        "requests": {
+          "cpu":    {"base": "250m",  "step": "100m",  "nodesPerStep": 10, "max": "2"},
+          "memory": {"base": "128Mi", "step": "32Mi",  "nodesPerStep": 10, "max": "512Mi"}
+        }
+      }
+    }
+
+---
+# cpvpa controller itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thing-cpvpa
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: thing-cpvpa
+  template:
+    metadata:
+      labels:
+        k8s-app: thing-cpvpa
+    spec:
+      serviceAccountName: cpvpa
+      containers:
+        - name: autoscaler
+          image: registry.k8s.io/cpa/cpvpa:vX.Y.Z   # placeholder for the release that includes this feature
+          resources:
+            requests: { cpu: "20m", memory: "10Mi" }
+          command:
+            - /cpvpa
+            - --target=deployment/thing
+            - --namespace=kube-system
+            - --logtostderr=true
+            - --poll-period-seconds=10
+            - --config-file=/etc/config/thing-cpvpa
+            # NEW FLAGS:
+            - --resize-mode=InPlaceOrRecreate
+            - --resize-fallback-grace-period=5m
+            - --resize-fallback-max-pods-per-cycle=1
+          volumeMounts:
+            - name: config
+              mountPath: /etc/config
+      volumes:
+        - name: config
+          configMap:
+            name: thing-cpvpa
