@@ -17,6 +17,7 @@ limitations under the License.
 package autoscaler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -153,7 +154,7 @@ func TestCalculatePerCores(t *testing.T) {
 			t.Fatalf("invalid default config: %v", err)
 		}
 
-		sz, err := mockK8s.GetClusterSize()
+		sz, err := mockK8s.GetClusterSize(context.Background())
 		if err != nil {
 			t.Errorf("failed to get cluster size")
 		}
@@ -250,7 +251,7 @@ func TestCalculatePerNodes(t *testing.T) {
 			t.Fatalf("invalid default config: %v", err)
 		}
 
-		sz, err := mockK8s.GetClusterSize()
+		sz, err := mockK8s.GetClusterSize(context.Background())
 		if err != nil {
 			t.Errorf("failed to get cluster size")
 		}
