@@ -5,3 +5,4 @@
 /.dockerfile-*
 /.licenses*
 /.buildx-initialized
+.idea/
