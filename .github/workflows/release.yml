@@ -46,3 +46,31 @@ jobs:
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ github.ref_name }}
         run: make manifest-list
+
+      - name: Install crane
+        run: |
+          CRANE_VERSION=v0.20.3
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin crane
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.1.4'
+
+      - name: Sign the images (keyless)
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for image in \
+            "us-docker.pkg.dev/castai-hub/library/cpa/cpvpa" \
+            "ghcr.io/castai/images/cpa/cpvpa"; do
+            digest="$(crane digest "${image}:${VERSION}")"
+            cosign sign --yes "${image}@${digest}"
+            cosign verify \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity-regexp '^https://github.com/castai/cluster-proportional-vertical-autoscaler/' \
+              "${image}@${digest}" >/dev/null
+            echo "signed and verified ${image}@${digest}"
+          done
