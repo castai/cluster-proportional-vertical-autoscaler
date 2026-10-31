@@ -18,6 +18,7 @@ package autoscaler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -51,7 +52,14 @@ type AutoScaler struct {
 
 // NewAutoScaler returns a new AutoScaler
 func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
-	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun)
+	mode := k8sclient.ResizeMode(c.ResizeMode)
+	fallbackCfg := k8sclient.ResizeFallbackConfig{
+		GracePeriod:      c.ResizeFallbackGracePeriod,
+		MaxPodsPerCycle:  c.ResizeFallbackMaxPodsPerCycle,
+		DisruptionMethod: k8sclient.FallbackDisruptionMethod(c.ResizeFallbackDisruption),
+	}
+	clk := clock.RealClock{}
+	newK8sClient, err := k8sclient.NewK8sClient(c.Namespace, c.Target, c.Kubeconfig, c.DryRun, mode, fallbackCfg, clk)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +74,7 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 		defaultConfig: cfg,
 		configFile:    c.ConfigFile,
 		pollPeriod:    time.Second * time.Duration(c.PollPeriodSeconds),
-		clock:         clock.RealClock{},
+		clock:         clk,
 		stopCh:        make(chan struct{}),
 		readyCh:       make(chan struct{}, 1),
 	}, nil
@@ -77,42 +85,59 @@ func NewAutoScaler(c *options.AutoScalerConfig) (*AutoScaler, error) {
 // updates the target resource with the expected replicas if necessary.
 func (s *AutoScaler) Run() {
 	ticker := s.clock.NewTicker(s.pollPeriod)
+	defer ticker.Stop()
+
+	// Base context for all API work this loop performs, cancelled when the
+	// autoscaler is stopped so in-flight requests abort promptly on shutdown.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-s.stopCh
+		cancel()
+	}()
+
 	s.readyCh <- struct{}{} // For testing.
 
 	// Don't wait for ticker and execute pollAPIServer() for the first time.
-	s.pollAPIServer()
+	if err := s.pollAPIServer(ctx); err != nil {
+		glog.Errorf("Error: %v", err)
+	}
 
 	for {
 		select {
 		case <-ticker.C():
-			s.pollAPIServer()
+			if err := s.pollAPIServer(ctx); err != nil {
+				glog.Errorf("Error: %v", err)
+			}
 		case <-s.stopCh:
 			return
 		}
 	}
 }
 
-func (s *AutoScaler) pollAPIServer() {
+func (s *AutoScaler) pollAPIServer(ctx context.Context) error {
+	// Bound one poll cycle (cluster-size read + resize) by the poll period;
+	// shutdown cancellation is inherited from the ctx passed by Run.
+	ctx, cancel := context.WithTimeout(ctx, s.pollPeriod)
+	defer cancel()
+
 	// Query the apiserver for the cluster status --- number of nodes and cores
-	clusterSize, err := s.k8sClient.GetClusterSize()
+	clusterSize, err := s.k8sClient.GetClusterSize(ctx)
 	if err != nil {
-		glog.Errorf("Error getting cluster size: %v", err)
-		return
+		return fmt.Errorf("get cluster size: %w", err)
 	}
 	glog.V(4).Infof("Nodes %5d", clusterSize.Nodes)
 	glog.V(4).Infof("Cores %5d", clusterSize.Cores)
 
 	fileBytes, err := s.readConfigFileIfChanged()
 	if err != nil {
-		glog.Errorf("Failed to read config file %q: %v", s.configFile, err)
-		return
+		return fmt.Errorf("read config file %q: %w", s.configFile, err)
 	}
 	if s.currentConfig == nil || len(fileBytes) > 0 {
 		cfg := s.defaultConfig.DeepCopy()
 		if len(fileBytes) > 0 {
 			if err := json.Unmarshal(fileBytes, &cfg); err != nil {
-				glog.Errorf("Failed to unmarshal config file %q: %v", s.configFile, err)
-				return
+				return fmt.Errorf("unmarshal config file %q: %w", s.configFile, err)
 			}
 		}
 		s.currentConfig = cfg
@@ -140,19 +165,24 @@ func (s *AutoScaler) pollAPIServer() {
 			glog.V(4).Infof("Calculated %s limits[%q] = %v", ctr, res, r)
 		}
 	}
-	if reflect.DeepEqual(s.lastReqs, newReqs) {
-		return
+	reqsChanged := !reflect.DeepEqual(s.lastReqs, newReqs)
+
+	if reqsChanged {
+		glog.V(0).Infof("Updating resource for nodes: %d, cores: %d",
+			clusterSize.Nodes, clusterSize.Cores)
+		logRequirements(newReqs)
 	}
 
-	glog.V(0).Infof("Updating resource for nodes: %d, cores: %d",
-		clusterSize.Nodes, clusterSize.Cores)
-	logRequirements(newReqs)
-	// Update resource target with new resources.
-	if err = s.k8sClient.UpdateResources(newReqs); err != nil {
-		glog.Errorf("Update failure: %s", err)
+	// UpdateResources is called every cycle for the in-place modes (so newly
+	// created pods converge and stuck resizes are retried); it internally
+	// no-ops when reqsChanged is false in Recreate mode.
+	if err = s.k8sClient.UpdateResources(ctx, newReqs, reqsChanged); err != nil {
+		return fmt.Errorf("update resources: %w", err)
 	} else {
 		s.lastReqs = newReqs
 	}
+
+	return nil
 }
 
 func logRequirements(reqs map[string]apiv1.ResourceRequirements) {
@@ -261,22 +291,23 @@ type ContainerScaleConfig struct {
 // scaling and the by-nodes scaling, bounded by the max value.
 //
 // Example:
-//   Base = 10
-//   Max = 100
-//   Step = 2
-//   CoresPerStep = 4
-//   NodesPerStep = 2
 //
-//   The core and node counts are rounded up to the next whole step.
+//	Base = 10
+//	Max = 100
+//	Step = 2
+//	CoresPerStep = 4
+//	NodesPerStep = 2
 //
-//   If we find 64 cores and 4 nodes we get scalars of:
-//     by-cores: 10 + (2 * (round(64, 4)/4)) = 10 + 32 = 42
-//     by-nodes: 10 + (2 * (round(4, 2)/2)) = 10 + 4 = 14
-//   The larger is by-cores, and it is less than Max, so the final value is 42.
+//	The core and node counts are rounded up to the next whole step.
 //
-//   If we find 3 cores and 3 nodes we get scalars of:
-//     by-cores: 10 + (2 * (round(3, 4)/4)) = 10 + 2 = 12
-//     by-nodes: 10 + (2 * (round(3, 2)/2)) = 10 + 4 = 14
+//	If we find 64 cores and 4 nodes we get scalars of:
+//	  by-cores: 10 + (2 * (round(64, 4)/4)) = 10 + 32 = 42
+//	  by-nodes: 10 + (2 * (round(4, 2)/2)) = 10 + 4 = 14
+//	The larger is by-cores, and it is less than Max, so the final value is 42.
+//
+//	If we find 3 cores and 3 nodes we get scalars of:
+//	  by-cores: 10 + (2 * (round(3, 4)/4)) = 10 + 2 = 12
+//	  by-nodes: 10 + (2 * (round(3, 2)/2)) = 10 + 4 = 14
 type ResourceScaleConfig struct {
 	// The baseline quantity required.
 	Base *resource.Quantity
@@ -295,7 +326,7 @@ func (sc ScaleConfig) String() string {
 	var buf bytes.Buffer
 	buf.WriteString("{ ")
 	for k, v := range sc {
-		buf.WriteString(fmt.Sprintf("[%s]: %s, ", k, v))
+		fmt.Fprintf(&buf, "[%s]: %s, ", k, v)
 	}
 	buf.WriteString("}")
 	return buf.String()
@@ -305,11 +336,11 @@ func (csc ContainerScaleConfig) String() string {
 	var buf bytes.Buffer
 	buf.WriteString("{ requests: { ")
 	for k, v := range csc.Requests {
-		buf.WriteString(fmt.Sprintf("[%s]: %s, ", k, v))
+		fmt.Fprintf(&buf, "[%s]: %s, ", k, v)
 	}
 	buf.WriteString("}, limits: { ")
 	for k, v := range csc.Limits {
-		buf.WriteString(fmt.Sprintf("[%s]: %s", k, v))
+		fmt.Fprintf(&buf, "[%s]: %s", k, v)
 	}
 	buf.WriteString("} }")
 	return buf.String()
@@ -319,19 +350,19 @@ func (rsc ResourceScaleConfig) String() string {
 	var buf bytes.Buffer
 	buf.WriteString("{ ")
 	if rsc.Base != nil {
-		buf.WriteString(fmt.Sprintf("base=%s ", rsc.Base.String()))
+		fmt.Fprintf(&buf, "base=%s ", rsc.Base.String())
 	}
 	if rsc.Max != nil {
-		buf.WriteString(fmt.Sprintf("max=%s ", rsc.Max.String()))
+		fmt.Fprintf(&buf, "max=%s ", rsc.Max.String())
 	}
 	if rsc.Step != nil {
-		buf.WriteString(fmt.Sprintf("incr=%s ", rsc.Step.String()))
+		fmt.Fprintf(&buf, "incr=%s ", rsc.Step.String())
 	}
 	if rsc.CoresPerStep != nil {
-		buf.WriteString(fmt.Sprintf("cores_incr=%d ", *rsc.CoresPerStep))
+		fmt.Fprintf(&buf, "cores_incr=%d ", *rsc.CoresPerStep)
 	}
 	if rsc.NodesPerStep != nil {
-		buf.WriteString(fmt.Sprintf("nodes_incr=%d ", *rsc.NodesPerStep))
+		fmt.Fprintf(&buf, "nodes_incr=%d ", *rsc.NodesPerStep)
 	}
 	buf.WriteString("}")
 	return buf.String()

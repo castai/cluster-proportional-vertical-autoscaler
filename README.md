@@ -21,7 +21,7 @@ Usage of cluster-proportional-vertical-autoscaler:
       --log-dir="": If non-empty, write log files in this directory
       --logtostderr[=false]: log to standard error instead of files
       --namespace="": The Namespace of the --target. Defaults to ${MY_NAMESPACE}.
-      --poll-period-seconds=10: The period, in seconds, to poll cluster size and perform autoscaling.
+      --poll-period-seconds=10: The period, in seconds, to poll cluster size and perform autoscaling. In InPlace modes it also bounds a single resize cycle; autoscaler resumes on the next poll if a cycle can't finish in time.
       --stderrthreshold=2: logs at or above this threshold go to stderr
       --target="": Target to scale. In format: deployment/*, replicaset/* or daemonset/* (not case sensitive).
       --v=0: log level for V logs
@@ -177,3 +177,50 @@ spec:
         operator: "Exists"
       serviceAccountName: thing-autoscaler
 ```
+
+## In-place pod resize (Kubernetes 1.33+)
+
+By default, cpvpa only patches the workload template; new pods come up at the correct size, but existing pods are rolled only when the owning controller recreates them. In-place resize mode uses the `pods/resize` subresource (KEP-1287) to patch live pods without restart.
+
+### Requirements
+
+- Kubernetes 1.33+ with the `InPlacePodVerticalScaling` feature gate enabled (on by default in 1.33).
+- Each container that should resize in-place must declare a `resizePolicy` with `restartPolicy: NotRequired` for the resources you want to resize.
+
+### RBAC
+
+In-place modes need extra permissions beyond the base role. Apply `examples/RBAC/RBAC-inplace-configs.yaml` in addition to the base role:
+
+```bash
+kubectl apply -f examples/RBAC/RBAC-inplace-configs.yaml
+```
+
+This grants:
+- `pods`: `[list, get]` — to find and classify pods owned by the target
+- `pods/resize`: `[patch]` — the actual in-place resize subresource
+- `pods`: `[delete]` — fallback eviction in `InPlaceOrRecreate` mode
+
+### Resize modes
+
+- `--resize-mode=Recreate` (default): patch only the template; existing pods are rolled by the controller.
+- `--resize-mode=InPlace`: resize live pods via `/resize` only; the workload template is intentionally left unchanged so the controller is not triggered to roll pods. Newly created pods (scale-up, reschedule) start at the template size and are converged on a later poll. Pods that report `Deferred` or `Infeasible` are retried on the next poll.
+- `--resize-mode=InPlaceOrRecreate`: like `InPlace`, but pods that fail to resize (kubelet reports `Infeasible` or `Deferred`, or the resize stays in progress) for longer than `--resize-fallback-grace-period` are recreated at the new size. How they're recreated depends on the target: for Deployments and `RollingUpdate` DaemonSets cpvpa patches the template and lets the controller perform its normal rolling update — which recreates **all** of the workload's pods, paced by `maxUnavailable`/PodDisruptionBudgets, not just the stuck ones; for bare ReplicaSets and `OnDelete` DaemonSets cpvpa deletes the stuck pods directly so the controller recreates them. Note that this direct delete is a raw deletion, not an eviction, so it does **not** honor PodDisruptionBudgets (the self-healing rollout path does, via the controller's `maxUnavailable`).
+
+Both `InPlace` and `InPlaceOrRecreate` need the in-place RBAC add-on.
+
+In the in-place modes, `--poll-period-seconds` also bounds how long one resize cycle may run: cpvpa tries to resize every matching pod within a single poll period and resumes on the next poll if it can't finish. Already-resized pods are skipped without any API calls, so large workloads converge over a few cycles. For very large workloads, raise the poll period rather than expecting a single cycle to process everything.
+
+### Flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--resize-mode` | How to apply resource changes: `Recreate`, `InPlace`, or `InPlaceOrRecreate` | `Recreate` |
+| `--resize-fallback-grace-period` | Only for `InPlaceOrRecreate`. How long a pod must fail to resize (Infeasible, Deferred, or stuck in progress) before cpvpa recreates it. | `5m` |
+| `--resize-fallback-max-pods-per-cycle` | Only for `InPlaceOrRecreate`. Caps how many stuck pods cpvpa deletes directly per cycle (bare ReplicaSet / OnDelete DaemonSet only; self-healing controllers pace their own rollout). | `1` |
+
+### Example
+
+See `examples/cpvpa-inplace-example.yaml` for a complete example including:
+- a target Deployment with `resizePolicy` on its containers
+- a cpvpa Deployment running in `InPlaceOrRecreate` mode
+- the required RBAC bindings

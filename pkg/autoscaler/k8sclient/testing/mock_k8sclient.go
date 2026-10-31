@@ -17,6 +17,8 @@ limitations under the License.
 package k8sclient
 
 import (
+	"context"
+
 	"github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/autoscaler/k8sclient"
 	apiv1 "k8s.io/api/core/v1"
 )
@@ -30,11 +32,11 @@ type MockK8sClient struct {
 }
 
 // GetClusterSize mocks counting schedulable nodes and cores in the cluster
-func (k *MockK8sClient) GetClusterSize() (*k8sclient.ClusterSize, error) {
+func (k *MockK8sClient) GetClusterSize(ctx context.Context) (*k8sclient.ClusterSize, error) {
 	return &k8sclient.ClusterSize{Nodes: k.NumOfNodes, Cores: k.NumOfCores}, nil
 }
 
 // UpdateResources mocks updating resources needs for containers in the target
-func (k *MockK8sClient) UpdateResources(resources map[string]apiv1.ResourceRequirements) error {
+func (k *MockK8sClient) UpdateResources(ctx context.Context, resources map[string]apiv1.ResourceRequirements, reqsChanged bool) error {
 	return nil
 }
