@@ -1,17 +1,17 @@
 # cpvpa-inplace-example.yaml
 #
-# End-to-end example: a target Deployment whose containers declare a
-# resizePolicy, plus a cpvpa controller pointed at it in InPlaceOrRecreate
-# mode. Requires Kubernetes 1.33+ (InPlacePodVerticalScaling on by default).
+# End-to-end example: a target Deployment, plus a cpvpa controller pointed
+# at it in InPlaceOrRecreate mode. Requires Kubernetes 1.33+
+# (InPlacePodVerticalScaling on by default).
 #
 # IMPORTANT: apply examples/RBAC/RBAC-inplace-configs.yaml first. The
-# InPlaceOrRecreate mode needs extra permissions (pods/resize, pods/delete)
-# beyond the base RBAC role.
+# InPlaceOrRecreate mode needs extra permissions (pods/resize,
+# pods/eviction) beyond the base RBAC role.
 
 ---
-# Target workload. The interesting bit is resizePolicy on each container.
-# Without it, the kubelet defaults to RestartContainer for memory, which
-# turns a "live resize" into a container restart — defeating the point.
+# Target workload. Its limits are scaled by the cpvpa config below along
+# with its requests: a request may never exceed its limit, so fixed limits
+# would make every resize past them fail.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,9 +33,10 @@ spec:
           resources:
             requests: { cpu: "250m", memory: "128Mi" }
             limits:   { cpu: "500m", memory: "256Mi" }
-          # Live resize for both — no restart for CPU, no restart for
-          # memory increases. (Memory decreases may still be deferred by
-          # the kubelet; that's expected.)
+          # Optional: NotRequired is already the default for both. Shown
+          # for clarity; RestartContainer here would restart the container
+          # on every resize. (Memory decreases may still be deferred by the
+          # kubelet; that's expected.)
           resizePolicy:
             - resourceName: cpu
               restartPolicy: NotRequired

@@ -184,8 +184,12 @@ By default, cpvpa only patches the workload template; new pods come up at the co
 
 ### Requirements
 
-- Kubernetes 1.33+ with the `InPlacePodVerticalScaling` feature gate enabled (on by default in 1.33).
-- Each container that should resize in-place must declare a `resizePolicy` with `restartPolicy: NotRequired` for the resources you want to resize.
+- **API server 1.33+.** cpvpa checks the server version and the `pods/resize` subresource at startup. If those discovery calls fail, it retries for about 15s and then exits, so the pod restarts and checks again. `InPlace` exits when the cluster lacks support; `InPlaceOrRecreate` falls back to `Recreate` only on a definitive "unsupported" answer, never on a failed call.
+- **Kubelet support on the nodes** (`InPlacePodVerticalScaling`, on by default since 1.33). This can differ per node, for example on older node pools within version skew. cpvpa detects it per pod; see *Resize modes* for what happens on nodes without it.
+- **`resizePolicy`:** nothing to declare. The default `restartPolicy` is `NotRequired`. Only set `RestartContainer` if the container really needs a restart to pick up the new value; it then restarts on every resize.
+- **Limits must allow the requests.** A request may never exceed its limit. If the target sets limits, scale them in the cpvpa config too (see the example), or drop them. cpvpa will not send a resize or template patch that puts a request above its limit.
+- **The QoS class cannot change in place.** For a Guaranteed pod (requests equal limits), scale requests and limits together.
+- **cpvpa must be the only resizer** for the containers it manages. Exclude them from VPA in-place updates and other autoscalers; otherwise each one reverts the other's change on every poll.
 
 ### RBAC
 
@@ -207,8 +211,8 @@ Only when using `--resize-fallback-disruption=delete` instead: add `pods: [delet
 ### Resize modes
 
 - `--resize-mode=Recreate` (default): patch only the template; existing pods are rolled by the controller.
-- `--resize-mode=InPlace`: resize live pods via `/resize`. The workload template is left unchanged for self-healing targets (patching it would trigger a full rollout), but non-self-healing targets (bare ReplicaSets, `OnDelete` DaemonSets/StatefulSets) get their template patched too, since that carries no rollout — every pod created afterwards (scale-up, reschedule, eviction) then starts at the right size instead of waiting for the next poll. Pods that report `Deferred` or `Infeasible` are retried on the next poll.
-- `--resize-mode=InPlaceOrRecreate`: like `InPlace`, but pods that fail to resize (kubelet reports `Infeasible` or `Deferred`, or the resize stays in progress) for longer than `--resize-fallback-grace-period` are recreated at the new size. How they're recreated depends on the target: for Deployments, `RollingUpdate` DaemonSets and `RollingUpdate` StatefulSets cpvpa patches the template and lets the controller perform its normal rolling update — which recreates **all** of the workload's pods, paced by `maxUnavailable`/PodDisruptionBudgets, not just the stuck ones; for bare ReplicaSets and `OnDelete` DaemonSets/StatefulSets cpvpa disrupts the stuck pods itself so the controller recreates them. That direct disruption uses the Eviction API by default, which honors PodDisruptionBudgets; with `--resize-fallback-disruption=delete` it is a raw delete that does **not**. Targets whose pods are pinned to their node (DaemonSets) and targets whose controller would not act on a template patch (paused Deployments, partitioned StatefulSets) are treated as non-self-healing; DaemonSet pods stuck with `Deferred`/`Infeasible` are never disrupted at all — they would be recreated on the same node they cannot fit.
+- `--resize-mode=InPlace`: resize live pods via `/resize`. The workload template is left unchanged for self-healing targets (patching it would trigger a full rollout), but non-self-healing targets (bare ReplicaSets, `OnDelete` DaemonSets/StatefulSets) get their template patched too, since that carries no rollout — every pod created afterwards (scale-up, reschedule, eviction) then starts at the right size instead of waiting for the next poll. Pods that report `Deferred` or `Infeasible` are retried on the next poll. Pods whose resize can never succeed are skipped: the node's kubelet lacks in-place support, the change would alter the QoS class or put a request above its limit, or the pod is static, runs on Windows, or uses pod-level resources. Each is logged once as a Warning and counted as `Rejected` in the cycle summary; QoS and limit rejections are re-checked when the target changes. `InPlace` never evicts, deletes or triggers a rollout, so skipped pods keep their old size until something else recreates them. If some nodes lack in-place support, use `InPlaceOrRecreate`. A pod that already has the target size on such a node counts as done.
+- `--resize-mode=InPlaceOrRecreate`: like `InPlace`, but pods that fail to resize (kubelet reports `Infeasible` or `Deferred`, the resize stays in progress, or it is skipped as above) for longer than `--resize-fallback-grace-period` are recreated at the new size. The grace clock restarts when cpvpa patches a pod with a new target, except when the kubelet already reported the pod as `Deferred`/`Infeasible` and no value went down: the new size is no easier to fit, and a node count flapping across a step boundary must not postpone the fallback forever. How they're recreated depends on the target: for Deployments, `RollingUpdate` DaemonSets and `RollingUpdate` StatefulSets cpvpa patches the template and lets the controller perform its normal rolling update — which recreates **all** of the workload's pods, paced by `maxUnavailable`/PodDisruptionBudgets, not just the stuck ones; for bare ReplicaSets and `OnDelete` DaemonSets/StatefulSets cpvpa disrupts the stuck pods itself so the controller recreates them. That direct disruption uses the Eviction API by default, which honors PodDisruptionBudgets; with `--resize-fallback-disruption=delete` it is a raw delete that does **not**. Paused Deployments and partitioned StatefulSets are treated as non-self-healing, since their controller would not act on a template patch, so cpvpa disrupts their stuck pods directly. DaemonSet pods are recreated on the same node, so a DaemonSet pod the kubelet reports as `Deferred` or `Infeasible` is never disrupted (its replacement would not fit either); it is logged once as an Error and counted as `FallbackSkippedNodeBound`. DaemonSet pods on nodes without in-place support are still recreated: that is the only way they converge.
 
 Both `InPlace` and `InPlaceOrRecreate` need the in-place RBAC add-on.
 
@@ -219,13 +223,13 @@ In the in-place modes, `--poll-period-seconds` also bounds how long one resize c
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--resize-mode` | How to apply resource changes: `Recreate`, `InPlace`, or `InPlaceOrRecreate` | `Recreate` |
-| `--resize-fallback-grace-period` | Only for `InPlaceOrRecreate`. How long a pod must fail to resize (Infeasible, Deferred, or stuck in progress) before cpvpa recreates it. | `5m` |
+| `--resize-fallback-grace-period` | Only for `InPlaceOrRecreate`. How long a pod must fail to resize (Infeasible, Deferred, stuck in progress, or skipped as unresizable) before cpvpa recreates it. | `5m` |
 | `--resize-fallback-max-pods-per-cycle` | Only for `InPlaceOrRecreate`. Caps how many stuck pods cpvpa disrupts per cycle (bare ReplicaSet / OnDelete DaemonSet or StatefulSet only; self-healing controllers pace their own rollout). | `1` |
 | `--resize-fallback-disruption` | Only for `InPlaceOrRecreate`. How to disrupt stuck pods on non-self-healing targets: `eviction` (uses the Eviction API, honors PodDisruptionBudgets) or `delete` (raw delete, ignores PDBs). | `eviction` |
 
 ### Example
 
 See `examples/cpvpa-inplace-example.yaml` for a complete example including:
-- a target Deployment with `resizePolicy` on its containers
+- a target Deployment whose limits are scaled alongside its requests
 - a cpvpa Deployment running in `InPlaceOrRecreate` mode
 - the required RBAC bindings
