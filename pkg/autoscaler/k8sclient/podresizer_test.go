@@ -1901,37 +1901,82 @@ func TestResizeRunningPods_UnsupportedNodeSuppressed(t *testing.T) {
 	}
 }
 
-// TestResizeRunningPods_ActuationUnknownRejected merges the old actuation-unknown
-// warning into the rejection machinery. A single managed running container with
-// nil status.resources is caught by precheckResize (node-unsupported); the
-// actuation-unknown branch itself fires when a LATER managed running container
-// has no status resources while an earlier one does.
-func TestResizeRunningPods_ActuationUnknownRejected(t *testing.T) {
-	res := cpuReq("100m")
-	pod := makePod("pod-a", v1.PodRunning, nil, res) // spec already at desired: no patch
-	pod.Spec.Containers = append(pod.Spec.Containers, v1.Container{Name: "worker", Resources: res})
-	pod.Spec.NodeName = "node-1"
-	pod.Status.ContainerStatuses = []v1.ContainerStatus{
-		{Name: "main", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Resources: &res},
-		{Name: "worker", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}},
+// TestResizeRunningPods_AtDesiredOnUnsupportedNodeConverged is the regression
+// test for a recreation loop: a pod whose spec already matches desired, on a
+// node without in-place support (running container, nil status.resources),
+// must count as converged — never rejected, never fed to the fallback. Before
+// the fix it was evicted every grace period, and so was its identically sized
+// replacement. Covers the single-container case (formerly caught by the
+// precheck) and the multi-container one (the actuation-unknown branch).
+func TestResizeRunningPods_AtDesiredOnUnsupportedNodeConverged(t *testing.T) {
+	res := cpuReq("200m")
+	single := func() (v1.Pod, map[string]v1.ResourceRequirements) {
+		p := makePod("pod-a", v1.PodRunning, nil, res)
+		p.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", nil)}
+		return p, map[string]v1.ResourceRequirements{"main": res}
 	}
+	multi := func() (v1.Pod, map[string]v1.ResourceRequirements) {
+		p := makePod("pod-a", v1.PodRunning, nil, res)
+		p.Spec.Containers = append(p.Spec.Containers, v1.Container{Name: "worker", Resources: res})
+		p.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &res), runningStatus("worker", nil)}
+		return p, map[string]v1.ResourceRequirements{"main": res, "worker": res}
+	}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionEviction}
 
-	server := newPodListServer([]v1.Pod{pod})
-	defer server.Close()
-
-	rig := newResizeRig(t, server)
-	result := rig.run(map[string]v1.ResourceRequirements{"main": res, "worker": res}, ResizeModeInPlace, stdFallback, false)
-	if result.ActuationUnknown != 1 {
-		t.Errorf("ActuationUnknown = %d, want 1", result.ActuationUnknown)
-	}
-	if result.Rejected != 1 || result.Unsupported != 1 {
-		t.Errorf("Rejected=%d Unsupported=%d, want 1/1", result.Rejected, result.Unsupported)
-	}
-	if result.AlreadyOK != 0 {
-		t.Errorf("AlreadyOK = %d, want 0 (kubelet never confirmed actuation)", result.AlreadyOK)
-	}
-	if _, ok := rig.tracker.rejection(types.UID("pod-a"), ""); !ok {
-		t.Error("tracker should record the node-unsupported rejection")
+	for _, shape := range []struct {
+		name string
+		make func() (v1.Pod, map[string]v1.ResourceRequirements)
+	}{{"single container", single}, {"multi container", multi}} {
+		for _, tgt := range []struct {
+			name                 string
+			selfHeals, nodeBound bool
+		}{
+			{"bare ReplicaSet", false, false},
+			{"Deployment", true, false},
+			{"OnDelete DaemonSet", false, true},
+			{"RollingUpdate DaemonSet", true, true},
+		} {
+			t.Run(shape.name+"/"+tgt.name, func(t *testing.T) {
+				warnings := countWarnings(t)
+				pod, desired := shape.make()
+				pod.Spec.NodeName = "old-node"
+				var patches, disruptions, templatePatches int
+				server := recordingPodServer(&pod, &patches, &disruptions)
+				defer server.Close()
+				rig := newResizeRig(t, server)
+				rig.pastGrace("pod-a")
+				target := &fakeResizeTarget{
+					selector: rig.selector, namespace: "test", clientset: rig.client,
+					selfHeals: func(context.Context) bool { return tgt.selfHeals },
+					patcher:   func(map[string]v1.ResourceRequirements) error { templatePatches++; return nil },
+					nodeBound: tgt.nodeBound,
+				}
+				r := &podResizer{
+					resizeMode: ResizeModeInPlaceOrRecreate, fallbackConfig: fallback,
+					clock: clock.RealClock{}, clientset: rig.client, tracker: rig.tracker,
+				}
+				for cycle := 0; cycle < 3; cycle++ {
+					result, err := r.resizeRunningPods(context.Background(), target, desired)
+					if err != nil {
+						t.Fatalf("cycle %d: %v", cycle, err)
+					}
+					if result.ActuationUnknown != 1 || result.Rejected != 0 || result.Unsupported != 0 {
+						t.Errorf("cycle %d: ActuationUnknown=%d Rejected=%d Unsupported=%d, want 1/0/0",
+							cycle, result.ActuationUnknown, result.Rejected, result.Unsupported)
+					}
+				}
+				if disruptions != 0 || templatePatches != 0 || patches != 0 {
+					t.Errorf("disruptions=%d templatePatches=%d /resize=%d over 3 polls, want 0/0/0",
+						disruptions, templatePatches, patches)
+				}
+				if _, tracked := rig.tracker.notResizedSince[types.UID("pod-a")]; tracked {
+					t.Error("a converged pod must not stay on the fallback clock")
+				}
+				if *warnings != 0 {
+					t.Errorf("warnings = %d, want 0", *warnings)
+				}
+			})
+		}
 	}
 }
 
@@ -2246,8 +2291,8 @@ func runningStatus(name string, res *v1.ResourceRequirements) v1.ContainerStatus
 }
 
 // TestResizeRunningPods_RejectionWarnsOnceAcrossPolls pins the wiring, not
-// just the tracker: each rejection path (local precheck, actuation unknown)
-// emits exactly one warning over several polls.
+// just the tracker: a rejected pod emits exactly one warning over several
+// polls.
 func TestResizeRunningPods_RejectionWarnsOnceAcrossPolls(t *testing.T) {
 	t.Run("precheck", func(t *testing.T) {
 		warnings := countWarnings(t)
@@ -2261,25 +2306,6 @@ func TestResizeRunningPods_RejectionWarnsOnceAcrossPolls(t *testing.T) {
 		rig := newResizeRig(t, server)
 		for cycle := 0; cycle < 3; cycle++ {
 			rig.run(map[string]v1.ResourceRequirements{"main": cpuReq("200m")}, ResizeModeInPlace, stdFallback, false)
-		}
-		if *warnings != 1 {
-			t.Errorf("warnings over 3 polls = %d, want 1", *warnings)
-		}
-	})
-	t.Run("actuation unknown", func(t *testing.T) {
-		warnings := countWarnings(t)
-		res := cpuReq("100m")
-		pod := makePod("pod-a", v1.PodRunning, nil, res)
-		pod.Spec.Containers = append(pod.Spec.Containers, v1.Container{Name: "worker", Resources: res})
-		pod.Spec.NodeName = "node-1"
-		pod.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &res), runningStatus("worker", nil)}
-		var patches, disruptions int
-		server := recordingPodServer(&pod, &patches, &disruptions)
-		defer server.Close()
-
-		rig := newResizeRig(t, server)
-		for cycle := 0; cycle < 3; cycle++ {
-			rig.run(map[string]v1.ResourceRequirements{"main": res, "worker": res}, ResizeModeInPlace, stdFallback, false)
 		}
 		if *warnings != 1 {
 			t.Errorf("warnings over 3 polls = %d, want 1", *warnings)
