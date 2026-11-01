@@ -57,6 +57,10 @@ data:
         "requests": {
           "cpu":    {"base": "250m",  "step": "100m",  "nodesPerStep": 10, "max": "2"},
           "memory": {"base": "128Mi", "step": "32Mi",  "nodesPerStep": 10, "max": "512Mi"}
+        },
+        "limits": {
+          "cpu":    {"base": "500m",  "step": "200m",  "nodesPerStep": 10, "max": "4"},
+          "memory": {"base": "256Mi", "step": "64Mi",  "nodesPerStep": 10, "max": "1Gi"}
         }
       }
     }
@@ -81,7 +85,7 @@ spec:
       serviceAccountName: cpvpa
       containers:
         - name: autoscaler
-          image: registry.k8s.io/cpa/cpvpa:vX.Y.Z   # placeholder for the release that includes this feature
+          image: ghcr.io/castai/images/cpa/cpvpa:vX.Y.Z   # placeholder for the release that includes this feature
           resources:
             requests: { cpu: "20m", memory: "10Mi" }
           command:
@@ -89,7 +93,7 @@ spec:
             - --target=deployment/thing
             - --namespace=kube-system
             - --logtostderr=true
-            - --poll-period-seconds=10
+            - --poll-period-seconds=30
             - --config-file=/etc/config/thing-cpvpa
             # NEW FLAGS:
             - --resize-mode=InPlaceOrRecreate

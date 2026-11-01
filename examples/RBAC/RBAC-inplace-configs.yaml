@@ -29,7 +29,7 @@ rules:
   # the Recreate path and is what guarantees new pods come up at the right
   # size in every mode.
   - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets", "daemonsets"]
+    resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
     verbs: ["get", "patch"]
 
 ---

@@ -189,22 +189,26 @@ By default, cpvpa only patches the workload template; new pods come up at the co
 
 ### RBAC
 
-In-place modes need extra permissions beyond the base role. Apply `examples/RBAC/RBAC-inplace-configs.yaml` in addition to the base role:
+In-place modes need extra permissions beyond the base role. Apply `examples/RBAC/RBAC-inplace-configs.yaml`; it is **self-contained** — it defines the `cpvpa` service account, the base role (nodes, apps) and the in-place add-on role, so use it *instead of* the older `examples/RBAC/RBAC-configs.yaml` (which binds a different service account):
 
 ```bash
 kubectl apply -f examples/RBAC/RBAC-inplace-configs.yaml
 ```
 
 This grants:
+- `nodes`: `[list, watch]` — the cluster-size signal
+- `deployments/replicasets/daemonsets/statefulsets` (`apps`): `[get, patch]` — the workload template (Recreate mode and the fallback)
 - `pods`: `[list, get]` — to find and classify pods owned by the target
 - `pods/resize`: `[patch]` — the actual in-place resize subresource
-- `pods`: `[delete]` — fallback eviction in `InPlaceOrRecreate` mode
+- `pods/eviction`: `[create]` — the `InPlaceOrRecreate` fallback's default disruption method (honors PodDisruptionBudgets)
+
+Only when using `--resize-fallback-disruption=delete` instead: add `pods: [delete]` and drop the `pods/eviction` rule (see the commented block in the file).
 
 ### Resize modes
 
 - `--resize-mode=Recreate` (default): patch only the template; existing pods are rolled by the controller.
 - `--resize-mode=InPlace`: resize live pods via `/resize` only; the workload template is intentionally left unchanged so the controller is not triggered to roll pods. Newly created pods (scale-up, reschedule) start at the template size and are converged on a later poll. Pods that report `Deferred` or `Infeasible` are retried on the next poll.
-- `--resize-mode=InPlaceOrRecreate`: like `InPlace`, but pods that fail to resize (kubelet reports `Infeasible` or `Deferred`, or the resize stays in progress) for longer than `--resize-fallback-grace-period` are recreated at the new size. How they're recreated depends on the target: for Deployments and `RollingUpdate` DaemonSets cpvpa patches the template and lets the controller perform its normal rolling update — which recreates **all** of the workload's pods, paced by `maxUnavailable`/PodDisruptionBudgets, not just the stuck ones; for bare ReplicaSets and `OnDelete` DaemonSets cpvpa deletes the stuck pods directly so the controller recreates them. Note that this direct delete is a raw deletion, not an eviction, so it does **not** honor PodDisruptionBudgets (the self-healing rollout path does, via the controller's `maxUnavailable`).
+- `--resize-mode=InPlaceOrRecreate`: like `InPlace`, but pods that fail to resize (kubelet reports `Infeasible` or `Deferred`, or the resize stays in progress) for longer than `--resize-fallback-grace-period` are recreated at the new size. How they're recreated depends on the target: for Deployments, `RollingUpdate` DaemonSets and `RollingUpdate` StatefulSets cpvpa patches the template and lets the controller perform its normal rolling update — which recreates **all** of the workload's pods, paced by `maxUnavailable`/PodDisruptionBudgets, not just the stuck ones; for bare ReplicaSets and `OnDelete` DaemonSets/StatefulSets cpvpa disrupts the stuck pods itself so the controller recreates them. That direct disruption uses the Eviction API by default, which honors PodDisruptionBudgets; with `--resize-fallback-disruption=delete` it is a raw delete that does **not**.
 
 Both `InPlace` and `InPlaceOrRecreate` need the in-place RBAC add-on.
 
@@ -216,7 +220,8 @@ In the in-place modes, `--poll-period-seconds` also bounds how long one resize c
 |------|-------------|---------|
 | `--resize-mode` | How to apply resource changes: `Recreate`, `InPlace`, or `InPlaceOrRecreate` | `Recreate` |
 | `--resize-fallback-grace-period` | Only for `InPlaceOrRecreate`. How long a pod must fail to resize (Infeasible, Deferred, or stuck in progress) before cpvpa recreates it. | `5m` |
-| `--resize-fallback-max-pods-per-cycle` | Only for `InPlaceOrRecreate`. Caps how many stuck pods cpvpa deletes directly per cycle (bare ReplicaSet / OnDelete DaemonSet only; self-healing controllers pace their own rollout). | `1` |
+| `--resize-fallback-max-pods-per-cycle` | Only for `InPlaceOrRecreate`. Caps how many stuck pods cpvpa disrupts per cycle (bare ReplicaSet / OnDelete DaemonSet or StatefulSet only; self-healing controllers pace their own rollout). | `1` |
+| `--resize-fallback-disruption` | Only for `InPlaceOrRecreate`. How to disrupt stuck pods on non-self-healing targets: `eviction` (uses the Eviction API, honors PodDisruptionBudgets) or `delete` (raw delete, ignores PDBs). | `eviction` |
 
 ### Example
 

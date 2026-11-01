@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 
 	apiv1 "k8s.io/api/core/v1"
@@ -29,7 +31,73 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
+	"sigs.k8s.io/yaml"
 )
+
+// TestRBACInplaceCoversAllTargetKinds is a guard test for the shipped RBAC
+// example: every workload kind that discoverAPI accepts must be readable and
+// patchable by the cpvpa ClusterRole in RBAC-inplace-configs.yaml, otherwise
+// targets of that kind fail every poll with 403.
+func TestRBACInplaceCoversAllTargetKinds(t *testing.T) {
+	data, err := os.ReadFile("../../../examples/RBAC/RBAC-inplace-configs.yaml")
+	if err != nil {
+		t.Fatalf("read RBAC example: %v", err)
+	}
+
+	type rbacRule struct {
+		APIGroups []string `json:"apiGroups"`
+		Resources []string `json:"resources"`
+		Verbs     []string `json:"verbs"`
+	}
+	type rbacDoc struct {
+		Kind     string `json:"kind"`
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		Rules []rbacRule `json:"rules"`
+	}
+
+	var appsRule *rbacRule
+	for _, doc := range strings.Split(string(data), "\n---") {
+		var d rbacDoc
+		if err := yaml.Unmarshal([]byte(doc), &d); err != nil {
+			continue // comment-only or empty segment
+		}
+		if d.Kind == "ClusterRole" && d.Metadata.Name == "cpvpa" {
+			for i := range d.Rules {
+				for _, g := range d.Rules[i].APIGroups {
+					if g == "apps" {
+						r := d.Rules[i]
+						appsRule = &r
+					}
+				}
+			}
+		}
+	}
+	if appsRule == nil {
+		t.Fatal("no apps rule found in the cpvpa ClusterRole")
+	}
+
+	has := func(list []string, want string) bool {
+		for _, s := range list {
+			if s == want {
+				return true
+			}
+		}
+		return false
+	}
+	for _, kind := range []string{"deployments", "daemonsets", "replicasets", "statefulsets"} {
+		if !has(appsRule.Resources, kind) {
+			t.Errorf("cpvpa ClusterRole apps rule is missing %q (targets of this kind get 403)", kind)
+		}
+	}
+	for _, verb := range []string{"get", "patch"} {
+		if !has(appsRule.Verbs, verb) {
+			t.Errorf("cpvpa ClusterRole apps rule is missing verb %q", verb)
+		}
+	}
+}
+
 
 func TestDiscoverAPI(t *testing.T) {
 	testCases := []struct {

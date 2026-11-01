@@ -66,7 +66,7 @@ func NewAutoScalerConfig() *AutoScalerConfig {
 
 // AddFlags adds flags to the specified FlagSet.
 func (c *AutoScalerConfig) AddFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&c.Target, "target", c.Target, "The target object to scale. Format: deployment/* (not case sensitive).")
+	fs.StringVar(&c.Target, "target", c.Target, "The target object to scale. Format: deployment/*, daemonset/*, replicaset/*, or statefulset/* (not case sensitive).")
 	fs.StringVar(&c.Namespace, "namespace", c.Namespace, "The Namespace of the --target. Defaults to ${MY_NAMESPACE}.")
 	fs.StringVar(&c.DefaultConfig, "default-config", c.DefaultConfig, "The default configuration (in JSON format).")
 	fs.StringVar(&c.ConfigFile, "config-file", c.ConfigFile, "A config file (in JSON format), which overrides the --default-config.")
@@ -76,7 +76,7 @@ func (c *AutoScalerConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&c.DryRun, "dry-run", c.DryRun, "Calculate updates for a target but do not apply them.")
 	fs.StringVar(&c.ResizeMode, "resize-mode", c.ResizeMode, "How to apply resource changes. One of: Recreate, InPlace, InPlaceOrRecreate. Recreate is the legacy behaviour. InPlace requires Kubernetes 1.33+.")
 	fs.DurationVar(&c.ResizeFallbackGracePeriod, "resize-fallback-grace-period", c.ResizeFallbackGracePeriod, "Only used with InPlaceOrRecreate. How long a pod must continuously fail to resize (Infeasible, Deferred, or stuck in progress) before cpvpa recreates it so the controller can reschedule it at the new size.")
-	fs.IntVar(&c.ResizeFallbackMaxPodsPerCycle, "resize-fallback-max-pods-per-cycle", c.ResizeFallbackMaxPodsPerCycle, "Only used with InPlaceOrRecreate. Caps how many not-yet-resized pods cpvpa recreates (by direct delete) in a single poll cycle.")
+	fs.IntVar(&c.ResizeFallbackMaxPodsPerCycle, "resize-fallback-max-pods-per-cycle", c.ResizeFallbackMaxPodsPerCycle, "Only used with InPlaceOrRecreate. Caps how many not-yet-resized pods cpvpa recreates (via the configured fallback disruption) in a single poll cycle.")
 	fs.StringVar(&c.ResizeFallbackDisruption, "resize-fallback-disruption", c.ResizeFallbackDisruption, "Only used with InPlaceOrRecreate. How to recreate stuck pods: eviction (default, honors PDBs) or delete (ignores PDBs).")
 }
 
