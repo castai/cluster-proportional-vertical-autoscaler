@@ -1889,10 +1889,13 @@ func TestResizeRunningPods_UnsupportedNodeSuppressed(t *testing.T) {
 		if result.Rejected != 1 || result.Unsupported != 1 {
 			t.Errorf("cycle %d: Rejected=%d Unsupported=%d, want 1/1", cycle, result.Rejected, result.Unsupported)
 		}
-		if result.Infeasible != 1 {
-			t.Errorf("cycle %d: Infeasible=%d, want 1 (rejection feeds the fallback clock)", cycle, result.Infeasible)
+		if result.Infeasible != 0 {
+			t.Errorf("cycle %d: Infeasible=%d, want 0 (a rejection is counted as Rejected, not Infeasible)", cycle, result.Infeasible)
 		}
-		if reason, ok := rig.tracker.rejection(types.UID("pod-a")); !ok || reason != rejectNodeUnsupported {
+		if _, tracked := rig.tracker.notResizedSince[types.UID("pod-a")]; !tracked {
+			t.Errorf("cycle %d: rejection should feed the fallback clock", cycle)
+		}
+		if reason, ok := rig.tracker.rejection(types.UID("pod-a"), ""); !ok || reason != rejectNodeUnsupported {
 			t.Errorf("cycle %d: tracker rejection = (%q, %v), want (%q, true)", cycle, reason, ok, rejectNodeUnsupported)
 		}
 	}
@@ -1927,7 +1930,7 @@ func TestResizeRunningPods_ActuationUnknownRejected(t *testing.T) {
 	if result.AlreadyOK != 0 {
 		t.Errorf("AlreadyOK = %d, want 0 (kubelet never confirmed actuation)", result.AlreadyOK)
 	}
-	if _, ok := rig.tracker.rejection(types.UID("pod-a")); !ok {
+	if _, ok := rig.tracker.rejection(types.UID("pod-a"), ""); !ok {
 		t.Error("tracker should record the node-unsupported rejection")
 	}
 }
@@ -2026,7 +2029,7 @@ func TestResizeRunningPods_Invalid422CauseMapped(t *testing.T) {
 	if patchCount != 1 {
 		t.Errorf("PATCH count = %d, want 1 (the 422 cause must suppress later attempts)", patchCount)
 	}
-	if reason, ok := rig.tracker.rejection(types.UID("pod-a")); !ok || reason != rejectNodeUnsupported {
+	if reason, ok := rig.tracker.rejection(types.UID("pod-a"), ""); !ok || reason != rejectNodeUnsupported {
 		t.Errorf("tracker rejection = (%q, %v), want (%q, true)", reason, ok, rejectNodeUnsupported)
 	}
 }
@@ -2036,17 +2039,17 @@ func TestResizeRunningPods_Invalid422CauseMapped(t *testing.T) {
 func TestResizeTracker_RejectionWarnOnce(t *testing.T) {
 	tr := newResizeTracker()
 	uid := types.UID("pod-a")
-	if !tr.setRejection(uid, rejectNodeUnsupported) {
+	if !tr.setRejection(uid, rejectNodeUnsupported, "") {
 		t.Error("first setRejection should report warn=true")
 	}
-	if tr.setRejection(uid, rejectNodeUnsupported) {
+	if tr.setRejection(uid, rejectNodeUnsupported, "") {
 		t.Error("repeat setRejection with the same reason should not warn")
 	}
-	if !tr.setRejection(uid, rejectQoSChange) {
+	if !tr.setRejection(uid, rejectQoSChange, "") {
 		t.Error("setRejection with a changed reason should warn")
 	}
 	tr.clear(uid)
-	if !tr.setRejection(uid, rejectNodeUnsupported) {
+	if !tr.setRejection(uid, rejectNodeUnsupported, "") {
 		t.Error("setRejection after clear should warn")
 	}
 }
@@ -2198,5 +2201,292 @@ func TestResizeRunningPods_NodeBoundActuationErrorStillEvicted(t *testing.T) {
 	}
 	if result.Evicted != 1 || result.FallbackSkippedNodeBound != 0 {
 		t.Errorf("Evicted=%d FallbackSkippedNodeBound=%d, want 1/0", result.Evicted, result.FallbackSkippedNodeBound)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// rejection follow-ups: warn-once wiring, desired-dependent re-evaluation,
+// node-bound recreation of rejected pods, crash-looping pods
+// ---------------------------------------------------------------------------
+
+// countWarnings swaps the rejection warning sink for a counter for the
+// duration of the test.
+func countWarnings(t *testing.T) *int {
+	t.Helper()
+	n := 0
+	orig := logWarningf
+	logWarningf = func(format string, args ...interface{}) { n++ }
+	t.Cleanup(func() { logWarningf = orig })
+	return &n
+}
+
+// recordingPodServer serves one pod and counts /resize PATCHes and
+// disruptions (eviction or delete).
+func recordingPodServer(pod *v1.Pod, patches, disruptions *int) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{*pod}))
+		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
+			*patches++
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podResponse(pod))
+		case req.Method == "DELETE", req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/eviction"):
+			*disruptions++
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
+func runningStatus(name string, res *v1.ResourceRequirements) v1.ContainerStatus {
+	return v1.ContainerStatus{Name: name, State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Resources: res}
+}
+
+// TestResizeRunningPods_RejectionWarnsOnceAcrossPolls pins the wiring, not
+// just the tracker: each rejection path (local precheck, actuation unknown)
+// emits exactly one warning over several polls.
+func TestResizeRunningPods_RejectionWarnsOnceAcrossPolls(t *testing.T) {
+	t.Run("precheck", func(t *testing.T) {
+		warnings := countWarnings(t)
+		pod := makePod("pod-a", v1.PodRunning, nil, cpuReq("100m"))
+		pod.Spec.NodeName = "node-1"
+		pod.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", nil)}
+		var patches, disruptions int
+		server := recordingPodServer(&pod, &patches, &disruptions)
+		defer server.Close()
+
+		rig := newResizeRig(t, server)
+		for cycle := 0; cycle < 3; cycle++ {
+			rig.run(map[string]v1.ResourceRequirements{"main": cpuReq("200m")}, ResizeModeInPlace, stdFallback, false)
+		}
+		if *warnings != 1 {
+			t.Errorf("warnings over 3 polls = %d, want 1", *warnings)
+		}
+	})
+	t.Run("actuation unknown", func(t *testing.T) {
+		warnings := countWarnings(t)
+		res := cpuReq("100m")
+		pod := makePod("pod-a", v1.PodRunning, nil, res)
+		pod.Spec.Containers = append(pod.Spec.Containers, v1.Container{Name: "worker", Resources: res})
+		pod.Spec.NodeName = "node-1"
+		pod.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &res), runningStatus("worker", nil)}
+		var patches, disruptions int
+		server := recordingPodServer(&pod, &patches, &disruptions)
+		defer server.Close()
+
+		rig := newResizeRig(t, server)
+		for cycle := 0; cycle < 3; cycle++ {
+			rig.run(map[string]v1.ResourceRequirements{"main": res, "worker": res}, ResizeModeInPlace, stdFallback, false)
+		}
+		if *warnings != 1 {
+			t.Errorf("warnings over 3 polls = %d, want 1", *warnings)
+		}
+	})
+}
+
+// TestResizeRunningPods_DesiredDependentRejectionReevaluated verifies that a
+// rejection tied to the desired values (request above limit) is dropped once
+// the desired values change and become valid, while a repeat of the same
+// rejection does not warn again.
+func TestResizeRunningPods_DesiredDependentRejectionReevaluated(t *testing.T) {
+	warnings := countWarnings(t)
+	res := cpuReq("100m")
+	res.Limits = v1.ResourceList{v1.ResourceCPU: resource.MustParse("500m")}
+	pod := makePod("pod-a", v1.PodRunning, nil, res)
+	pod.Spec.NodeName = "node-1"
+	stRes := res
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &stRes)}
+	var patches, disruptions int
+	server := recordingPodServer(&pod, &patches, &disruptions)
+	defer server.Close()
+
+	rig := newResizeRig(t, server)
+	tooBig := map[string]v1.ResourceRequirements{"main": cpuReq("600m")}
+	fits := map[string]v1.ResourceRequirements{"main": cpuReq("300m")}
+
+	if r := rig.run(tooBig, ResizeModeInPlace, stdFallback, false); r.Rejected != 1 || patches != 0 {
+		t.Fatalf("above-limit target: Rejected=%d patches=%d, want 1/0", r.Rejected, patches)
+	}
+	if r := rig.run(tooBig, ResizeModeInPlace, stdFallback, false); r.Rejected != 1 || patches != 0 {
+		t.Fatalf("same target again: Rejected=%d patches=%d, want 1/0", r.Rejected, patches)
+	}
+	if *warnings != 1 {
+		t.Errorf("warnings = %d, want 1", *warnings)
+	}
+	if r := rig.run(fits, ResizeModeInPlace, stdFallback, false); r.Rejected != 0 || patches != 1 {
+		t.Errorf("valid target: Rejected=%d patches=%d, want 0/1 (stale rejection must not stick)", r.Rejected, patches)
+	}
+}
+
+// TestResizeRunningPods_NodeBoundRejectedStillRecreated verifies that the
+// node-bound guard only blocks kubelet-reported Deferred/Infeasible: a
+// DaemonSet pod on a node without in-place support is recreated after the
+// grace period, since recreation is the only way it converges.
+func TestResizeRunningPods_NodeBoundRejectedStillRecreated(t *testing.T) {
+	pod := makePod("ds-a", v1.PodRunning, nil, cpuReq("100m"))
+	pod.Spec.NodeName = "old-node"
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", nil)}
+	var patches, disruptions int
+	server := recordingPodServer(&pod, &patches, &disruptions)
+	defer server.Close()
+
+	rig := newResizeRig(t, server)
+	rig.pastGrace("ds-a")
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
+	calls := 0
+	result := runNodeBound(t, rig, false, map[string]v1.ResourceRequirements{"main": cpuReq("200m")}, ResizeModeInPlaceOrRecreate, fallback, &calls)
+	if result.FallbackSkippedNodeBound != 0 {
+		t.Errorf("FallbackSkippedNodeBound = %d, want 0 (a rejection carries no node-fit signal)", result.FallbackSkippedNodeBound)
+	}
+	if disruptions != 1 || result.Evicted != 1 {
+		t.Errorf("disruptions=%d Evicted=%d, want 1/1", disruptions, result.Evicted)
+	}
+	if patches != 0 {
+		t.Errorf("/resize patches = %d, want 0", patches)
+	}
+}
+
+// TestResizeRunningPods_CrashLoopingPodPatched verifies that a scheduled pod
+// with nothing running is skipped only if it never started: a crash-looping
+// pod (restarted before, waiting now) is resized so its next restart picks
+// up the new size.
+func TestResizeRunningPods_CrashLoopingPodPatched(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		restarts    int32
+		wantPatches int
+		wantWaiting int
+	}{
+		{name: "never started", restarts: 0, wantPatches: 0, wantWaiting: 1},
+		{name: "crash looping", restarts: 3, wantPatches: 1, wantWaiting: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := makePod("pod-a", v1.PodRunning, nil, cpuReq("100m"))
+			pod.Spec.NodeName = "node-1"
+			pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+				Name:         "main",
+				State:        v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+				RestartCount: tc.restarts,
+			}}
+			var patches, disruptions int
+			server := recordingPodServer(&pod, &patches, &disruptions)
+			defer server.Close()
+
+			rig := newResizeRig(t, server)
+			result := rig.run(map[string]v1.ResourceRequirements{"main": cpuReq("200m")}, ResizeModeInPlace, stdFallback, false)
+			if patches != tc.wantPatches || result.WaitingToStart != tc.wantWaiting {
+				t.Errorf("patches=%d WaitingToStart=%d, want %d/%d", patches, result.WaitingToStart, tc.wantPatches, tc.wantWaiting)
+			}
+		})
+	}
+}
+
+// TestResizeRunningPods_InPlaceNeverDisrupts pins the InPlace contract: no
+// matter why a pod is stuck, or for how long, InPlace mode never evicts,
+// deletes, or patches the template to trigger a rollout — recreation is
+// InPlaceOrRecreate's job. Each case is also run in InPlaceOrRecreate (on a
+// target that is not node-bound) to prove the setup really reaches the
+// fallback, so the InPlace assertions are not vacuous.
+func TestResizeRunningPods_InPlaceNeverDisrupts(t *testing.T) {
+	old, desired := cpuReq("100m"), cpuReq("200m")
+	actuationErr := []v1.PodCondition{{Type: v1.PodResizeInProgress, Status: v1.ConditionTrue, Reason: v1.PodReasonError}}
+
+	cases := []struct {
+		name string
+		pod  func() v1.Pod
+	}{
+		{"rejected: node without in-place support", func() v1.Pod {
+			p := makePod("pod-a", v1.PodRunning, nil, old)
+			p.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", nil)}
+			return p
+		}},
+		{"infeasible", func() v1.Pod {
+			p := makePod("pod-a", v1.PodRunning, infeasibleConds(), desired)
+			p.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &old)}
+			return p
+		}},
+		{"deferred", func() v1.Pod {
+			p := makePod("pod-a", v1.PodRunning, deferredConds(), desired)
+			p.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &old)}
+			return p
+		}},
+		{"in progress with actuation error", func() v1.Pod {
+			p := makePod("pod-a", v1.PodRunning, actuationErr, desired)
+			p.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &old)}
+			return p
+		}},
+		{"actuation mismatch", func() v1.Pod {
+			p := makePod("pod-a", v1.PodRunning, nil, desired)
+			p.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &old)}
+			return p
+		}},
+	}
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
+
+	// run polls three times, the pod past the grace period from the start,
+	// and returns /resize patches, disruptions and template patches.
+	run := func(t *testing.T, pod v1.Pod, mode ResizeMode, selfHeals, nodeBound bool) (patches, disruptions, templatePatches int) {
+		t.Helper()
+		pod.Spec.NodeName = "node-1"
+		server := recordingPodServer(&pod, &patches, &disruptions)
+		defer server.Close()
+		rig := newResizeRig(t, server)
+		rig.pastGrace("pod-a")
+		target := &fakeResizeTarget{
+			selector:  rig.selector,
+			namespace: "test",
+			clientset: rig.client,
+			selfHeals: func(context.Context) bool { return selfHeals },
+			patcher:   func(map[string]v1.ResourceRequirements) error { templatePatches++; return nil },
+			nodeBound: nodeBound,
+		}
+		r := &podResizer{
+			resizeMode:     mode,
+			fallbackConfig: fallback,
+			clock:          clock.RealClock{},
+			clientset:      rig.client,
+			tracker:        rig.tracker,
+		}
+		for cycle := 0; cycle < 3; cycle++ {
+			if _, err := r.resizeRunningPods(context.Background(), target, map[string]v1.ResourceRequirements{"main": desired}); err != nil {
+				t.Fatalf("cycle %d: %v", cycle, err)
+			}
+		}
+		return patches, disruptions, templatePatches
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, target := range []struct {
+				name                 string
+				selfHeals, nodeBound bool
+			}{
+				{"bare ReplicaSet / OnDelete", false, false},
+				{"Deployment / RollingUpdate", true, false},
+				{"OnDelete DaemonSet", false, true},
+				{"RollingUpdate DaemonSet", true, true},
+			} {
+				t.Run(target.name, func(t *testing.T) {
+					patches, disruptions, templatePatches := run(t, tc.pod(), ResizeModeInPlace, target.selfHeals, target.nodeBound)
+					if disruptions != 0 || templatePatches != 0 {
+						t.Errorf("InPlace: disruptions=%d templatePatches=%d over 3 polls past grace, want 0/0", disruptions, templatePatches)
+					}
+					if patches != 0 {
+						t.Errorf("InPlace: /resize patches=%d, want 0 (pod is stuck, spec already at desired or rejected)", patches)
+					}
+
+					if target.nodeBound {
+						return // the node-bound guard is covered by the NodeBound* tests
+					}
+					_, disruptions, templatePatches = run(t, tc.pod(), ResizeModeInPlaceOrRecreate, target.selfHeals, target.nodeBound)
+					if disruptions+templatePatches == 0 {
+						t.Errorf("control: InPlaceOrRecreate did not fall back (disruptions=%d templatePatches=%d) — setup does not reach the fallback", disruptions, templatePatches)
+					}
+				})
+			}
+		})
 	}
 }

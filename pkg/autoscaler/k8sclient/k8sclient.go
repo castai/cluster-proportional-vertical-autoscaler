@@ -19,6 +19,7 @@ package k8sclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -691,14 +692,17 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 	// at the right size instead of waiting to be resized in place. The call
 	// is a no-op once the template matches desired. Self-healing targets
 	// keep the original template until the fallback deliberately triggers a
-	// rollout.
+	// rollout. A failed template patch (RBAC, conflict, request above limit)
+	// must not block in-place resizing of the live pods: it is reported
+	// after the resize pass instead.
 	selfHeals, err := target.IsSelfHealing(ctx)
 	if err != nil {
 		return fmt.Errorf("self-heal check: %w", err)
 	}
+	var templateErr error
 	if !selfHeals {
 		if _, err := target.PatchTemplate(ctx, resources); err != nil {
-			return fmt.Errorf("template patch: %w", err)
+			templateErr = fmt.Errorf("template patch: %w", err)
 		}
 	}
 
@@ -709,7 +713,7 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 		glog.V(1).Infof("resize cycle: %+v", result)
 	}
 	if err != nil {
-		return fmt.Errorf("in-place resize: %w", err)
+		return errors.Join(templateErr, fmt.Errorf("in-place resize: %w", err))
 	}
-	return nil
+	return templateErr
 }

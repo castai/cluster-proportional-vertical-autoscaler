@@ -257,6 +257,7 @@ type fakeCluster struct {
 	pods          []apiv1.Pod    // pods returned by the pod LIST
 	hasResize     bool           // whether discovery advertises the pods/resize subresource
 	serverVersion string         // GitVersion reported by /version (defaults to v1.34.0)
+	templateDeny  bool           // template PATCH fails with 403 (e.g. RBAC missing patch)
 }
 
 func ctr(name, cpu string) apiv1.Container {
@@ -471,6 +472,13 @@ func (fc fakeCluster) handler(t *testing.T, rec *requestRecorder) http.HandlerFu
 			case http.MethodPatch:
 				body, _ := io.ReadAll(req.Body)
 				rec.recordTemplatePatch(req.URL.Path, body)
+				if fc.templateDeny {
+					writeJSON(w, http.StatusForbidden, &metav1.Status{
+						TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"},
+						Status:   metav1.StatusFailure, Reason: metav1.StatusReasonForbidden, Code: http.StatusForbidden,
+					})
+					return
+				}
 				applyTemplatePatch(fc.target, body)
 				writeJSON(w, http.StatusOK, fc.target)
 			default:
@@ -1087,5 +1095,28 @@ func TestPollAPIServer_InPlacePatchesTemplateForNonSelfHealing(t *testing.T) {
 	}
 	if !rec.resizePatched() {
 		t.Error("live pod should still be resized via /resize")
+	}
+}
+
+// TestPollAPIServer_InPlaceTemplateFailureDoesNotBlockResize verifies that a
+// failed template patch on a non-self-healing target (here a 403) is reported
+// as the poll error but does not stop the live pods from being resized.
+func TestPollAPIServer_InPlaceTemplateFailureDoesNotBlockResize(t *testing.T) {
+	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+
+	dsTarget := daemonset("test-ds", appsv1.OnDeleteDaemonSetStrategyType, ctr("main", "10m"))
+	cluster := fakeCluster{
+		cores:        []int{2, 2, 2, 1},
+		target:       dsTarget,
+		pods:         []apiv1.Pod{directlyOwnedPod(t, "test-ds-pod", dsTarget, ctr("main", "10m"))},
+		hasResize:    true,
+		templateDeny: true,
+	}
+	rec, err := runPoll(t, scenario{cluster: cluster, mode: k8sclient.ResizeModeInPlace, config: baseConfig})
+	if err == nil || !strings.Contains(err.Error(), "template patch") {
+		t.Errorf("poll error = %v, want the template patch failure reported", err)
+	}
+	if !rec.resizePatched() {
+		t.Error("live pod should still be resized via /resize despite the template failure")
 	}
 }

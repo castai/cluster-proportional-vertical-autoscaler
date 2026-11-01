@@ -83,6 +83,22 @@ const (
 	rejectWindows         resizeRejection = "windows-pod"
 )
 
+// podStable reports whether the rejection depends only on the pod (and its
+// node), not on the values cpvpa wants to apply. Pod-stable rejections hold
+// for the pod's lifetime; the rest (QoS change, request above limit) are
+// re-evaluated as soon as the desired values change.
+func (r resizeRejection) podStable() bool {
+	switch r {
+	case rejectNodeUnsupported, rejectPodLevel, rejectStaticPod, rejectWindows:
+		return true
+	}
+	return false
+}
+
+// logWarningf is the warning sink for once-per-pod rejection warnings;
+// a variable so tests can count emissions.
+var logWarningf = glog.Warningf
+
 // ResizeFallbackConfig governs the InPlaceOrRecreate fallback path.
 type ResizeFallbackConfig struct {
 	// GracePeriod is how long a pod must remain not-resized in-place
@@ -158,6 +174,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 		}
 	}
 	nodeBound := target.NodeBound()
+	desiredKey := resourcesKey(desired)
 
 	templatePatched := false
 	ensureTemplate := func() (bool, error) {
@@ -192,11 +209,14 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 			continue
 		}
 
-		// The API server's node-support check needs at least one running
-		// container; a scheduled pod with nothing running is picked up on a
-		// later poll instead of wasting a PATCH. Unscheduled pods are fine:
-		// the scheduler uses the new values.
-		if pod.Spec.NodeName != "" && !hasRunningContainer(pod) {
+		// A scheduled pod whose containers have never started is picked up on
+		// a later poll: its node's resize support can't be told yet, and the
+		// container will start from the latest spec anyway. Unscheduled pods
+		// are patched (the scheduler uses the new values), and so are pods
+		// whose containers ran before but are not running now (crash loop):
+		// the API server accepts that resize, and the kubelet applies it on
+		// the next restart — often exactly the fix an OOM-looping pod needs.
+		if pod.Spec.NodeName != "" && !hasRunningContainer(pod) && !hasStartedBefore(pod) {
 			result.WaitingToStart++
 			continue
 		}
@@ -205,12 +225,11 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 		// on an earlier one) is skipped; the fallback machinery still sees it
 		// so InPlaceOrRecreate can converge it via recreation, which does not
 		// depend on in-place support.
-		if reason, rejected := r.tracker.rejection(pod.UID); rejected {
+		if reason, rejected := r.tracker.rejection(pod.UID, desiredKey); rejected {
 			r.noteRejection(ctx, pod, reason, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
 			continue
 		}
 		if reason, rejected := precheckResize(pod, desired); rejected {
-			r.tracker.setRejection(pod.UID, reason)
 			r.noteRejection(ctx, pod, reason, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
 			continue
 		}
@@ -233,7 +252,6 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 					// kubelet reports no resize support: treat it as a permanent
 					// node-unsupported rejection.
 					result.ActuationUnknown++
-					r.tracker.setRejection(pod.UID, rejectNodeUnsupported)
 					r.noteRejection(ctx, pod, rejectNodeUnsupported, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
 				}
 			} else {
@@ -264,7 +282,6 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 			}
 			if apierrors.IsInvalid(patchErr) {
 				if reason := rejectionReasonFromError(patchErr); reason != "" {
-					r.tracker.setRejection(pod.UID, reason)
 					r.noteRejection(ctx, pod, reason, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
 				} else {
 					glog.V(2).Infof("resize rejected as invalid for pod=%s/%s (e.g. QoS class change); routing to fallback: %v",
@@ -297,7 +314,6 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 				r.maybeFallbackEvict(ctx, updated, now, age, selfHealing, resizeStatusOK, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
 			case actuationUnknown:
 				result.ActuationUnknown++
-				r.tracker.setRejection(updated.UID, rejectNodeUnsupported)
 				r.noteRejection(ctx, updated, rejectNodeUnsupported, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
 			}
 		} else {
@@ -329,6 +345,8 @@ func (r *podResizer) accountNotResized(
 		result.Deferred++
 	case resizeStatusInfeasible:
 		result.Infeasible++
+	case resizeStatusRejected:
+		// counted as Rejected by noteRejection
 	}
 	firstSeen := r.tracker.markNotResized(pod.UID, now)
 	age := now.Sub(firstSeen)
@@ -336,9 +354,12 @@ func (r *podResizer) accountNotResized(
 	r.maybeFallbackEvict(ctx, pod, now, age, selfHeals, status, desired, nodeBound, ensureTemplate, evictedThisCycle, result)
 }
 
-// noteRejection accounts for one pod whose resize is permanently rejected:
-// it counts the rejection, warns once per (pod, reason), and feeds the pod
-// to the fallback machinery like an Infeasible state.
+// noteRejection accounts for one pod whose resize is rejected: it records
+// the rejection (it is the only caller of setRejection, so the once-per-(pod,
+// reason) warning fires exactly once), counts it, and feeds the pod to the
+// fallback clock with resizeStatusRejected. That status is deliberately not
+// Infeasible: a rejection says nothing about whether the new size fits the
+// node, so the node-bound guard must not block recreation for it.
 func (r *podResizer) noteRejection(
 	ctx context.Context,
 	pod *v1.Pod,
@@ -355,16 +376,19 @@ func (r *podResizer) noteRejection(
 	if reason == rejectNodeUnsupported {
 		result.Unsupported++
 	}
-	if r.tracker.setRejection(pod.UID, reason) {
+	if r.tracker.setRejection(pod.UID, reason, resourcesKey(desired)) {
 		if reason == rejectNodeUnsupported {
-			glog.Warningf("pod=%s/%s on node %q cannot resize in place: kubelet has no InPlacePodVerticalScaling support",
+			logWarningf("pod=%s/%s on node %q cannot resize in place: kubelet has no InPlacePodVerticalScaling support",
 				pod.Namespace, pod.Name, pod.Spec.NodeName)
+		} else if reason.podStable() {
+			logWarningf("pod=%s/%s resize permanently rejected (%s); skipping /resize patches for it",
+				pod.Namespace, pod.Name, reason)
 		} else {
-			glog.Warningf("pod=%s/%s resize permanently rejected (%s); skipping /resize patches for it",
+			logWarningf("pod=%s/%s resize rejected (%s); skipping /resize patches for it until the desired resources change",
 				pod.Namespace, pod.Name, reason)
 		}
 	}
-	r.accountNotResized(ctx, pod, resizeStatusInfeasible, now, selfHeals, desired, nodeBound, ensureTemplate, evictedThisCycle, result)
+	r.accountNotResized(ctx, pod, resizeStatusRejected, now, selfHeals, desired, nodeBound, ensureTemplate, evictedThisCycle, result)
 }
 
 // hasActuationError reports whether the kubelet reported a resize actuation
@@ -407,6 +431,50 @@ func hasRunningContainer(pod *v1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// hasStartedBefore reports whether any container of the pod has run before
+// (restarted, or has a terminated last state) — e.g. a crash-looping pod
+// caught between restarts.
+func hasStartedBefore(pod *v1.Pod) bool {
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		if cs.RestartCount > 0 || cs.LastTerminationState.Terminated != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// resourcesKey renders desired resources (requests and limits, every
+// container) as a deterministic string, used to tell whether a recorded
+// desired-dependent rejection still applies.
+func resourcesKey(desired map[string]v1.ResourceRequirements) string {
+	names := make([]string, 0, len(desired))
+	for name := range desired {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	list := func(tag string, rl v1.ResourceList) {
+		keys := make([]string, 0, len(rl))
+		for k := range rl {
+			keys = append(keys, string(k))
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			q := rl[v1.ResourceName(k)]
+			fmt.Fprintf(&b, "%s.%s=%s,", tag, k, q.String())
+		}
+	}
+	for _, name := range names {
+		b.WriteString(name)
+		b.WriteByte('{')
+		list("req", desired[name].Requests)
+		list("lim", desired[name].Limits)
+		b.WriteString("};")
+	}
+	return b.String()
 }
 
 // resizeSupportedOnNode mirrors the API server's isPodResizeRequestSupported:
@@ -584,6 +652,8 @@ func (r *podResizer) maybeFallbackEvict(
 	// same node, so a Deferred/Infeasible resize would only replace a working
 	// agent with a Pending twin. Actuation errors are exempt — the pod's
 	// current allocation already fits the node, so the replacement can start.
+	// So are rejections (resizeStatusRejected), e.g. a kubelet without
+	// in-place support: recreation is the only way such a pod converges.
 	if nodeBound && (status == resizeStatusDeferred ||
 		(status == resizeStatusInfeasible && !hasActuationError(pod))) {
 		result.FallbackSkippedNodeBound++
@@ -719,7 +789,7 @@ type resizeTracker struct {
 	mu                   sync.Mutex
 	notResizedSince      map[types.UID]time.Time
 	evictionBlockedSince map[types.UID]time.Time
-	rejections           map[types.UID]resizeRejection
+	rejections           map[types.UID]rejectionEntry
 	fallbackWarned       map[types.UID]bool
 }
 
@@ -727,7 +797,7 @@ func newResizeTracker() *resizeTracker {
 	return &resizeTracker{
 		notResizedSince:      make(map[types.UID]time.Time),
 		evictionBlockedSince: make(map[types.UID]time.Time),
-		rejections:           make(map[types.UID]resizeRejection),
+		rejections:           make(map[types.UID]rejectionEntry),
 		fallbackWarned:       make(map[types.UID]bool),
 	}
 }
@@ -754,25 +824,36 @@ func (t *resizeTracker) clear(uid types.UID) {
 	delete(t.fallbackWarned, uid)
 }
 
-// setRejection marks a pod as permanently rejected. It returns true the
-// first time a given (uid, reason) pair is recorded, so the caller can warn
-// once per pod instead of on every poll.
-func (t *resizeTracker) setRejection(uid types.UID, reason resizeRejection) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if prev, ok := t.rejections[uid]; ok {
-		return prev != reason
-	}
-	t.rejections[uid] = reason
-	return true
+// rejectionEntry is a recorded rejection plus the desired values
+// (resourcesKey) it was determined for.
+type rejectionEntry struct {
+	reason     resizeRejection
+	desiredKey string
 }
 
-// rejection returns the recorded permanent rejection reason for a pod, if any.
-func (t *resizeTracker) rejection(uid types.UID) (resizeRejection, bool) {
+// setRejection records a pod's rejection for the given desired values. It
+// returns true when the pod had no rejection or a different reason, so the
+// caller warns once per (pod, reason) instead of on every poll.
+func (t *resizeTracker) setRejection(uid types.UID, reason resizeRejection, desiredKey string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	r, ok := t.rejections[uid]
-	return r, ok
+	prev, ok := t.rejections[uid]
+	t.rejections[uid] = rejectionEntry{reason: reason, desiredKey: desiredKey}
+	return !ok || prev.reason != reason
+}
+
+// rejection returns the pod's recorded rejection if it still applies:
+// pod-stable reasons always do; desired-dependent ones only while the
+// desired values are unchanged. A stale entry is kept (not deleted) so a
+// repeat rejection for the same reason does not warn again.
+func (t *resizeTracker) rejection(uid types.UID, desiredKey string) (resizeRejection, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.rejections[uid]
+	if !ok || (!e.reason.podStable() && e.desiredKey != desiredKey) {
+		return "", false
+	}
+	return e.reason, true
 }
 
 // warnedNodeBound reports (once per pod UID) whether the node-bound fallback
@@ -891,6 +972,11 @@ const (
 	resizeStatusInProgress
 	resizeStatusDeferred
 	resizeStatusInfeasible
+	// resizeStatusRejected is never returned by classifyResize: it marks a
+	// pod whose /resize cpvpa skipped (or the API server refused) because it
+	// can never succeed as requested. Unlike Infeasible, it carries no
+	// node-fit signal.
+	resizeStatusRejected
 )
 
 func (s resizeStatus) String() string {
@@ -901,6 +987,8 @@ func (s resizeStatus) String() string {
 		return "Deferred"
 	case resizeStatusInfeasible:
 		return "Infeasible"
+	case resizeStatusRejected:
+		return "Rejected"
 	default:
 		return "OK"
 	}
