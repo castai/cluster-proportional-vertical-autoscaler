@@ -110,7 +110,7 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 		}
 	}
 
-	return newK8sClient(clientset, tgt, resizer, mode)
+	return newK8sClient(clientset, tgt, resizer, mode, dryRun)
 }
 
 // newK8sClient builds a k8sClient from its core dependencies.
@@ -119,10 +119,12 @@ func newK8sClient(
 	target *targetMeta,
 	podResizer *podResizer,
 	mode ResizeMode,
+	dryRun bool,
 ) (*k8sClient, error) {
 	return &k8sClient{
 		clientset:  clientset,
 		target:     target,
+		dryRun:     dryRun,
 		podResizer: podResizer,
 		resizeMode: mode,
 	}, nil

@@ -245,7 +245,7 @@ func TestUpdateResources(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error making target %q: %v", tc.target, err)
 		}
-		k8scli, err := newK8sClient(client, tgt, nil, ResizeModeRecreate)
+		k8scli, err := newK8sClient(client, tgt, nil, ResizeModeRecreate, false)
 		if err != nil {
 			t.Fatalf("error creating k8sClient: %v", err)
 		}

@@ -607,6 +607,44 @@ func TestPollAPIServer(t *testing.T) {
 			},
 		},
 		{
+			name:     "dry-run in Recreate mode applies no template patch",
+			scenario: scenario{cluster: standardCluster(), mode: k8sclient.ResizeModeRecreate, config: baseConfig, dryRun: true},
+			assert: func(t *testing.T, rec *requestRecorder) {
+				if rec.templatePatched() {
+					t.Error("dry-run patched the template in Recreate mode")
+				}
+				if rec.resizePatched() || rec.deleteCount() != 0 || rec.evictionCount() != 0 {
+					t.Error("dry-run mutated pods")
+				}
+			},
+		},
+		{
+			name: "dry-run in InPlaceOrRecreate applies nothing even past the grace period",
+			scenario: scenario{
+				cluster: fakeCluster{
+					cores:  standardCores,
+					target: deployment("test-dep", ctr("main", "10m")),
+					pods: []apiv1.Pod{ownedPod("test-dep-abc-def", "test-dep-abc", ctr("main", "17m"),
+						apiv1.PodCondition{Type: apiv1.PodResizePending, Status: apiv1.ConditionTrue, Reason: apiv1.PodReasonInfeasible})},
+					hasResize: true,
+				},
+				mode:     k8sclient.ResizeModeInPlaceOrRecreate,
+				fallback: k8sclient.ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1},
+				config:   baseConfig,
+				dryRun:   true,
+				cycles:   2,
+				advance:  6 * time.Minute,
+			},
+			assert: func(t *testing.T, rec *requestRecorder) {
+				if rec.templatePatched() {
+					t.Error("dry-run triggered the fallback template patch")
+				}
+				if rec.resizePatched() || rec.deleteCount() != 0 || rec.evictionCount() != 0 {
+					t.Error("dry-run mutated pods")
+				}
+			},
+		},
+		{
 			name: "foreign pod is skipped, owned pod is resized",
 			scenario: scenario{
 				cluster: fakeCluster{
