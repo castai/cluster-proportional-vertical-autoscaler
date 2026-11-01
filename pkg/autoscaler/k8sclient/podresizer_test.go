@@ -413,10 +413,13 @@ type fakeResizeTarget struct {
 	patcher   func(resources map[string]v1.ResourceRequirements) error
 	ownsPod   func(pod *v1.Pod) bool
 	clientset clientset.Interface
+	nodeBound bool
 	// templateAlreadyCurrent makes PatchTemplate report changed == false,
 	// simulating a workload template that already matches desired.
 	templateAlreadyCurrent bool
 }
+
+func (f *fakeResizeTarget) NodeBound() bool { return f.nodeBound }
 
 func (f *fakeResizeTarget) OwnsPod(pod *v1.Pod) bool {
 	if f.ownsPod != nil {
@@ -2045,5 +2048,155 @@ func TestResizeTracker_RejectionWarnOnce(t *testing.T) {
 	tr.clear(uid)
 	if !tr.setRejection(uid, rejectNodeUnsupported) {
 		t.Error("setRejection after clear should warn")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// node-bound fallback guard
+// ---------------------------------------------------------------------------
+
+// runNodeBound runs resizeRunningPods against a node-bound fake target.
+func runNodeBound(t *testing.T, rig *resizeRig, selfHeals bool, desired map[string]v1.ResourceRequirements, mode ResizeMode, fallback ResizeFallbackConfig, patcherCalls *int) resizeResult {
+	t.Helper()
+	fake := &fakeResizeTarget{
+		selector:  rig.selector,
+		namespace: "test",
+		clientset: rig.client,
+		selfHeals: func(ctx context.Context) bool { return selfHeals },
+		patcher:   func(map[string]v1.ResourceRequirements) error { *patcherCalls++; return nil },
+		nodeBound: true,
+	}
+	r := &podResizer{
+		resizeMode:     mode,
+		fallbackConfig: fallback,
+		clock:          clock.RealClock{},
+		clientset:      rig.client,
+		tracker:        rig.tracker,
+	}
+	result, err := r.resizeRunningPods(context.Background(), fake, desired)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return result
+}
+
+// TestResizeRunningPods_NodeBoundInfeasibleNotDisrupted verifies that a stuck
+// Infeasible pod on a node-bound target (OnDelete DaemonSet) is never
+// disrupted: the replacement would ask the same node for the same resources
+// and stay Pending, leaving the node without its agent.
+func TestResizeRunningPods_NodeBoundInfeasibleNotDisrupted(t *testing.T) {
+	desired := cpuReq("200m")
+	pod := makePod("ds-node-a", v1.PodRunning, infeasibleConds(), desired) // spec already at desired: no patch
+	pod.Spec.NodeName = "node-small"
+	res := cpuReq("200m")
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name: "main", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Resources: &res,
+	}}
+
+	disruptCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/ds-node-a":
+			disruptCount++
+			w.WriteHeader(http.StatusOK)
+		case req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/eviction"):
+			disruptCount++
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
+	rig := newResizeRig(t, server)
+	rig.pastGrace("ds-node-a")
+
+	patcherCalls := 0
+	result := runNodeBound(t, rig, false, map[string]v1.ResourceRequirements{"main": desired}, ResizeModeInPlaceOrRecreate, fallback, &patcherCalls)
+	if disruptCount != 0 {
+		t.Errorf("node-bound Infeasible pod was disrupted %d time(s), want 0", disruptCount)
+	}
+	if result.FallbackSkippedNodeBound != 1 {
+		t.Errorf("FallbackSkippedNodeBound = %d, want 1", result.FallbackSkippedNodeBound)
+	}
+	if result.Evicted != 0 {
+		t.Errorf("Evicted = %d, want 0", result.Evicted)
+	}
+}
+
+// TestResizeRunningPods_NodeBoundSelfHealingNoTemplatePatch verifies that the
+// guard also covers the self-healing path: a RollingUpdate DaemonSet with a
+// stuck Infeasible pod gets no template patch — the rollout would delete the
+// pod and the replacement would stay Pending on the same node.
+func TestResizeRunningPods_NodeBoundSelfHealingNoTemplatePatch(t *testing.T) {
+	desired := cpuReq("200m")
+	pod := makePod("ds-node-a", v1.PodRunning, infeasibleConds(), desired)
+	pod.Spec.NodeName = "node-small"
+	res := cpuReq("200m")
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name: "main", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Resources: &res,
+	}}
+
+	server := newPodListServer([]v1.Pod{pod})
+	defer server.Close()
+
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1}
+	rig := newResizeRig(t, server)
+	rig.pastGrace("ds-node-a")
+
+	patcherCalls := 0
+	result := runNodeBound(t, rig, true, map[string]v1.ResourceRequirements{"main": desired}, ResizeModeInPlaceOrRecreate, fallback, &patcherCalls)
+	if patcherCalls != 0 {
+		t.Errorf("template patched %d time(s) for node-bound Infeasible pod, want 0", patcherCalls)
+	}
+	if result.FallbackSkippedNodeBound != 1 || result.Evicted != 0 {
+		t.Errorf("FallbackSkippedNodeBound=%d Evicted=%d, want 1/0", result.FallbackSkippedNodeBound, result.Evicted)
+	}
+}
+
+// TestResizeRunningPods_NodeBoundActuationErrorStillEvicted verifies the
+// exemption: an actuation error (PodResizeInProgress, reason Error) means the
+// pod's current allocation already fits the node, so recreating a node-bound
+// pod is safe and still happens.
+func TestResizeRunningPods_NodeBoundActuationErrorStillEvicted(t *testing.T) {
+	desired := cpuReq("200m")
+	errConds := []v1.PodCondition{{Type: v1.PodResizeInProgress, Status: v1.ConditionTrue, Reason: v1.PodReasonError}}
+	pod := makePod("ds-node-a", v1.PodRunning, errConds, desired)
+	pod.Spec.NodeName = "node-ok"
+	res := cpuReq("200m")
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name: "main", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Resources: &res,
+	}}
+
+	deleted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "DELETE" && req.URL.Path == "/api/v1/namespaces/test/pods/ds-node-a":
+			deleted = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
+	rig := newResizeRig(t, server)
+	rig.pastGrace("ds-node-a")
+
+	patcherCalls := 0
+	result := runNodeBound(t, rig, false, map[string]v1.ResourceRequirements{"main": desired}, ResizeModeInPlaceOrRecreate, fallback, &patcherCalls)
+	if !deleted {
+		t.Error("actuation-error pod should still be recreated on a node-bound target")
+	}
+	if result.Evicted != 1 || result.FallbackSkippedNodeBound != 0 {
+		t.Errorf("Evicted=%d FallbackSkippedNodeBound=%d, want 1/0", result.Evicted, result.FallbackSkippedNodeBound)
 	}
 }

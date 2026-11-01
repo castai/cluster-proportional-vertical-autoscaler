@@ -152,6 +152,72 @@ type containerPatch struct {
 	Resources apiv1.ResourceRequirements `json:"resources"`
 }
 
+// applyTemplatePatch merges a template patch body into the workload object so
+// later GETs observe it, like the real API server would.
+func applyTemplatePatch(target runtime.Object, body []byte) {
+	var p struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []containerPatch `json:"containers"`
+				} `json:"spec"`
+			} `json:"template"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(body, &p); err != nil {
+		return
+	}
+	setContainers := func(ctrs []apiv1.Container) {
+		switch o := target.(type) {
+		case *appsv1.Deployment:
+			o.Spec.Template.Spec.Containers = ctrs
+		case *appsv1.DaemonSet:
+			o.Spec.Template.Spec.Containers = ctrs
+		case *appsv1.StatefulSet:
+			o.Spec.Template.Spec.Containers = ctrs
+		case *appsv1.ReplicaSet:
+			o.Spec.Template.Spec.Containers = ctrs
+		}
+	}
+	var ctrs []apiv1.Container
+	switch o := target.(type) {
+	case *appsv1.Deployment:
+		ctrs = o.Spec.Template.Spec.Containers
+	case *appsv1.DaemonSet:
+		ctrs = o.Spec.Template.Spec.Containers
+	case *appsv1.StatefulSet:
+		ctrs = o.Spec.Template.Spec.Containers
+	case *appsv1.ReplicaSet:
+		ctrs = o.Spec.Template.Spec.Containers
+	default:
+		return
+	}
+	for _, pc := range p.Spec.Template.Spec.Containers {
+		for i := range ctrs {
+			if ctrs[i].Name != pc.Name {
+				continue
+			}
+			if len(pc.Resources.Requests) > 0 {
+				if ctrs[i].Resources.Requests == nil {
+					ctrs[i].Resources.Requests = apiv1.ResourceList{}
+				}
+				for k, v := range pc.Resources.Requests {
+					ctrs[i].Resources.Requests[k] = v
+				}
+			}
+			if len(pc.Resources.Limits) > 0 {
+				if ctrs[i].Resources.Limits == nil {
+					ctrs[i].Resources.Limits = apiv1.ResourceList{}
+				}
+				for k, v := range pc.Resources.Limits {
+					ctrs[i].Resources.Limits[k] = v
+				}
+			}
+		}
+	}
+	setContainers(ctrs)
+}
+
 // templatePatchContainers extracts spec.template.spec.containers from a workload
 // template patch body.
 func templatePatchContainers(t *testing.T, body []byte) []containerPatch {
@@ -405,6 +471,7 @@ func (fc fakeCluster) handler(t *testing.T, rec *requestRecorder) http.HandlerFu
 			case http.MethodPatch:
 				body, _ := io.ReadAll(req.Body)
 				rec.recordTemplatePatch(req.URL.Path, body)
+				applyTemplatePatch(fc.target, body)
 				writeJSON(w, http.StatusOK, fc.target)
 			default:
 				w.WriteHeader(http.StatusMethodNotAllowed)
@@ -710,9 +777,16 @@ func TestPollAPIServer(t *testing.T) {
 			assert:   assertResizedNoTemplate,
 		},
 		{
-			name:     "in-place resizes a ReplicaSet pod",
+			name:     "in-place resizes a ReplicaSet pod and patches its template (non-self-healing)",
 			scenario: scenario{cluster: kindCluster(rsTarget, "test-rs-pod"), mode: k8sclient.ResizeModeInPlace, config: baseConfig},
-			assert:   assertResizedNoTemplate,
+			assert: func(t *testing.T, rec *requestRecorder) {
+				if !rec.resizePatched() {
+					t.Fatal("pod was not resized via /resize")
+				}
+				if !rec.templatePatched() {
+					t.Error("non-self-healing target template should be patched so new pods start at the right size")
+				}
+			},
 		},
 	}
 
@@ -777,7 +851,7 @@ func TestPollAPIServer_Fallback(t *testing.T) {
 			},
 		},
 		{
-			name: "non-self-healing target (OnDelete DaemonSet): stuck pod is evicted",
+			name: "node-bound target (OnDelete DaemonSet): Infeasible pod is left alone",
 			scenario: scenario{
 				cluster: fakeCluster{
 					cores:     standardCores,
@@ -792,14 +866,14 @@ func TestPollAPIServer_Fallback(t *testing.T) {
 				advance:  grace + time.Minute,
 			},
 			assert: func(t *testing.T, rec *requestRecorder) {
-				if rec.evictionCount() != 1 {
-					t.Errorf("eviction count = %d, want 1", rec.evictionCount())
+				// DaemonSet pods are recreated on the same node, so disrupting a
+				// pod the kubelet says cannot fit would only replace a working
+				// agent with a Pending twin.
+				if rec.evictionCount() != 0 {
+					t.Errorf("eviction count = %d, want 0", rec.evictionCount())
 				}
 				if rec.deleteCount() != 0 {
-					t.Errorf("delete count = %d, want 0 (eviction configured)", rec.deleteCount())
-				}
-				if !rec.templatePatched() {
-					t.Error("template should be patched so the recreated pod gets the new size")
+					t.Errorf("delete count = %d, want 0", rec.deleteCount())
 				}
 			},
 		},
@@ -916,5 +990,102 @@ func TestPollAPIServer_RequestAboveLimit(t *testing.T) {
 	}
 	if rec.deleteCount() != 0 || rec.evictionCount() != 0 {
 		t.Error("pods must not be recreated when the resize itself is impossible")
+	}
+}
+
+// TestPollAPIServer_Fallback_PausedDeploymentEvicts verifies that a paused
+// Deployment accepts template patches but never rolls, so it must be treated
+// as non-self-healing — the fallback disrupts the stuck pod directly instead
+// of waiting for a rollout that will not happen.
+func TestPollAPIServer_Fallback_PausedDeploymentEvicts(t *testing.T) {
+	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+	const grace = 5 * time.Minute
+
+	dep := deployment("test-dep", ctr("main", "10m"))
+	dep.Spec.Paused = true
+	stuck := apiv1.PodCondition{Type: apiv1.PodResizePending, Status: apiv1.ConditionTrue, Reason: apiv1.PodReasonInfeasible}
+
+	cluster := fakeCluster{
+		cores:     []int{2, 2, 2, 1},
+		target:    dep,
+		pods:      []apiv1.Pod{ownedPod("test-dep-abc-def", "test-dep-abc", ctr("main", "17m"), stuck)},
+		hasResize: true,
+	}
+	rec, err := runPoll(t, scenario{
+		cluster:  cluster,
+		mode:     k8sclient.ResizeModeInPlaceOrRecreate,
+		fallback: k8sclient.ResizeFallbackConfig{GracePeriod: grace, MaxPodsPerCycle: 1, DisruptionMethod: k8sclient.FallbackDisruptionEviction},
+		config:   baseConfig,
+		cycles:   2,
+		advance:  grace + time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("pollAPIServer: %v", err)
+	}
+	if rec.evictionCount() != 1 {
+		t.Errorf("eviction count = %d, want 1 (paused Deployment must take the direct-disruption path)", rec.evictionCount())
+	}
+	if rec.deleteCount() != 0 {
+		t.Errorf("delete count = %d, want 0 (eviction configured)", rec.deleteCount())
+	}
+}
+
+// TestPollAPIServer_Fallback_PartitionedStatefulSetEvicts verifies that a
+// RollingUpdate StatefulSet with partition > 0 only rolls pods at or above the
+// partition, so pods below it must take the direct-disruption path.
+func TestPollAPIServer_Fallback_PartitionedStatefulSetEvicts(t *testing.T) {
+	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+	const grace = 5 * time.Minute
+
+	partition := int32(2)
+	ss := statefulset("test-ss", appsv1.RollingUpdateStatefulSetStrategyType, ctr("main", "10m"))
+	ss.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{Partition: &partition}
+	stuck := apiv1.PodCondition{Type: apiv1.PodResizePending, Status: apiv1.ConditionTrue, Reason: apiv1.PodReasonInfeasible}
+
+	cluster := fakeCluster{
+		cores:     []int{2, 2, 2, 1},
+		target:    ss,
+		pods:      []apiv1.Pod{directlyOwnedPod(t, "test-ss-pod", ss, ctr("main", "17m"), stuck)},
+		hasResize: true,
+	}
+	rec, err := runPoll(t, scenario{
+		cluster:  cluster,
+		mode:     k8sclient.ResizeModeInPlaceOrRecreate,
+		fallback: k8sclient.ResizeFallbackConfig{GracePeriod: grace, MaxPodsPerCycle: 1, DisruptionMethod: k8sclient.FallbackDisruptionEviction},
+		config:   baseConfig,
+		cycles:   2,
+		advance:  grace + time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("pollAPIServer: %v", err)
+	}
+	if rec.evictionCount() != 1 {
+		t.Errorf("eviction count = %d, want 1 (partitioned StatefulSet must take the direct-disruption path)", rec.evictionCount())
+	}
+}
+
+// TestPollAPIServer_InPlacePatchesTemplateForNonSelfHealing verifies that an
+// OnDelete DaemonSet never rolls its pods, so in InPlace mode cpvpa patches
+// the template (once — later cycles are no-ops) to make every pod created
+// after the patch start at the right size.
+func TestPollAPIServer_InPlacePatchesTemplateForNonSelfHealing(t *testing.T) {
+	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+
+	dsTarget := daemonset("test-ds", appsv1.OnDeleteDaemonSetStrategyType, ctr("main", "10m"))
+	cluster := fakeCluster{
+		cores:     []int{2, 2, 2, 1},
+		target:    dsTarget,
+		pods:      []apiv1.Pod{directlyOwnedPod(t, "test-ds-pod", dsTarget, ctr("main", "10m"))},
+		hasResize: true,
+	}
+	rec, err := runPoll(t, scenario{cluster: cluster, mode: k8sclient.ResizeModeInPlace, config: baseConfig, cycles: 2})
+	if err != nil {
+		t.Fatalf("pollAPIServer: %v", err)
+	}
+	if got := len(rec.templatePatches); got != 1 {
+		t.Errorf("template patch count = %d, want 1 (patched once, then a no-op)", got)
+	}
+	if !rec.resizePatched() {
+		t.Error("live pod should still be resized via /resize")
 	}
 }
