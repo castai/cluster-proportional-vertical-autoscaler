@@ -2516,3 +2516,59 @@ func TestResizeRunningPods_InPlaceNeverDisrupts(t *testing.T) {
 		})
 	}
 }
+
+// TestResizeRunningPods_RepatchGraceClockOnStuckPod covers F18: re-patching a
+// pod the kubelet already reported as not fitting keeps the fallback clock
+// when no value went down (the resize got no easier), so a flapping target
+// cannot postpone the fallback forever; any decrease restarts the clock.
+// The no-signal case (pod not Deferred/Infeasible) is
+// TestResizeRunningPods_RepatchResetsGraceClock.
+func TestResizeRunningPods_RepatchGraceClockOnStuckPod(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		conds         []v1.PodCondition
+		next          v1.ResourceRequirements
+		wantKept      bool
+		wantDisrupted int
+	}{
+		{"infeasible, target rises", infeasibleConds(), cpuReq("300m"), true, 1},
+		{"deferred, target rises", deferredConds(), cpuReq("300m"), true, 1},
+		{"infeasible, target falls", infeasibleConds(), cpuReq("100m"), false, 0},
+		{"infeasible, cpu rises but limit falls", infeasibleConds(), v1.ResourceRequirements{
+			Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("300m")},
+			Limits:   v1.ResourceList{v1.ResourceCPU: resource.MustParse("400m")},
+		}, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cur := cpuReq("200m")
+			cur.Limits = v1.ResourceList{v1.ResourceCPU: resource.MustParse("1")}
+			pod := makePod("pod-a", v1.PodRunning, tc.conds, cur)
+			pod.Spec.NodeName = "node-1"
+			old := cpuReq("100m")
+			pod.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &old)}
+			var patches, disruptions int
+			server := recordingPodServer(&pod, &patches, &disruptions)
+			defer server.Close()
+
+			rig := newResizeRig(t, server)
+			rig.pastGrace("pod-a")
+			seeded := rig.tracker.notResizedSince[types.UID("pod-a")]
+			fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
+
+			rig.run(map[string]v1.ResourceRequirements{"main": tc.next}, ResizeModeInPlaceOrRecreate, fallback, false)
+			if patches != 1 {
+				t.Fatalf("/resize patches = %d, want 1", patches)
+			}
+			if disruptions != tc.wantDisrupted {
+				t.Errorf("disruptions = %d, want %d", disruptions, tc.wantDisrupted)
+			}
+			if tc.wantKept {
+				return // the pod was recreated, which clears its tracker entry
+			}
+			got, tracked := rig.tracker.notResizedSince[types.UID("pod-a")]
+			if !tracked || !got.After(seeded) {
+				t.Errorf("grace clock = (%v, tracked=%v), want restarted after %v", got, tracked, seeded)
+			}
+		})
+	}
+}

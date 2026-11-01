@@ -17,6 +17,7 @@ package k8sclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -30,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilversion "k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/clock"
 )
@@ -303,9 +305,17 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 			continue
 		} else {
 			result.Applied++
-			// A successful patch is a fresh resize attempt, so reset the
-			// fallback clock.
-			r.tracker.clear(updated.UID)
+			// A successful patch is a fresh resize attempt, so normally the
+			// fallback clock restarts. Not when the pod was already reported
+			// as not fitting (Deferred/Infeasible) and no value went down:
+			// the new size is no easier to fit, and resetting would let a
+			// node count flapping across a step boundary postpone the
+			// fallback forever.
+			if s := classifyResize(pod); (s == resizeStatusDeferred || s == resizeStatusInfeasible) && noneDecreased(pod, desired) {
+				r.tracker.keepClock(updated.UID)
+			} else {
+				r.tracker.clear(updated.UID)
+			}
 		}
 
 		if status := classifyResize(updated); status == resizeStatusOK {
@@ -438,6 +448,30 @@ func hasRunningContainer(pod *v1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// noneDecreased reports whether, for every container and resource cpvpa
+// manages, the desired request and limit are at least the pod's current
+// spec value (a value the pod does not set yet counts as an increase).
+func noneDecreased(pod *v1.Pod, desired map[string]v1.ResourceRequirements) bool {
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
+		want, managed := desired[c.Name]
+		if !managed {
+			continue
+		}
+		for _, pair := range []struct{ have, want v1.ResourceList }{
+			{c.Resources.Requests, want.Requests},
+			{c.Resources.Limits, want.Limits},
+		} {
+			for name, w := range pair.want {
+				if h, ok := pair.have[name]; ok && w.Cmp(h) < 0 {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 // hasStartedBefore reports whether any container of the pod has run before
@@ -838,6 +872,16 @@ type rejectionEntry struct {
 	desiredKey string
 }
 
+// keepClock handles a successful re-patch that leaves the resize no easier:
+// the fallback clock (notResizedSince) is kept, the rest of the pod's state
+// (rejection, eviction-blocked timer) is reset as for a fresh attempt.
+func (t *resizeTracker) keepClock(uid types.UID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.evictionBlockedSince, uid)
+	delete(t.rejections, uid)
+}
+
 // setRejection records a pod's rejection for the given desired values. It
 // returns true when the pod had no rejection or a different reason, so the
 // caller warns once per (pod, reason) instead of on every poll.
@@ -1074,9 +1118,20 @@ func actuationState(pod *v1.Pod, desired map[string]v1.ResourceRequirements) act
 	return actuationConfirmed
 }
 
+// ErrResizeUnsupported is returned (wrapped) by EnsureResizeSubresource when
+// discovery answered and the cluster definitively cannot do in-place resize
+// (server older than 1.33, or no pods/resize subresource). Any other error
+// is a failed discovery call, which says nothing about the cluster.
+var ErrResizeUnsupported = errors.New("in-place pod resize unsupported")
+
+// resizeDiscoveryBackoff paces startup retries of a failing discovery call:
+// 1s, 2s, 4s, 8s between 5 attempts (~15s) before giving up.
+var resizeDiscoveryBackoff = wait.Backoff{Duration: time.Second, Factor: 2, Steps: 5}
+
 // EnsureResizeSubresource checks that the cluster supports the pods/resize
 // subresource in its 1.33+ (beta) shape. Call at startup when resize mode is
-// not Recreate to fail fast with a clear message.
+// not Recreate to fail fast with a clear message. A definitive "no" wraps
+// ErrResizeUnsupported; other errors are discovery failures.
 //
 // Note: discovery (the API server advertising the subresource) cannot confirm
 // the InPlacePodVerticalScaling feature gate is enabled on every kubelet;
@@ -1094,9 +1149,9 @@ func EnsureResizeSubresource(client kubernetes.Interface) error {
 		return fmt.Errorf("failed to parse server version %q: %w", serverVersion.GitVersion, err)
 	}
 	if ver.Major() < 1 || (ver.Major() == 1 && ver.Minor() < 33) {
-		return fmt.Errorf("in-place pod resize requires Kubernetes 1.33+ (server is %s); "+
+		return fmt.Errorf("%w: requires Kubernetes 1.33+ (server is %s); "+
 			"the 1.32 alpha resize API lacks the PodResizePending/InProgress conditions this controller relies on",
-			serverVersion.GitVersion)
+			ErrResizeUnsupported, serverVersion.GitVersion)
 	}
 	resources, err := client.Discovery().ServerResourcesForGroupVersion("v1")
 	if err != nil {
@@ -1107,7 +1162,52 @@ func EnsureResizeSubresource(client kubernetes.Interface) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("cluster does not support pods/resize subresource; "+
+	return fmt.Errorf("%w: cluster does not serve the pods/resize subresource; "+
 		"in-place pod resize requires Kubernetes 1.33+ with InPlacePodVerticalScaling enabled (server is %s)",
-		serverVersion.GitVersion)
+		ErrResizeUnsupported, serverVersion.GitVersion)
+}
+
+// ensureResizeWithRetry runs EnsureResizeSubresource, retrying discovery
+// failures with backoff. A definitive ErrResizeUnsupported answer is
+// returned immediately.
+func ensureResizeWithRetry(client kubernetes.Interface, backoff wait.Backoff) error {
+	var lastErr error
+	err := wait.ExponentialBackoff(backoff, func() (bool, error) {
+		lastErr = EnsureResizeSubresource(client)
+		if lastErr == nil {
+			return true, nil
+		}
+		if errors.Is(lastErr, ErrResizeUnsupported) {
+			return false, lastErr
+		}
+		glog.Warningf("in-place resize support check failed, retrying: %v", lastErr)
+		return false, nil
+	})
+	if wait.Interrupted(err) {
+		return fmt.Errorf("in-place resize support check kept failing: %w", lastErr)
+	}
+	return err
+}
+
+// resolveResizeMode decides the effective resize mode at startup. InPlace
+// requires in-place support and fails otherwise. InPlaceOrRecreate degrades
+// to Recreate only when the cluster definitively lacks support; a discovery
+// call that keeps failing is returned as an error (the process exits and
+// restarts) rather than locking the run into Recreate on a transient blip.
+func resolveResizeMode(client kubernetes.Interface, mode ResizeMode, backoff wait.Backoff) (ResizeMode, error) {
+	if mode == ResizeModeRecreate {
+		return mode, nil
+	}
+	err := ensureResizeWithRetry(client, backoff)
+	switch {
+	case err == nil:
+		return mode, nil
+	case mode == ResizeModeInPlaceOrRecreate && errors.Is(err, ErrResizeUnsupported):
+		glog.Warningf("pods/resize unavailable (%v); %s degrading to %s", err, mode, ResizeModeRecreate)
+		return ResizeModeRecreate, nil
+	case mode == ResizeModeInPlace:
+		return mode, fmt.Errorf("in-place resize requires the pods/resize subresource: %w", err)
+	default:
+		return mode, err
+	}
 }
