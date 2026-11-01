@@ -402,8 +402,18 @@ type targetClient struct {
 // Recreate mode, which must keep working on older clusters whose target lives
 // in an older API group.
 func (t *targetClient) PatchTemplate(ctx context.Context, resources map[string]v1.ResourceRequirements) (changed bool, err error) {
-	if t.cachedSpec != nil && templateMatches(t.cachedSpec.TemplateResources, resources) {
-		return false, nil // already at desired; patching would be a no-op
+	if t.cachedSpec != nil {
+		if templateMatches(t.cachedSpec.TemplateResources, resources) {
+			return false, nil // already at desired; patching would be a no-op
+		}
+		if reason := requestAboveTemplateLimit(t.cachedSpec.TemplateResources, resources); reason != "" {
+			// Replicate the API server's request<=limit validation locally:
+			// a template that would ship requests above limits is Invalid and
+			// would 422 every poll. Only possible when the template has
+			// been fetched (in-place fallback path); Recreate mode has no
+			// cached spec and keeps the legacy behavior.
+			return false, fmt.Errorf("invalid resources: %s", reason)
+		}
 	}
 	if t.dryRun {
 		glog.Infof("dry-run: would patch %s/%s template resources", t.meta.Kind, t.meta.Name)
@@ -529,7 +539,6 @@ func (t *targetClient) trySyncSpec(ctx context.Context) (*targetSpec, error) {
 	if t.cachedSpec != nil {
 		return t.cachedSpec, nil
 	}
-
 	spec, err := t.fetchSpec(ctx)
 	if err != nil {
 		return nil, err
@@ -537,6 +546,22 @@ func (t *targetClient) trySyncSpec(ctx context.Context) (*targetSpec, error) {
 
 	t.cachedSpec = spec
 	return spec, nil
+}
+
+// requestAboveTemplateLimit returns a non-empty reason when `desired`
+// requests would exceed the limits the merged pod template ends up with
+// (desired limits win over template limits; resources with no limit impose
+// nothing). Used to reject template patches the API server would 422.
+func requestAboveTemplateLimit(template, desired map[string]v1.ResourceRequirements) string {
+	for name, want := range desired {
+		lims := mergeResourceList(template[name].Limits, want.Limits)
+		for res, r := range want.Requests {
+			if l, ok := lims[res]; ok && r.Cmp(l) > 0 {
+				return fmt.Sprintf("container %q request %s=%s exceeds its limit %s", name, res, r.String(), l.String())
+			}
+		}
+	}
+	return ""
 }
 
 func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
@@ -648,7 +673,11 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 	}
 
 	result, err := k.podResizer.resizeRunningPods(ctx, target, resources)
-	glog.V(1).Infof("resize cycle: %+v", result)
+	if result.Rejected > 0 {
+		glog.Warningf("resize cycle: %+v", result)
+	} else {
+		glog.V(1).Infof("resize cycle: %+v", result)
+	}
 	if err != nil {
 		return fmt.Errorf("in-place resize: %w", err)
 	}

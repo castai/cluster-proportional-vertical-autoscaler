@@ -1725,3 +1725,325 @@ func TestResizeRunningPods_DeleteModeRegression(t *testing.T) {
 		t.Error("pod was NOT deleted in delete mode")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// permanent rejections: local prechecks, suppression across cycles,
+// Invalid-response cause mapping, and the waiting-to-start skip.
+// ---------------------------------------------------------------------------
+
+func withStatus(pod v1.Pod, css []v1.ContainerStatus) v1.Pod {
+	pod.Status.ContainerStatuses = css
+	return pod
+}
+
+// TestPrecheckResize pins the local replication of the API server's permanent
+// /resize rejections (ValidatePodResize).
+func TestPrecheckResize(t *testing.T) {
+	scaleUp := cpuReq("200m")
+	burstable := cpuReq("100m")
+	guaranteed := v1.ResourceRequirements{
+		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m"), v1.ResourceMemory: resource.MustParse("100Mi")},
+		Limits:   v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m"), v1.ResourceMemory: resource.MustParse("100Mi")},
+	}
+	guaranteed200 := v1.ResourceRequirements{
+		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("200m"), v1.ResourceMemory: resource.MustParse("200Mi")},
+		Limits:   v1.ResourceList{v1.ResourceCPU: resource.MustParse("200m"), v1.ResourceMemory: resource.MustParse("200Mi")},
+	}
+	capped := v1.ResourceRequirements{
+		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
+		Limits:   v1.ResourceList{v1.ResourceCPU: resource.MustParse("150m")},
+	}
+
+	running := []v1.ContainerStatus{{
+		Name: "main", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Resources: &burstable,
+	}}
+	runningNoResources := []v1.ContainerStatus{{
+		Name: "main", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+	}}
+
+	cappedPod := makePod("capped", v1.PodRunning, nil, capped)
+	cappedPod.Spec.NodeName = "node-1"
+	guaranteedPod := makePod("g", v1.PodRunning, nil, guaranteed)
+	guaranteedPod.Spec.NodeName = "node-1"
+	podLevel := makePod("pl", v1.PodRunning, nil, burstable)
+	podLevel.Spec.Resources = &v1.ResourceRequirements{}
+	staticPod := makePod("static", v1.PodRunning, nil, burstable)
+	staticPod.Annotations = map[string]string{v1.MirrorPodAnnotationKey: "mirror-uid"}
+	windowsPod := makePod("win", v1.PodRunning, nil, burstable)
+	windowsPod.Spec.OS = &v1.PodOS{Name: v1.Windows}
+
+	cases := []struct {
+		name    string
+		pod     v1.Pod
+		desired map[string]v1.ResourceRequirements
+		want    resizeRejection
+		wantRej bool
+	}{
+		{
+			name:    "supported node, safe resize",
+			pod:     withStatus(guaranteedPod, running),
+			desired: map[string]v1.ResourceRequirements{"main": guaranteed},
+		},
+		{
+			name:    "running container without status resources (kubelet without the gate)",
+			pod:     withStatus(guaranteedPod, runningNoResources),
+			desired: map[string]v1.ResourceRequirements{"main": guaranteed},
+			want:    rejectNodeUnsupported,
+			wantRej: true,
+		},
+		{
+			name:    "qos class change (guaranteed pod, request-only scale-down)",
+			pod:     withStatus(guaranteedPod, running),
+			desired: map[string]v1.ResourceRequirements{"main": cpuReq("50m")},
+			want:    rejectQoSChange,
+			wantRej: true,
+		},
+		{
+			name:    "guaranteed pod scaled up with proportional limits",
+			pod:     withStatus(guaranteedPod, running),
+			desired: map[string]v1.ResourceRequirements{"main": guaranteed200},
+		},
+		{
+			name:    "request above limit",
+			pod:     withStatus(cappedPod, running),
+			desired: map[string]v1.ResourceRequirements{"main": scaleUp},
+			want:    rejectAboveLimit,
+			wantRej: true,
+		},
+		{
+			name:    "request above limit only after merging desired limits",
+			pod:     withStatus(cappedPod, running),
+			desired: map[string]v1.ResourceRequirements{"main": {Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("200m")}}},
+			want:    rejectAboveLimit,
+			wantRej: true,
+		},
+		{
+			name:    "pod-level resources",
+			pod:     withStatus(podLevel, running),
+			desired: map[string]v1.ResourceRequirements{"main": scaleUp},
+			want:    rejectPodLevel,
+			wantRej: true,
+		},
+		{
+			name:    "static (mirror) pod",
+			pod:     withStatus(staticPod, running),
+			desired: map[string]v1.ResourceRequirements{"main": scaleUp},
+			want:    rejectStaticPod,
+			wantRej: true,
+		},
+		{
+			name:    "windows pod",
+			pod:     withStatus(windowsPod, running),
+			desired: map[string]v1.ResourceRequirements{"main": scaleUp},
+			want:    rejectWindows,
+			wantRej: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, rejected := precheckResize(&tc.pod, tc.desired)
+			if rejected != tc.wantRej || got != tc.want {
+				t.Errorf("precheckResize = (%q, %v), want (%q, %v)", got, rejected, tc.want, tc.wantRej)
+			}
+		})
+	}
+}
+
+// TestResizeRunningPods_UnsupportedNodeSuppressed verifies that a pod on a
+// node whose kubelet lacks InPlacePodVerticalScaling (running container with
+// nil status.resources) is never PATCHed — not on the first poll and not on
+// any later one — while still being counted and fed to the fallback clock.
+func TestResizeRunningPods_UnsupportedNodeSuppressed(t *testing.T) {
+	scaleUp := cpuReq("200m")
+	pod := makePod("pod-a", v1.PodRunning, nil, cpuReq("100m"))
+	pod.Spec.NodeName = "node-1"
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name: "main", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+	}}
+
+	patchCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
+			patchCount++
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podResponse(&pod))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	rig := newResizeRig(t, server)
+	for cycle := 1; cycle <= 3; cycle++ {
+		result := rig.run(map[string]v1.ResourceRequirements{"main": scaleUp}, ResizeModeInPlace, stdFallback, false)
+		if patchCount != 0 {
+			t.Fatalf("cycle %d: unsupported pod was PATCHed %d time(s), want 0", cycle, patchCount)
+		}
+		if result.Rejected != 1 || result.Unsupported != 1 {
+			t.Errorf("cycle %d: Rejected=%d Unsupported=%d, want 1/1", cycle, result.Rejected, result.Unsupported)
+		}
+		if result.Infeasible != 1 {
+			t.Errorf("cycle %d: Infeasible=%d, want 1 (rejection feeds the fallback clock)", cycle, result.Infeasible)
+		}
+		if reason, ok := rig.tracker.rejection(types.UID("pod-a")); !ok || reason != rejectNodeUnsupported {
+			t.Errorf("cycle %d: tracker rejection = (%q, %v), want (%q, true)", cycle, reason, ok, rejectNodeUnsupported)
+		}
+	}
+}
+
+// TestResizeRunningPods_ActuationUnknownRejected merges the old actuation-unknown
+// warning into the rejection machinery. A single managed running container with
+// nil status.resources is caught by precheckResize (node-unsupported); the
+// actuation-unknown branch itself fires when a LATER managed running container
+// has no status resources while an earlier one does.
+func TestResizeRunningPods_ActuationUnknownRejected(t *testing.T) {
+	res := cpuReq("100m")
+	pod := makePod("pod-a", v1.PodRunning, nil, res) // spec already at desired: no patch
+	pod.Spec.Containers = append(pod.Spec.Containers, v1.Container{Name: "worker", Resources: res})
+	pod.Spec.NodeName = "node-1"
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{
+		{Name: "main", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Resources: &res},
+		{Name: "worker", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}},
+	}
+
+	server := newPodListServer([]v1.Pod{pod})
+	defer server.Close()
+
+	rig := newResizeRig(t, server)
+	result := rig.run(map[string]v1.ResourceRequirements{"main": res, "worker": res}, ResizeModeInPlace, stdFallback, false)
+	if result.ActuationUnknown != 1 {
+		t.Errorf("ActuationUnknown = %d, want 1", result.ActuationUnknown)
+	}
+	if result.Rejected != 1 || result.Unsupported != 1 {
+		t.Errorf("Rejected=%d Unsupported=%d, want 1/1", result.Rejected, result.Unsupported)
+	}
+	if result.AlreadyOK != 0 {
+		t.Errorf("AlreadyOK = %d, want 0 (kubelet never confirmed actuation)", result.AlreadyOK)
+	}
+	if _, ok := rig.tracker.rejection(types.UID("pod-a")); !ok {
+		t.Error("tracker should record the node-unsupported rejection")
+	}
+}
+
+// TestResizeRunningPods_ScheduledWaitingToStartSkipped verifies the pending-pod
+// fix keeps unscheduled pods patchable (the scheduler uses the new values)
+// while a scheduled pod with nothing running is skipped until it starts.
+func TestResizeRunningPods_ScheduledWaitingToStartSkipped(t *testing.T) {
+	scaleUp := cpuReq("200m")
+	scheduled := makePod("scheduled", v1.PodRunning, nil, cpuReq("100m"))
+	scheduled.Spec.NodeName = "node-1"
+	scheduled.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name: "main", State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}},
+	}}
+	unscheduled := makePod("unscheduled", v1.PodPending, nil, cpuReq("100m")) // no NodeName, no statuses
+
+	patchCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{scheduled, unscheduled}))
+		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
+			patchCount++
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podResponse(&unscheduled))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	rig := newResizeRig(t, server)
+	result := rig.run(map[string]v1.ResourceRequirements{"main": scaleUp}, ResizeModeInPlace, stdFallback, false)
+	if patchCount != 1 {
+		t.Errorf("PATCH count = %d, want 1 (unscheduled pod only)", patchCount)
+	}
+	if result.WaitingToStart != 1 {
+		t.Errorf("WaitingToStart = %d, want 1", result.WaitingToStart)
+	}
+	if result.Applied != 1 {
+		t.Errorf("Applied = %d, want 1", result.Applied)
+	}
+}
+
+// TestResizeRunningPods_Invalid422CauseMapped verifies that a real API-server
+// 422 whose message names a known permanent cause is recorded as a rejection,
+// so later cycles stop PATCHing that pod.
+func TestResizeRunningPods_Invalid422CauseMapped(t *testing.T) {
+	scaleUp := cpuReq("200m")
+	pod := makePod("pod-a", v1.PodRunning, nil, cpuReq("100m"))
+	pod.Spec.NodeName = "node-1"
+	stRes := cpuReq("100m")
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name: "main", State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Resources: &stRes,
+	}}
+
+	status := metav1.Status{
+		TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"},
+		Status:   "Failure",
+		Message:  "Pod Resize pod-a: Pod running on node without support for resize",
+		Reason:   metav1.StatusReasonInvalid,
+		Code:     http.StatusUnprocessableEntity,
+		Details: &metav1.StatusDetails{Causes: []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: "Unsupported node: no support for resize",
+			Field:   "spec.containers[0].resources",
+		}}},
+	}
+	statusBody, _ := json.Marshal(&status)
+
+	patchCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{pod}))
+		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
+			patchCount++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			w.Write(statusBody)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	rig := newResizeRig(t, server)
+	for cycle := 1; cycle <= 2; cycle++ {
+		result := rig.run(map[string]v1.ResourceRequirements{"main": scaleUp}, ResizeModeInPlace, stdFallback, false)
+		if result.Rejected != 1 || result.Unsupported != 1 {
+			t.Errorf("cycle %d: Rejected=%d Unsupported=%d, want 1/1", cycle, result.Rejected, result.Unsupported)
+		}
+	}
+	if patchCount != 1 {
+		t.Errorf("PATCH count = %d, want 1 (the 422 cause must suppress later attempts)", patchCount)
+	}
+	if reason, ok := rig.tracker.rejection(types.UID("pod-a")); !ok || reason != rejectNodeUnsupported {
+		t.Errorf("tracker rejection = (%q, %v), want (%q, true)", reason, ok, rejectNodeUnsupported)
+	}
+}
+
+// TestResizeTracker_RejectionWarnOnce pins the once-per-(pod, reason) warning
+// semantics of setRejection.
+func TestResizeTracker_RejectionWarnOnce(t *testing.T) {
+	tr := newResizeTracker()
+	uid := types.UID("pod-a")
+	if !tr.setRejection(uid, rejectNodeUnsupported) {
+		t.Error("first setRejection should report warn=true")
+	}
+	if tr.setRejection(uid, rejectNodeUnsupported) {
+		t.Error("repeat setRejection with the same reason should not warn")
+	}
+	if !tr.setRejection(uid, rejectQoSChange) {
+		t.Error("setRejection with a changed reason should warn")
+	}
+	tr.clear(uid)
+	if !tr.setRejection(uid, rejectNodeUnsupported) {
+		t.Error("setRejection after clear should warn")
+	}
+}

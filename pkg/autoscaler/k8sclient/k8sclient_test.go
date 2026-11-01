@@ -98,7 +98,6 @@ func TestRBACInplaceCoversAllTargetKinds(t *testing.T) {
 	}
 }
 
-
 func TestDiscoverAPI(t *testing.T) {
 	testCases := []struct {
 		kind     string

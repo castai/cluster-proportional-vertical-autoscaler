@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilversion "k8s.io/apimachinery/pkg/version"
 
 	"github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/autoscaler/k8sclient"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -185,10 +186,11 @@ func cpuRequest(ctrs []containerPatch, name string) string {
 // ---------------------------------------------------------------------------
 
 type fakeCluster struct {
-	cores     []int          // CPU capacity (cores) per node
-	target    runtime.Object // workload object served on GET and patched on PATCH
-	pods      []apiv1.Pod    // pods returned by the pod LIST
-	hasResize bool           // whether discovery advertises the pods/resize subresource
+	cores         []int          // CPU capacity (cores) per node
+	target        runtime.Object // workload object served on GET and patched on PATCH
+	pods          []apiv1.Pod    // pods returned by the pod LIST
+	hasResize     bool           // whether discovery advertises the pods/resize subresource
+	serverVersion string         // GitVersion reported by /version (defaults to v1.34.0)
 }
 
 func ctr(name, cpu string) apiv1.Container {
@@ -340,6 +342,14 @@ func (fc fakeCluster) handler(t *testing.T, rec *requestRecorder) http.HandlerFu
 		t.Logf("mock %s %s", req.Method, req.URL.Path)
 
 		// --- discovery ---
+		if req.URL.Path == "/version" {
+			v := fc.serverVersion
+			if v == "" {
+				v = "v1.34.0" // default: in-place resize supported
+			}
+			writeJSON(w, http.StatusOK, &utilversion.Info{GitVersion: v})
+			return
+		}
 		switch req.URL.Path {
 		case "/api":
 			writeJSON(w, http.StatusOK, &metav1.APIVersions{Versions: []string{"v1"}})
@@ -827,5 +837,84 @@ func TestPollAPIServer_Fallback(t *testing.T) {
 			}
 			tc.assert(t, rec)
 		})
+	}
+}
+
+// TestPollAPIServer_OldClusterDegradesToRecreate verifies the server-version
+// gate: on a 1.32 cluster (alpha resize API, no PodResizePending/InProgress
+// conditions) NewK8sClient degrades InPlaceOrRecreate to Recreate instead of
+// driving resizes the kubelet can never report on. InPlace mode stays strict
+// and fails at startup.
+func TestPollAPIServer_OldClusterDegradesToRecreate(t *testing.T) {
+	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+
+	cluster := fakeCluster{
+		cores:         []int{2, 2, 2, 1},
+		target:        deployment("test-dep", ctr("main", "10m")),
+		pods:          []apiv1.Pod{ownedPod("test-dep-abc-def", "test-dep-abc", ctr("main", "10m"))},
+		hasResize:     true,
+		serverVersion: "v1.32.4",
+	}
+	rec, err := runPoll(t, scenario{cluster: cluster, mode: k8sclient.ResizeModeInPlaceOrRecreate, config: baseConfig})
+	if err != nil {
+		t.Fatalf("pollAPIServer: %v", err)
+	}
+	if rec.resizePatched() {
+		t.Error("no /resize call expected after degradation to Recreate")
+	}
+	if !rec.templatePatched() {
+		t.Fatal("template should be patched in Recreate mode")
+	}
+	p, _ := rec.lastTemplatePatch()
+	ctrs := templatePatchContainers(t, p.Body)
+	if cpu := cpuRequest(ctrs, "main"); cpu != "17m" {
+		t.Errorf("patched CPU request = %q, want 17m", cpu)
+	}
+}
+
+// TestPollAPIServer_RequestAboveLimit pins the request-above-limit guard
+// end-to-end: a config
+// that would scale a request past the container's fixed limit must send no
+// PATCH at all — the pod-level precheck rejects the resize locally, and the
+// fallback's template patch refuses to ship an Invalid (request > limit)
+// template — while the pods still accumulate toward (unusable) recreation.
+func TestPollAPIServer_RequestAboveLimit(t *testing.T) {
+	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+	const grace = 5 * time.Minute
+
+	limited := apiv1.Container{
+		Name: "main",
+		Resources: apiv1.ResourceRequirements{
+			Requests: apiv1.ResourceList{apiv1.ResourceCPU: resource.MustParse("10m")},
+			Limits:   apiv1.ResourceList{apiv1.ResourceCPU: resource.MustParse("15m")},
+		},
+	}
+	stuck := apiv1.PodCondition{Type: apiv1.PodResizePending, Status: apiv1.ConditionTrue, Reason: apiv1.PodReasonInfeasible}
+
+	cluster := fakeCluster{
+		cores:     []int{2, 2, 2, 1}, // 7 cores -> desired request 17m > 15m limit
+		target:    deployment("test-dep", limited),
+		pods:      []apiv1.Pod{ownedPod("test-dep-abc-def", "test-dep-abc", limited, stuck)},
+		hasResize: true,
+	}
+	rec, err := runPoll(t, scenario{
+		cluster:  cluster,
+		mode:     k8sclient.ResizeModeInPlaceOrRecreate,
+		fallback: k8sclient.ResizeFallbackConfig{GracePeriod: grace, MaxPodsPerCycle: 1},
+		config:   baseConfig,
+		cycles:   2,
+		advance:  grace + time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("pollAPIServer: %v", err)
+	}
+	if rec.resizePatched() {
+		t.Error("request above limit must not be sent to /resize")
+	}
+	if rec.templatePatched() {
+		t.Error("request above limit must not be shipped into the template")
+	}
+	if rec.deleteCount() != 0 || rec.evictionCount() != 0 {
+		t.Error("pods must not be recreated when the resize itself is impossible")
 	}
 }
