@@ -407,6 +407,11 @@ func (fc fakeCluster) handler(t *testing.T, rec *requestRecorder) http.HandlerFu
 
 	return func(w http.ResponseWriter, req *http.Request) {
 		t.Logf("mock %s %s", req.Method, req.URL.Path)
+		if req.Method == http.MethodPatch {
+			if fm := req.URL.Query().Get("fieldManager"); fm != k8sclient.FieldManager {
+				t.Errorf("PATCH %s with fieldManager %q, want %q", req.URL.Path, fm, k8sclient.FieldManager)
+			}
+		}
 
 		// --- discovery ---
 		if req.URL.Path == "/version" {
@@ -522,13 +527,14 @@ func (fc fakeCluster) handler(t *testing.T, rec *requestRecorder) http.HandlerFu
 // ---------------------------------------------------------------------------
 
 type scenario struct {
-	cluster  fakeCluster
-	mode     k8sclient.ResizeMode
-	fallback k8sclient.ResizeFallbackConfig
-	config   string // ScaleConfig JSON
-	dryRun   bool
-	cycles   int           // number of pollAPIServer calls; defaults to 1
-	advance  time.Duration // resizer-clock step applied before each cycle after the first
+	cluster    fakeCluster
+	mode       k8sclient.ResizeMode
+	fallback   k8sclient.ResizeFallbackConfig
+	config     string // ScaleConfig JSON
+	dryRun     bool
+	onConflict k8sclient.ConflictPolicy // "" = yield
+	cycles     int                      // number of pollAPIServer calls; defaults to 1
+	advance    time.Duration            // resizer-clock step applied before each cycle after the first
 }
 
 // runPoll stands up the mock server, builds a real k8sClient + AutoScaler from
@@ -550,7 +556,7 @@ func runPoll(t *testing.T, s scenario) (*requestRecorder, error) {
 	resizerClock := clocktesting.NewFakeClock(time.Now())
 
 	kubeconfig := writeTempKubeconfig(t, server.URL)
-	client, err := k8sclient.NewK8sClient(testNamespace, s.cluster.targetRef(t), kubeconfig, s.dryRun, s.mode, s.fallback, resizerClock)
+	client, err := k8sclient.NewK8sClient(testNamespace, s.cluster.targetRef(t), kubeconfig, s.dryRun, s.mode, s.fallback, s.onConflict, resizerClock)
 	if err != nil {
 		t.Fatalf("NewK8sClient: %v", err)
 	}

@@ -47,6 +47,7 @@ type AutoScalerConfig struct {
 	ResizeFallbackGracePeriod     time.Duration
 	ResizeFallbackMaxPodsPerCycle int
 	ResizeFallbackDisruption      string
+	ResizeOnConflict              string
 }
 
 // NewAutoScalerConfig returns a Autoscaler config
@@ -61,6 +62,7 @@ func NewAutoScalerConfig() *AutoScalerConfig {
 		ResizeFallbackGracePeriod:     defaultResizeFallbackGracePeriod,
 		ResizeFallbackMaxPodsPerCycle: defaultResizeFallbackMaxPodsPerCycle,
 		ResizeFallbackDisruption:      "eviction",
+		ResizeOnConflict:              "yield",
 	}
 }
 
@@ -78,6 +80,7 @@ func (c *AutoScalerConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.DurationVar(&c.ResizeFallbackGracePeriod, "resize-fallback-grace-period", c.ResizeFallbackGracePeriod, "Only used with InPlaceOrRecreate. How long a pod must continuously fail to resize (Infeasible, Deferred, or stuck in progress) before cpvpa recreates it so the controller can reschedule it at the new size.")
 	fs.IntVar(&c.ResizeFallbackMaxPodsPerCycle, "resize-fallback-max-pods-per-cycle", c.ResizeFallbackMaxPodsPerCycle, "Only used with InPlaceOrRecreate. Caps how many not-yet-resized pods cpvpa recreates (via the configured fallback disruption) in a single poll cycle.")
 	fs.StringVar(&c.ResizeFallbackDisruption, "resize-fallback-disruption", c.ResizeFallbackDisruption, "Only used with InPlaceOrRecreate. How to recreate stuck pods: eviction (default, honors PDBs) or delete (ignores PDBs).")
+	fs.StringVar(&c.ResizeOnConflict, "resize-on-conflict", c.ResizeOnConflict, "Only used with the in-place modes. What to do when another manager (e.g. VPA) resized a pod field cpvpa manages: yield (default; leave the pod alone until cpvpa's desired resources change, then take the fields back once) or override (always re-apply cpvpa's values).")
 }
 
 // InitFlags no// WordSepNormalizeFunc changes all flags that contain "_" separators
@@ -135,6 +138,12 @@ func (c *AutoScalerConfig) ValidateFlags() error {
 	default:
 		errorsFound = true
 		glog.Errorf("--resize-fallback-disruption must be one of: eviction, delete (got %q)", c.ResizeFallbackDisruption)
+	}
+	switch c.ResizeOnConflict {
+	case "yield", "override":
+	default:
+		errorsFound = true
+		glog.Errorf("--resize-on-conflict must be one of: yield, override (got %q)", c.ResizeOnConflict)
 	}
 	if c.ResizeMode != "InPlaceOrRecreate" {
 		if c.ResizeFallbackGracePeriod != defaultResizeFallbackGracePeriod || c.ResizeFallbackMaxPodsPerCycle != defaultResizeFallbackMaxPodsPerCycle || c.ResizeFallbackDisruption != "eviction" {

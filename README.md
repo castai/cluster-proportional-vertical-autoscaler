@@ -189,7 +189,7 @@ By default, cpvpa only patches the workload template; new pods come up at the co
 - **`resizePolicy`:** nothing to declare. The default `restartPolicy` is `NotRequired`. Only set `RestartContainer` if the container really needs a restart to pick up the new value; it then restarts on every resize.
 - **Limits must allow the requests.** A request may never exceed its limit. If the target sets limits, scale them in the cpvpa config too (see the example), or drop them. cpvpa will not send a resize or template patch that puts a request above its limit.
 - **The QoS class cannot change in place.** For a Guaranteed pod (requests equal limits), scale requests and limits together.
-- **cpvpa must be the only resizer** for the containers it manages. Exclude them from VPA in-place updates and other autoscalers; otherwise each one reverts the other's change on every poll.
+- **cpvpa should be the only resizer** for the containers it manages. Exclude them from VPA in-place updates and other autoscalers. cpvpa detects another resizer from the pod's `managedFields` (it writes as field manager `cpvpa`): when a field it wants to change was last resized by someone else, it warns once and, by default, leaves the pod alone until its own desired resources change, then takes the fields back once. Such a pod is counted as `ExternalConflict` and is never recreated by the fallback. A `/resize` whose values an admission webhook changes is handled the same way. See `--resize-on-conflict`.
 
 ### RBAC
 
@@ -225,6 +225,7 @@ In the in-place modes, `--poll-period-seconds` also bounds how long one resize c
 | `--resize-mode` | How to apply resource changes: `Recreate`, `InPlace`, or `InPlaceOrRecreate` | `Recreate` |
 | `--resize-fallback-grace-period` | Only for `InPlaceOrRecreate`. How long a pod must fail to resize (Infeasible, Deferred, stuck in progress, or skipped as unresizable) before cpvpa recreates it. | `5m` |
 | `--resize-fallback-max-pods-per-cycle` | Only for `InPlaceOrRecreate`. Caps how many stuck pods cpvpa disrupts per cycle (bare ReplicaSet / OnDelete DaemonSet or StatefulSet only; self-healing controllers pace their own rollout). | `1` |
+| `--resize-on-conflict` | In-place modes. When another manager resized a pod field cpvpa manages: `yield` (leave the pod alone until cpvpa's desired resources change, then take the fields back once) or `override` (always re-apply cpvpa's values; with an active second resizer both keep reverting each other). Pods whose resize an admission webhook changes are never re-sent until the desired resources change, in either mode. | `yield` |
 | `--resize-fallback-disruption` | Only for `InPlaceOrRecreate`. How to disrupt stuck pods on non-self-healing targets: `eviction` (uses the Eviction API, honors PodDisruptionBudgets) or `delete` (raw delete, ignores PDBs). | `eviction` |
 
 ### Example

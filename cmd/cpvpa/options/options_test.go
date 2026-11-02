@@ -118,3 +118,22 @@ func TestValidateFlags(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateFlags_ResizeOnConflict(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		wantErr bool
+	}{{"yield", false}, {"override", false}, {"", true}, {"fight", true}} {
+		c := NewAutoScalerConfig()
+		c.Target = "deployment/thing"
+		c.Namespace = "default"
+		c.DefaultConfig = `{"main":{"requests":{"cpu":{"base":"10m"}}}}`
+		c.ResizeOnConflict = tc.value
+		if err := c.ValidateFlags(); (err != nil) != tc.wantErr {
+			t.Errorf("--resize-on-conflict=%q: err = %v, wantErr %v", tc.value, err, tc.wantErr)
+		}
+	}
+	if got := NewAutoScalerConfig().ResizeOnConflict; got != "yield" {
+		t.Errorf("default --resize-on-conflict = %q, want yield", got)
+	}
+}

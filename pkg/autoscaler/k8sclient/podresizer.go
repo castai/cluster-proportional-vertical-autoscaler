@@ -15,6 +15,7 @@ limitations under the License.
 package k8sclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/clock"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 )
 
 // ResizeMode controls how cpvpa applies resource changes to a target.
@@ -104,6 +106,30 @@ func (r resizeRejection) podStable() bool {
 // a variable so tests can count emissions.
 var logWarningf = glog.Warningf
 
+// FieldManager is the field manager cpvpa records for every write, so its
+// ownership of pod and template fields is visible in managedFields and can be
+// told apart from other resizers'.
+const FieldManager = "cpvpa"
+
+// ConflictPolicy decides what cpvpa does when another manager resized a pod
+// field cpvpa manages.
+type ConflictPolicy string
+
+const (
+	// ConflictYield (default) leaves the pod alone while the desired values
+	// stay the same, and takes the fields back once when they change. A
+	// yielded pod never enters the recreation fallback.
+	ConflictYield ConflictPolicy = "yield"
+	// ConflictOverride always re-applies cpvpa's values (the pre-detection
+	// behavior). With another active resizer, both revert each other.
+	ConflictOverride ConflictPolicy = "override"
+)
+
+// admissionManager marks a conflict entry for a /resize that an admission
+// webhook mutated: the result is attributed to cpvpa, so ownership can't
+// reveal it.
+const admissionManager = "(admission webhook)"
+
 // ResizeFallbackConfig governs the InPlaceOrRecreate fallback path.
 type ResizeFallbackConfig struct {
 	// GracePeriod is how long a pod must remain not-resized in-place
@@ -134,6 +160,7 @@ type podResizer struct {
 	clock          clock.PassiveClock
 	clientset      kubernetes.Interface
 	tracker        *resizeTracker
+	onConflict     ConflictPolicy // "" means ConflictYield
 }
 
 type resizeResult struct {
@@ -149,6 +176,7 @@ type resizeResult struct {
 	RecreateStuck            int // self-healing pods still not resized though the template already matches desired (rollout wedged, likely unschedulable)
 	EvictionBlocked          int // pods whose eviction was blocked by PDB
 	FallbackSkippedNodeBound int // pods whose fallback disruption was skipped: node-bound target + Deferred/Infeasible (recreation cannot fix them)
+	ExternalConflict         int // pods whose managed fields another manager (or an admission webhook) set to other values
 	Rejected                 int // pods whose resize was skipped: permanently rejected (see tracker rejection reasons)
 	Unsupported              int // subset of Rejected: pods on nodes whose kubelet lacks InPlacePodVerticalScaling
 	ActuationUnknown         int // pods at desired spec whose kubelet reports no status resources (node without in-place support); treated as converged
@@ -256,6 +284,13 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 			continue
 		}
 
+		// Another resizer (or a webhook) set the fields cpvpa wants to change.
+		// Checked before rejections: a yielded pod must never reach the
+		// recreation fallback, which would evict it over someone else's sizing.
+		if r.yieldToOtherManager(pod, desired, desiredKey, &result) {
+			continue
+		}
+
 		// Only a pod that still needs a resize can have it rejected; checking
 		// before buildResizePatch would mark correctly sized pods as stuck.
 		// A pod whose resize is permanently rejected (determined this poll or
@@ -281,7 +316,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 			pod.Name,
 			types.StrategicMergePatchType,
 			patchBody,
-			metav1.PatchOptions{},
+			metav1.PatchOptions{FieldManager: FieldManager},
 			"resize",
 		)
 		if patchErr != nil {
@@ -306,6 +341,19 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 			continue
 		} else {
 			result.Applied++
+			// The API server accepted the PATCH, but an admission webhook can
+			// still have changed the values. Re-sending would be mutated the
+			// same way every poll; wait for the desired values to change.
+			if _, stillDiffers := buildResizePatch(updated, desired); stillDiffers {
+				r.tracker.clearClock(updated.UID)
+				result.ExternalConflict++
+				if r.tracker.setConflict(updated.UID, admissionManager, desiredKey) {
+					logWarningf("pod=%s/%s: the /resize was accepted but its resources were changed on admission (desired %s, got %s); "+
+						"not re-sending until the desired resources change",
+						updated.Namespace, updated.Name, formatResourceRequests(desired), formatPodRequests(updated, desired))
+				}
+				continue
+			}
 			// A successful patch is a fresh resize attempt, so normally the
 			// fallback clock restarts. Not when the pod was already reported
 			// as not fitting (Deferred/Infeasible) and no value went down:
@@ -370,6 +418,120 @@ func (r *podResizer) accountNotResized(
 	age := now.Sub(firstSeen)
 	glog.V(2).Infof("pod=%s/%s resize %s (not resized for %s)", pod.Namespace, pod.Name, status, age)
 	r.maybeFallbackEvict(ctx, pod, now, age, selfHeals, status, desired, nodeBound, ensureTemplate, evictedThisCycle, result)
+}
+
+// yieldToOtherManager handles a pod whose fields cpvpa wants to change were
+// last set by someone else, and reports whether to skip the pod.
+//
+//   - A pod already yielded for the same desired values stays yielded (an
+//     admission-webhook entry in either policy, an external resizer under
+//     ConflictYield). It leaves the fallback clock.
+//   - Once the desired values change, cpvpa takes the fields back once: the
+//     entry is dropped and the pod is patched without re-checking ownership.
+//   - Otherwise, if another manager owns a differing field, the conflict is
+//     recorded and warned about once; ConflictYield skips the pod,
+//     ConflictOverride patches it anyway.
+func (r *podResizer) yieldToOtherManager(pod *v1.Pod, desired map[string]v1.ResourceRequirements, desiredKey string, result *resizeResult) bool {
+	yield := r.onConflict != ConflictOverride
+	if e, ok := r.tracker.conflict(pod.UID); ok {
+		if e.desiredKey != desiredKey {
+			r.tracker.clearConflict(pod.UID)
+			if e.manager != admissionManager && yield {
+				glog.Infof("pod=%s/%s: desired resources changed, taking the fields back from %q once",
+					pod.Namespace, pod.Name, e.manager)
+				return false
+			}
+		} else if e.manager == admissionManager || yield {
+			result.ExternalConflict++
+			r.tracker.clearClock(pod.UID)
+			return true
+		}
+	}
+	manager, field := externalResizeOwner(pod, desired)
+	if manager == "" {
+		return false
+	}
+	result.ExternalConflict++
+	if r.tracker.setConflict(pod.UID, manager, desiredKey) {
+		action := "leaving it alone until the desired resources change"
+		if !yield {
+			action = "overriding it (--resize-on-conflict=override)"
+		}
+		logWarningf("pod=%s/%s: %s was resized by %q (desired %s, pod has %s); %s. "+
+			"cpvpa should be the only resizer of the containers it manages",
+			pod.Namespace, pod.Name, field, manager, formatResourceRequests(desired), formatPodRequests(pod, desired), action)
+	}
+	if yield {
+		r.tracker.clearClock(pod.UID)
+	}
+	return yield
+}
+
+// externalResizeOwner returns the manager, other than cpvpa, that last set
+// one of the pod's resource fields cpvpa wants to change through the resize
+// subresource, plus that field, or "" if there is none. Ownership comes from
+// managedFields: it is per field, moves to whoever last changed the value,
+// and is recorded with subresource "resize" for in-place resizes. Owners
+// without that subresource (the pod's creator, e.g. kube-controller-manager)
+// set the creation-time values and are not resizers.
+func externalResizeOwner(pod *v1.Pod, desired map[string]v1.ResourceRequirements) (manager, field string) {
+	type candidate struct {
+		path  fieldpath.Path
+		label string
+	}
+	var differing []candidate
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
+		want, managed := desired[c.Name]
+		if !managed {
+			continue
+		}
+		for _, list := range []struct {
+			kind       string
+			have, want v1.ResourceList
+		}{{"requests", c.Resources.Requests, want.Requests}, {"limits", c.Resources.Limits, want.Limits}} {
+			for res, w := range list.want {
+				if h, ok := list.have[res]; ok && h.Cmp(w) == 0 {
+					continue
+				}
+				differing = append(differing, candidate{
+					path: fieldpath.MakePathOrDie("spec", "containers", fieldpath.KeyByFields("name", c.Name),
+						"resources", list.kind, string(res)),
+					label: fmt.Sprintf("container %q %s.%s", c.Name, list.kind, res),
+				})
+			}
+		}
+	}
+	if len(differing) == 0 {
+		return "", ""
+	}
+	for _, mf := range pod.ManagedFields {
+		if mf.Subresource != "resize" || mf.Manager == FieldManager || mf.FieldsV1 == nil {
+			continue
+		}
+		set := &fieldpath.Set{}
+		if err := set.FromJSON(bytes.NewReader(mf.FieldsV1.Raw)); err != nil {
+			continue
+		}
+		for _, d := range differing {
+			if set.Has(d.path) {
+				return mf.Manager, d.label
+			}
+		}
+	}
+	return "", ""
+}
+
+// formatPodRequests renders the pod's current requests for the containers in
+// desired, in the same shape as formatResourceRequests.
+func formatPodRequests(pod *v1.Pod, desired map[string]v1.ResourceRequirements) string {
+	current := make(map[string]v1.ResourceRequirements, len(desired))
+	for i := range pod.Spec.Containers {
+		if _, managed := desired[pod.Spec.Containers[i].Name]; managed {
+			current[pod.Spec.Containers[i].Name] = pod.Spec.Containers[i].Resources
+		}
+	}
+	return formatResourceRequests(current)
 }
 
 // noteRejection accounts for one pod whose resize is rejected: it records
@@ -843,6 +1005,7 @@ type resizeTracker struct {
 	notResizedSince      map[types.UID]time.Time
 	evictionBlockedSince map[types.UID]time.Time
 	rejections           map[types.UID]rejectionEntry
+	conflicts            map[types.UID]conflictEntry // kept across clear(): see yieldToOtherManager
 	fallbackWarned       map[types.UID]bool
 }
 
@@ -851,6 +1014,7 @@ func newResizeTracker() *resizeTracker {
 		notResizedSince:      make(map[types.UID]time.Time),
 		evictionBlockedSince: make(map[types.UID]time.Time),
 		rejections:           make(map[types.UID]rejectionEntry),
+		conflicts:            make(map[types.UID]conflictEntry),
 		fallbackWarned:       make(map[types.UID]bool),
 	}
 }
@@ -882,6 +1046,45 @@ func (t *resizeTracker) clear(uid types.UID) {
 type rejectionEntry struct {
 	reason     resizeRejection
 	desiredKey string
+}
+
+// conflictEntry records that a pod's managed fields were set by another
+// manager while cpvpa wanted desiredKey.
+type conflictEntry struct {
+	manager    string
+	desiredKey string
+}
+
+// setConflict records a conflict and reports whether it is new for this pod
+// or names a different manager (so the caller warns once).
+func (t *resizeTracker) setConflict(uid types.UID, manager, desiredKey string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	prev, ok := t.conflicts[uid]
+	t.conflicts[uid] = conflictEntry{manager: manager, desiredKey: desiredKey}
+	return !ok || prev.manager != manager
+}
+
+func (t *resizeTracker) conflict(uid types.UID) (conflictEntry, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.conflicts[uid]
+	return e, ok
+}
+
+func (t *resizeTracker) clearConflict(uid types.UID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.conflicts, uid)
+}
+
+// clearClock takes a pod off the fallback clock without touching its other
+// state: a pod cpvpa yields to another manager must never be recreated.
+func (t *resizeTracker) clearClock(uid types.UID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.notResizedSince, uid)
+	delete(t.evictionBlockedSince, uid)
 }
 
 // keepClock handles a successful re-patch that leaves the resize no easier:
@@ -967,6 +1170,11 @@ func (t *resizeTracker) retain(live map[types.UID]bool) {
 	for uid := range t.fallbackWarned {
 		if !live[uid] {
 			delete(t.fallbackWarned, uid)
+		}
+	}
+	for uid := range t.conflicts {
+		if !live[uid] {
+			delete(t.conflicts, uid)
 		}
 	}
 }

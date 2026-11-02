@@ -66,7 +66,7 @@ type k8sClient struct {
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
-func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg ResizeFallbackConfig, clk clock.PassiveClock) (K8sClient, error) {
+func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode ResizeMode, fallbackCfg ResizeFallbackConfig, onConflict ConflictPolicy, clk clock.PassiveClock) (K8sClient, error) {
 	var config *rest.Config
 	var err error
 	if kubeconfig != "" {
@@ -104,6 +104,7 @@ func NewK8sClient(namespace, target, kubeconfig string, dryRun bool, mode Resize
 			clock:          clk,
 			clientset:      clientset,
 			tracker:        newResizeTracker(),
+			onConflict:     onConflict,
 		}
 	}
 
@@ -261,28 +262,28 @@ func findDeploymentPatcher(groupVersions map[string]bool) (string, patchFunc, er
 	// Find the best API to use - newest API first.
 	if groupVersions["apps/v1"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.AppsV1().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "apps/v1", patchFunc(fn), nil
 	}
 	if groupVersions["apps/v1beta2"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1beta2().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.AppsV1beta2().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "apps/v1beta2", patchFunc(fn), nil
 	}
 	if groupVersions["apps/v1beta1"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1beta1().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.AppsV1beta1().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "apps/v1beta1", patchFunc(fn), nil
 	}
 	if groupVersions["extensions/v1beta1"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.ExtensionsV1beta1().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.ExtensionsV1beta1().Deployments(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "extensions/v1beta1", patchFunc(fn), nil
@@ -294,21 +295,21 @@ func findDaemonSetPatcher(groupVersions map[string]bool) (string, patchFunc, err
 	// Find the best API to use - newest API first.
 	if groupVersions["apps/v1"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1().DaemonSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.AppsV1().DaemonSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "apps/v1", patchFunc(fn), nil
 	}
 	if groupVersions["apps/v1beta2"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1beta2().DaemonSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.AppsV1beta2().DaemonSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "apps/v1beta2", patchFunc(fn), nil
 	}
 	if groupVersions["extensions/v1beta1"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.ExtensionsV1beta1().DaemonSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.ExtensionsV1beta1().DaemonSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "extensions/v1beta1", patchFunc(fn), nil
@@ -320,21 +321,21 @@ func findReplicaSetPatcher(groupVersions map[string]bool) (string, patchFunc, er
 	// Find the best API to use - newest API first.
 	if groupVersions["apps/v1"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1().ReplicaSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.AppsV1().ReplicaSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "apps/v1", patchFunc(fn), nil
 	}
 	if groupVersions["apps/v1beta2"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1beta2().ReplicaSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.AppsV1beta2().ReplicaSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "apps/v1beta2", patchFunc(fn), nil
 	}
 	if groupVersions["extensions/v1beta1"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.ExtensionsV1beta1().ReplicaSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.ExtensionsV1beta1().ReplicaSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "extensions/v1beta1", patchFunc(fn), nil
@@ -346,21 +347,21 @@ func findStatefulSetPatcher(groupVersions map[string]bool) (string, patchFunc, e
 	// Find the best API to use - newest API first.
 	if groupVersions["apps/v1"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1().StatefulSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.AppsV1().StatefulSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "apps/v1", patchFunc(fn), nil
 	}
 	if groupVersions["apps/v1beta2"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1beta2().StatefulSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.AppsV1beta2().StatefulSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "apps/v1beta2", patchFunc(fn), nil
 	}
 	if groupVersions["apps/v1beta1"] {
 		fn := func(ctx context.Context, client kubernetes.Interface, namespace, name string, pt types.PatchType, data []byte) error {
-			_, err := client.AppsV1beta1().StatefulSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{})
+			_, err := client.AppsV1beta1().StatefulSets(namespace).Patch(ctx, name, pt, data, metav1.PatchOptions{FieldManager: FieldManager})
 			return err
 		}
 		return "apps/v1beta1", patchFunc(fn), nil
@@ -641,7 +642,7 @@ func (t *targetClient) NodeBound() bool {
 // Each underlying pod is already logged once when it first shows up; the
 // summary repeats the totals.
 type cycleProblems struct {
-	Rejected, Unsupported, FallbackSkippedNodeBound, Errors int
+	Rejected, Unsupported, FallbackSkippedNodeBound, ExternalConflict, Errors int
 }
 
 // logCycle logs the cycle summary at V(1), raised to Warning when the
@@ -652,6 +653,7 @@ func (k *k8sClient) logCycle(result resizeResult) {
 		Rejected:                 result.Rejected,
 		Unsupported:              result.Unsupported,
 		FallbackSkippedNodeBound: result.FallbackSkippedNodeBound,
+		ExternalConflict:         result.ExternalConflict,
 		Errors:                   result.Errors,
 	}
 	switch {

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/utils/clock"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 )
 
 // ---------------------------------------------------------------------------
@@ -1356,8 +1358,10 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 			w.WriteHeader(http.StatusUnprocessableEntity) // 422 -> apierrors.IsInvalid
 		case req.Method == "PATCH" && req.URL.Path == "/api/v1/namespaces/test/pods/pod-b/resize":
 			w.Header().Set("Content-Type", "application/json")
+			body, _ := io.ReadAll(req.Body)
+			patched := applyResizePatch(&podB, body)
 			w.WriteHeader(http.StatusOK)
-			w.Write(podResponse(&podB))
+			w.Write(podResponse(&patched))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -2005,7 +2009,9 @@ func TestResizeRunningPods_ScheduledWaitingToStartSkipped(t *testing.T) {
 		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
 			patchCount++
 			w.Header().Set("Content-Type", "application/json")
-			w.Write(podResponse(&unscheduled))
+			body, _ := io.ReadAll(req.Body)
+			patched := applyResizePatch(&unscheduled, body)
+			w.Write(podResponse(&patched))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -2279,8 +2285,10 @@ func recordingPodServer(pod *v1.Pod, patches, disruptions *int) *httptest.Server
 			w.Write(podListResponse([]v1.Pod{*pod}))
 		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
 			*patches++
+			body, _ := io.ReadAll(req.Body)
+			patched := applyResizePatch(pod, body)
 			w.Header().Set("Content-Type", "application/json")
-			w.Write(podResponse(pod))
+			w.Write(podResponse(&patched))
 		case req.Method == "DELETE", req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/eviction"):
 			*disruptions++
 			w.WriteHeader(http.StatusCreated)
@@ -2288,6 +2296,35 @@ func recordingPodServer(pod *v1.Pod, patches, disruptions *int) *httptest.Server
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
+}
+
+// applyResizePatch returns a copy of pod with a /resize patch body's
+// container resources applied, like the API server's response. The listed
+// pod is left unchanged, so the next poll sees the pre-patch state.
+func applyResizePatch(pod *v1.Pod, body []byte) v1.Pod {
+	var patch struct {
+		Spec struct {
+			Containers []struct {
+				Name      string                  `json:"name"`
+				Resources v1.ResourceRequirements `json:"resources"`
+			} `json:"containers"`
+		} `json:"spec"`
+	}
+	out := *pod.DeepCopy()
+	if err := json.Unmarshal(body, &patch); err != nil {
+		return out
+	}
+	for _, pc := range patch.Spec.Containers {
+		for i := range out.Spec.Containers {
+			c := &out.Spec.Containers[i]
+			if c.Name != pc.Name {
+				continue
+			}
+			c.Resources.Requests = mergeResourceList(c.Resources.Requests, pc.Resources.Requests)
+			c.Resources.Limits = mergeResourceList(c.Resources.Limits, pc.Resources.Limits)
+		}
+	}
+	return out
 }
 
 func runningStatus(name string, res *v1.ResourceRequirements) v1.ContainerStatus {
@@ -2667,4 +2704,252 @@ func TestResizeRunningPods_UnrecognizedInvalidRejected(t *testing.T) {
 			t.Errorf("FallbackSkippedNodeBound=%d disruptions=%d, want 0/1", result.FallbackSkippedNodeBound, disruptions)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// F4: another resizer / admission mutation
+// ---------------------------------------------------------------------------
+
+// ownedFields builds a managedFields entry in which manager owns the given
+// resources fields ("requests.cpu", "limits.memory", ...) of container "main",
+// encoded the way the API server does.
+func ownedFields(t *testing.T, manager, subresource string, fields ...string) metav1.ManagedFieldsEntry {
+	t.Helper()
+	paths := make([]fieldpath.Path, 0, len(fields))
+	for _, f := range fields {
+		kind, res, _ := strings.Cut(f, ".")
+		paths = append(paths, fieldpath.MakePathOrDie("spec", "containers", fieldpath.KeyByFields("name", "main"), "resources", kind, res))
+	}
+	raw, err := fieldpath.NewSet(paths...).ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return metav1.ManagedFieldsEntry{
+		Manager: manager, Operation: metav1.ManagedFieldsOperationUpdate, Subresource: subresource,
+		FieldsType: "FieldsV1", FieldsV1: &metav1.FieldsV1{Raw: raw},
+	}
+}
+
+// conflictPod is a running pod at cpu=200m/memory=64Mi on a supporting node.
+func conflictPod(managed ...metav1.ManagedFieldsEntry) v1.Pod {
+	res := v1.ResourceRequirements{Requests: v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("200m"), v1.ResourceMemory: resource.MustParse("64Mi"),
+	}}
+	p := makePod("pod-a", v1.PodRunning, nil, res)
+	p.Spec.NodeName = "node-1"
+	p.ManagedFields = managed
+	st := res
+	p.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &st)}
+	return p
+}
+
+func cpuMem(cpu, mem string) map[string]v1.ResourceRequirements {
+	return map[string]v1.ResourceRequirements{"main": {Requests: v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse(cpu), v1.ResourceMemory: resource.MustParse(mem),
+	}}}
+}
+
+// conflictRig runs resizeRunningPods against one listed pod, recording /resize
+// PATCHes (with their fieldManager) and disruptions. respond, if set, builds
+// the PATCH response; by default the patch is applied like the API server does.
+type conflictRig struct {
+	t            *testing.T
+	rig          *resizeRig
+	patches      int
+	disruptions  int
+	fieldManager []string
+	resizer      *podResizer
+}
+
+func newConflictRig(t *testing.T, pod *v1.Pod, policy ConflictPolicy, mode ResizeMode, respond func(body []byte) v1.Pod) *conflictRig {
+	t.Helper()
+	cr := &conflictRig{t: t}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podListResponse([]v1.Pod{*pod}))
+		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
+			cr.patches++
+			cr.fieldManager = append(cr.fieldManager, req.URL.Query().Get("fieldManager"))
+			body, _ := io.ReadAll(req.Body)
+			out := applyResizePatch(pod, body)
+			if respond != nil {
+				out = respond(body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(podResponse(&out))
+		case req.Method == "DELETE", req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/eviction"):
+			cr.disruptions++
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	cr.rig = newResizeRig(t, server)
+	cr.resizer = &podResizer{
+		resizeMode:     mode,
+		fallbackConfig: ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete},
+		clock:          clock.RealClock{},
+		clientset:      cr.rig.client,
+		tracker:        cr.rig.tracker,
+		onConflict:     policy,
+	}
+	return cr
+}
+
+func (cr *conflictRig) run(desired map[string]v1.ResourceRequirements) resizeResult {
+	cr.t.Helper()
+	target := &fakeResizeTarget{
+		selector: cr.rig.selector, namespace: "test", clientset: cr.rig.client,
+		selfHeals: func(context.Context) bool { return false },
+		patcher:   func(map[string]v1.ResourceRequirements) error { return nil },
+	}
+	result, err := cr.resizer.resizeRunningPods(context.Background(), target, desired)
+	if err != nil {
+		cr.t.Fatal(err)
+	}
+	return result
+}
+
+// TestResizeRunningPods_YieldsToOtherResizer: a field cpvpa wants to change
+// was last resized by another manager. cpvpa leaves the pod alone (no PATCH,
+// warned once, counted every poll) and never recreates it, even in
+// InPlaceOrRecreate past the grace period.
+func TestResizeRunningPods_YieldsToOtherResizer(t *testing.T) {
+	warnings := countWarnings(t)
+	pod := conflictPod(
+		ownedFields(t, "kube-controller-manager", "", "requests.memory"),
+		ownedFields(t, "vpa-updater", "resize", "requests.cpu"),
+	)
+	cr := newConflictRig(t, &pod, "", ResizeModeInPlaceOrRecreate, nil) // "" = default = yield
+	cr.rig.pastGrace("pod-a")
+
+	for cycle := 0; cycle < 3; cycle++ {
+		if r := cr.run(cpuMem("300m", "64Mi")); r.ExternalConflict != 1 || r.Applied != 0 {
+			t.Errorf("cycle %d: ExternalConflict=%d Applied=%d, want 1/0", cycle, r.ExternalConflict, r.Applied)
+		}
+		// Already on the first poll: a stale clock would survive until cpvpa
+		// takes the fields back, and could fire the fallback right then.
+		if _, tracked := cr.rig.tracker.notResizedSince[types.UID("pod-a")]; tracked {
+			t.Errorf("cycle %d: a yielded pod must not stay on the fallback clock", cycle)
+		}
+	}
+	if cr.patches != 0 || cr.disruptions != 0 {
+		t.Errorf("patches=%d disruptions=%d over 3 polls, want 0/0", cr.patches, cr.disruptions)
+	}
+	if *warnings != 1 {
+		t.Errorf("warnings = %d, want 1", *warnings)
+	}
+	if _, tracked := cr.rig.tracker.notResizedSince[types.UID("pod-a")]; tracked {
+		t.Error("a yielded pod must not stay on the fallback clock")
+	}
+}
+
+// TestResizeRunningPods_TakesFieldsBackOnceWhenDesiredChanges: after the
+// desired values change, cpvpa re-applies once; if the other resizer then
+// holds the field again (the listed pod still shows its ownership), cpvpa
+// yields again instead of fighting.
+func TestResizeRunningPods_TakesFieldsBackOnceWhenDesiredChanges(t *testing.T) {
+	warnings := countWarnings(t)
+	pod := conflictPod(ownedFields(t, "vpa-updater", "resize", "requests.cpu"))
+	cr := newConflictRig(t, &pod, ConflictYield, ResizeModeInPlace, nil)
+
+	cr.run(cpuMem("300m", "64Mi")) // yield
+	cr.run(cpuMem("400m", "64Mi")) // desired changed: take back once
+	if cr.patches != 1 {
+		t.Fatalf("patches after the desired change = %d, want 1", cr.patches)
+	}
+	cr.run(cpuMem("400m", "64Mi")) // still owned by vpa-updater: yield again
+	cr.run(cpuMem("400m", "64Mi"))
+	if cr.patches != 1 {
+		t.Errorf("patches = %d, want 1 (one take-back per desired change)", cr.patches)
+	}
+	if *warnings != 2 {
+		t.Errorf("warnings = %d, want 2 (first conflict, and again after the take-back)", *warnings)
+	}
+}
+
+// TestResizeRunningPods_NotAConflict covers ownership that must not count as
+// another resizer: the pod's creator, cpvpa's own earlier resize, and another
+// resizer owning only a field that already matches desired.
+func TestResizeRunningPods_NotAConflict(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		managed []metav1.ManagedFieldsEntry
+	}{
+		{"creator owns everything", []metav1.ManagedFieldsEntry{ownedFields(t, "kube-controller-manager", "", "requests.cpu", "requests.memory")}},
+		{"cpvpa's own earlier resize", []metav1.ManagedFieldsEntry{ownedFields(t, FieldManager, "resize", "requests.cpu")}},
+		{"other resizer owns a matching field", []metav1.ManagedFieldsEntry{
+			ownedFields(t, "kube-controller-manager", "", "requests.cpu"),
+			ownedFields(t, "vpa-updater", "resize", "requests.memory"),
+		}},
+		{"other manager without the resize subresource", []metav1.ManagedFieldsEntry{ownedFields(t, "some-operator", "", "requests.cpu")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := conflictPod(tc.managed...)
+			cr := newConflictRig(t, &pod, ConflictYield, ResizeModeInPlace, nil)
+			r := cr.run(cpuMem("300m", "64Mi"))
+			if r.ExternalConflict != 0 || cr.patches != 1 {
+				t.Errorf("ExternalConflict=%d patches=%d, want 0/1", r.ExternalConflict, cr.patches)
+			}
+			if len(cr.fieldManager) == 1 && cr.fieldManager[0] != FieldManager {
+				t.Errorf("/resize fieldManager = %q, want %q", cr.fieldManager[0], FieldManager)
+			}
+		})
+	}
+}
+
+// TestResizeRunningPods_OverridePolicy: with --resize-on-conflict=override
+// cpvpa re-applies every poll (the pre-detection behavior) but still counts
+// the conflict and warns once.
+func TestResizeRunningPods_OverridePolicy(t *testing.T) {
+	warnings := countWarnings(t)
+	pod := conflictPod(ownedFields(t, "vpa-updater", "resize", "requests.cpu"))
+	cr := newConflictRig(t, &pod, ConflictOverride, ResizeModeInPlace, nil)
+	for cycle := 0; cycle < 3; cycle++ {
+		if r := cr.run(cpuMem("300m", "64Mi")); r.ExternalConflict != 1 {
+			t.Errorf("cycle %d: ExternalConflict = %d, want 1", cycle, r.ExternalConflict)
+		}
+	}
+	if cr.patches != 3 || *warnings != 1 {
+		t.Errorf("patches=%d warnings=%d, want 3/1", cr.patches, *warnings)
+	}
+}
+
+// TestResizeRunningPods_MutatedOnAdmission: the API server accepts the PATCH
+// but returns other values (a webhook changed them). The result is owned by
+// cpvpa, so only the response reveals it. cpvpa doesn't re-send until the
+// desired values change — in both policies, since overriding can't win.
+func TestResizeRunningPods_MutatedOnAdmission(t *testing.T) {
+	for _, policy := range []ConflictPolicy{ConflictYield, ConflictOverride} {
+		t.Run(string(policy), func(t *testing.T) {
+			warnings := countWarnings(t)
+			pod := conflictPod()
+			clamp := func([]byte) v1.Pod { // webhook clamps cpu to 250m
+				out := *pod.DeepCopy()
+				out.Spec.Containers[0].Resources.Requests[v1.ResourceCPU] = resource.MustParse("250m")
+				return out
+			}
+			cr := newConflictRig(t, &pod, policy, ResizeModeInPlaceOrRecreate, clamp)
+			cr.rig.pastGrace("pod-a")
+
+			if r := cr.run(cpuMem("300m", "64Mi")); r.Applied != 1 || r.ExternalConflict != 1 {
+				t.Errorf("first poll: Applied=%d ExternalConflict=%d, want 1/1", r.Applied, r.ExternalConflict)
+			}
+			cr.run(cpuMem("300m", "64Mi"))
+			cr.run(cpuMem("300m", "64Mi"))
+			if cr.patches != 1 || cr.disruptions != 0 {
+				t.Errorf("patches=%d disruptions=%d over 3 polls, want 1/0", cr.patches, cr.disruptions)
+			}
+			if *warnings != 1 {
+				t.Errorf("warnings = %d, want 1", *warnings)
+			}
+			cr.run(cpuMem("350m", "64Mi"))
+			if cr.patches != 2 {
+				t.Errorf("patches after the desired change = %d, want 2", cr.patches)
+			}
+		})
+	}
 }
