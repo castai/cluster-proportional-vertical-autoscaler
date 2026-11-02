@@ -330,3 +330,32 @@ func TestUpdateResources(t *testing.T) {
 		}
 	}
 }
+
+// TestLogCycle verifies the cycle summary is raised to Warning only when the
+// problem counts change to a non-zero value, not on every poll while a
+// problem persists, and that a node-bound skip counts as a problem.
+func TestLogCycle(t *testing.T) {
+	warnings := 0
+	orig := logWarningf
+	logWarningf = func(string, ...interface{}) { warnings++ }
+	defer func() { logWarningf = orig }()
+
+	k := &k8sClient{}
+	for i, step := range []struct {
+		result   resizeResult
+		wantWarn int // cumulative
+	}{
+		{resizeResult{TargetPods: 3, AlreadyOK: 3}, 0},
+		{resizeResult{TargetPods: 3, Rejected: 1, Unsupported: 1}, 1},
+		{resizeResult{TargetPods: 3, Rejected: 1, Unsupported: 1, Applied: 2}, 1}, // same problems
+		{resizeResult{TargetPods: 3, Rejected: 1, Unsupported: 1}, 1},
+		{resizeResult{TargetPods: 3, FallbackSkippedNodeBound: 1}, 2},
+		{resizeResult{TargetPods: 3, AlreadyOK: 3}, 2}, // cleared: Info, not Warning
+		{resizeResult{TargetPods: 3, Errors: 1}, 3},
+	} {
+		k.logCycle(step.result)
+		if warnings != step.wantWarn {
+			t.Errorf("step %d: warnings = %d, want %d", i, warnings, step.wantWarn)
+		}
+	}
+}

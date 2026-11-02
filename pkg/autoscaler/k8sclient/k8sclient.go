@@ -60,6 +60,9 @@ type k8sClient struct {
 	dryRun     bool
 	resizeMode ResizeMode
 	podResizer *podResizer
+	// lastProblems is the problem part of the last cycle summary, so the
+	// summary is raised to Warning only when it changes.
+	lastProblems cycleProblems
 }
 
 // NewK8sClient gives a k8sClient with the given dependencies.
@@ -634,6 +637,34 @@ func (t *targetClient) NodeBound() bool {
 	return strings.EqualFold(t.meta.Kind, "daemonset")
 }
 
+// cycleProblems is the part of a resize cycle summary that needs attention.
+// Each underlying pod is already logged once when it first shows up; the
+// summary repeats the totals.
+type cycleProblems struct {
+	Rejected, Unsupported, FallbackSkippedNodeBound, Errors int
+}
+
+// logCycle logs the cycle summary at V(1), raised to Warning when the
+// problem counts change to a non-zero value, and to Info once when they
+// clear. A stable problem state is not repeated as a Warning every poll.
+func (k *k8sClient) logCycle(result resizeResult) {
+	p := cycleProblems{
+		Rejected:                 result.Rejected,
+		Unsupported:              result.Unsupported,
+		FallbackSkippedNodeBound: result.FallbackSkippedNodeBound,
+		Errors:                   result.Errors,
+	}
+	switch {
+	case p != k.lastProblems && p != (cycleProblems{}):
+		logWarningf("resize cycle: %+v", result)
+	case p != k.lastProblems:
+		glog.Infof("resize cycle: problems cleared: %+v", result)
+	default:
+		glog.V(1).Infof("resize cycle: %+v", result)
+	}
+	k.lastProblems = p
+}
+
 // ClusterSize defines the cluster status.
 type ClusterSize struct {
 	Nodes int
@@ -700,11 +731,7 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 	}
 
 	result, err := k.podResizer.resizeRunningPods(ctx, target, resources)
-	if result.Rejected > 0 {
-		glog.Warningf("resize cycle: %+v", result)
-	} else {
-		glog.V(1).Infof("resize cycle: %+v", result)
-	}
+	k.logCycle(result)
 	if err != nil {
 		return errors.Join(templateErr, fmt.Errorf("in-place resize: %w", err))
 	}
