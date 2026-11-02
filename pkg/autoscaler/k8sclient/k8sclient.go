@@ -456,6 +456,24 @@ func (t *targetClient) PatchTemplate(ctx context.Context, resources map[string]v
 	if err := t.meta.Patch(ctx, t.clientset, types.StrategicMergePatchType, jb); err != nil {
 		return false, fmt.Errorf("template patch failed: %v", err)
 	}
+	// Keep the cached template in step with what was just applied (a
+	// strategic merge of these keys), so a second PatchTemplate in the same
+	// cycle, e.g. from the fallback, is recognized as a no-op.
+	if t.cachedSpec != nil {
+		merged := make(map[string]v1.ResourceRequirements, len(t.cachedSpec.TemplateResources))
+		for name, r := range t.cachedSpec.TemplateResources {
+			merged[name] = r
+		}
+		for name, want := range resources {
+			have := merged[name]
+			merged[name] = v1.ResourceRequirements{
+				Requests: mergeResourceList(have.Requests, want.Requests),
+				Limits:   mergeResourceList(have.Limits, want.Limits),
+				Claims:   have.Claims,
+			}
+		}
+		t.cachedSpec.TemplateResources = merged
+	}
 	return true, nil
 }
 

@@ -25,6 +25,7 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -372,5 +373,74 @@ func TestLogCycle(t *testing.T) {
 		if warnings != step.wantWarn {
 			t.Errorf("step %d: warnings = %d, want %d", i, warnings, step.wantWarn)
 		}
+	}
+}
+
+// TestPatchTemplate_CacheFollowsPatch: after a successful template patch the
+// cached template reflects it, so a second PatchTemplate with the same values
+// in the same cycle (the fallback after UpdateResources) sends nothing.
+func TestPatchTemplate_CacheFollowsPatch(t *testing.T) {
+	rs := &appsv1.ReplicaSet{
+		TypeMeta:   metav1.TypeMeta{Kind: "ReplicaSet", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default", UID: "rs-uid"},
+		Spec: appsv1.ReplicaSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			Template: apiv1.PodTemplateSpec{Spec: apiv1.PodSpec{Containers: []apiv1.Container{{
+				Name:      "main",
+				Resources: apiv1.ResourceRequirements{Requests: apiv1.ResourceList{apiv1.ResourceCPU: resource.MustParse("100m")}},
+			}}}},
+		},
+	}
+	patches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var obj interface{}
+		switch {
+		case req.URL.Path == "/api":
+			obj = &metav1.APIVersions{Versions: []string{"v1"}}
+		case req.URL.Path == "/apis":
+			obj = &metav1.APIGroupList{Groups: []metav1.APIGroup{{
+				Name:             "apps",
+				Versions:         []metav1.GroupVersionForDiscovery{{GroupVersion: "apps/v1", Version: "v1"}},
+				PreferredVersion: metav1.GroupVersionForDiscovery{GroupVersion: "apps/v1", Version: "v1"},
+			}}}
+		case req.URL.Path == "/apis/apps/v1":
+			obj = &metav1.APIResourceList{GroupVersion: "apps/v1", APIResources: []metav1.APIResource{
+				{Name: "replicasets", Namespaced: true, Kind: "ReplicaSet"},
+			}}
+		case req.URL.Path == "/apis/apps/v1/namespaces/default/replicasets/web":
+			if req.Method == http.MethodPatch {
+				patches++
+			}
+			obj = rs
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		b, _ := json.Marshal(obj)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(b)
+	}))
+	defer server.Close()
+
+	client := clientset.NewForConfigOrDie(&restclient.Config{Host: server.URL})
+	meta, err := makeTarget(client, "replicaset/web", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc := &targetClient{meta: *meta, clientset: client}
+	ctx := context.Background()
+	if _, err := tc.IsSelfHealing(ctx); err != nil { // fetches and caches the spec
+		t.Fatal(err)
+	}
+	want := map[string]apiv1.ResourceRequirements{"main": {Requests: apiv1.ResourceList{apiv1.ResourceCPU: resource.MustParse("200m")}}}
+
+	if changed, err := tc.PatchTemplate(ctx, want); err != nil || !changed {
+		t.Fatalf("first patch: changed=%v err=%v, want true/nil", changed, err)
+	}
+	if changed, err := tc.PatchTemplate(ctx, want); err != nil || changed {
+		t.Errorf("second patch, same values: changed=%v err=%v, want false/nil", changed, err)
+	}
+	if patches != 1 {
+		t.Errorf("template PATCHes = %d, want 1", patches)
 	}
 }
