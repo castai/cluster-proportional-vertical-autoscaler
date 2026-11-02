@@ -58,6 +58,7 @@ func TestRBACInplaceCoversAllTargetKinds(t *testing.T) {
 	}
 
 	var appsRule *rbacRule
+	var nodeVerbs []string
 	for _, doc := range strings.Split(string(data), "\n---") {
 		var d rbacDoc
 		if err := yaml.Unmarshal([]byte(doc), &d); err != nil {
@@ -69,6 +70,13 @@ func TestRBACInplaceCoversAllTargetKinds(t *testing.T) {
 					if g == "apps" {
 						r := d.Rules[i]
 						appsRule = &r
+					}
+					if g == "" {
+						for _, res := range d.Rules[i].Resources {
+							if res == "nodes" {
+								nodeVerbs = append(nodeVerbs, d.Rules[i].Verbs...)
+							}
+						}
 					}
 				}
 			}
@@ -94,6 +102,13 @@ func TestRBACInplaceCoversAllTargetKinds(t *testing.T) {
 	for _, verb := range []string{"get", "patch"} {
 		if !has(appsRule.Verbs, verb) {
 			t.Errorf("cpvpa ClusterRole apps rule is missing verb %q", verb)
+		}
+	}
+	// list: cluster size every poll; get: node allocatable in the node-bound
+	// fallback log (a 403 there is swallowed, so nothing else would notice).
+	for _, verb := range []string{"get", "list"} {
+		if !has(nodeVerbs, verb) {
+			t.Errorf("cpvpa ClusterRole is missing verb %q on nodes", verb)
 		}
 	}
 }

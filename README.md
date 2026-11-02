@@ -200,7 +200,7 @@ kubectl apply -f examples/RBAC/RBAC-inplace-configs.yaml
 ```
 
 This grants:
-- `nodes`: `[list, watch]` — the cluster-size signal
+- `nodes`: `[get, list, watch]` — the cluster-size signal; `get` reads a node's allocatable for the log line when a DaemonSet pod that cannot fit its node is left alone
 - `deployments/replicasets/daemonsets/statefulsets` (`apps`): `[get, patch]` — the workload template (Recreate mode and the fallback)
 - `pods`: `[list, get]` — to find and classify pods owned by the target
 - `pods/resize`: `[patch]` — the actual in-place resize subresource

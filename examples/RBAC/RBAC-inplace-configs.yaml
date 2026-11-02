@@ -21,10 +21,12 @@ kind: ClusterRole
 metadata:
   name: cpvpa
 rules:
-  # Cluster-size signal — unchanged from the existing role.
+  # Cluster-size signal (list, watch). get: the InPlaceOrRecreate fallback
+  # reads a node's allocatable when it declines to recreate a DaemonSet pod
+  # that cannot fit its node, to explain why in the log.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["list", "watch"]
+    verbs: ["get", "list", "watch"]
   # Patching the workload template — also unchanged. This is what triggers
   # the Recreate path and is what guarantees new pods come up at the right
   # size in every mode.
