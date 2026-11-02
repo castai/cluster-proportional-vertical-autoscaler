@@ -24,6 +24,7 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"sort"
 	"time"
 
 	apiv1 "k8s.io/api/core/v1"
@@ -44,6 +45,7 @@ type AutoScaler struct {
 	lastFileInfo  os.FileInfo
 	currentConfig ScaleConfig
 	lastReqs      map[string]apiv1.ResourceRequirements
+	lastInvalid   string // last logged config violation, so it is logged once
 	pollPeriod    time.Duration
 	clock         clock.WithTicker
 	stopCh        chan struct{}
@@ -165,6 +167,25 @@ func (s *AutoScaler) pollAPIServer(ctx context.Context) error {
 			glog.V(4).Infof("Calculated %s limits[%q] = %v", ctr, res, r)
 		}
 	}
+	// The API server rejects any request above its limit, for the template
+	// and /resize alike. A config whose computed request outgrows its
+	// computed limit is a config error: log it once, and keep applying the
+	// last valid resources (in-place modes still converge new pods to them)
+	// instead of failing every poll.
+	if reason := computedRequestAboveLimit(newReqs); reason != "" {
+		if reason != s.lastInvalid {
+			glog.Errorf("config computes %s for nodes: %d, cores: %d; keeping the previous resources until the config is fixed",
+				reason, clusterSize.Nodes, clusterSize.Cores)
+			s.lastInvalid = reason
+		}
+		if s.lastReqs == nil {
+			return nil // nothing valid to apply yet
+		}
+		newReqs = s.lastReqs
+	} else {
+		s.lastInvalid = ""
+	}
+
 	reqsChanged := !reflect.DeepEqual(s.lastReqs, newReqs)
 
 	if reqsChanged {
@@ -183,6 +204,33 @@ func (s *AutoScaler) pollAPIServer(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// computedRequestAboveLimit returns a description of the first container
+// resource (in sorted order, so the result is stable) whose computed request
+// exceeds its computed limit, or "" if there is none. Resources without a
+// computed limit are not checked here; fixed template limits are checked
+// where the template is known.
+func computedRequestAboveLimit(reqs map[string]apiv1.ResourceRequirements) string {
+	ctrs := make([]string, 0, len(reqs))
+	for ctr := range reqs {
+		ctrs = append(ctrs, ctr)
+	}
+	sort.Strings(ctrs)
+	for _, ctr := range ctrs {
+		names := make([]string, 0, len(reqs[ctr].Requests))
+		for res := range reqs[ctr].Requests {
+			names = append(names, string(res))
+		}
+		sort.Strings(names)
+		for _, res := range names {
+			r := reqs[ctr].Requests[apiv1.ResourceName(res)]
+			if l, ok := reqs[ctr].Limits[apiv1.ResourceName(res)]; ok && r.Cmp(l) > 0 {
+				return fmt.Sprintf("container %q request %s=%s above its limit %s", ctr, res, r.String(), l.String())
+			}
+		}
+	}
+	return ""
 }
 
 func logRequirements(reqs map[string]apiv1.ResourceRequirements) {
