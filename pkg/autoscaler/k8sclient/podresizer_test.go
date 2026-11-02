@@ -17,6 +17,7 @@ package k8sclient
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1365,12 +1366,15 @@ func TestResizeRunningPods_InvalidPatchNoPanic(t *testing.T) {
 	rig := newResizeRig(t, server)
 
 	result := rig.run(map[string]v1.ResourceRequirements{"main": newRes}, ResizeModeInPlace, ResizeFallbackConfig{}, false)
-	// pod-a's 422 is counted as Infeasible (not Errors); pod-b still resized.
+	// pod-a's 422 is counted as Rejected (not Errors); pod-b still resized.
 	if result.Applied != 1 {
 		t.Errorf("Applied = %d, want 1 (pod-b processed after pod-a was rejected)", result.Applied)
 	}
-	if result.Infeasible != 1 {
-		t.Errorf("Infeasible = %d, want 1 (pod-a Invalid → Infeasible)", result.Infeasible)
+	if result.Rejected != 1 || result.Infeasible != 0 {
+		t.Errorf("Rejected=%d Infeasible=%d, want 1/0 (pod-a Invalid → Rejected)", result.Rejected, result.Infeasible)
+	}
+	if reason, ok := rig.tracker.rejection(types.UID("pod-a"), resourcesKey(map[string]v1.ResourceRequirements{"main": newRes})); !ok || reason != rejectInvalidOther {
+		t.Errorf("tracker rejection = (%q, %v), want (%q, true)", reason, ok, rejectInvalidOther)
 	}
 	if result.Errors != 0 {
 		t.Errorf("Errors = %d, want 0", result.Errors)
@@ -2571,4 +2575,96 @@ func TestResizeRunningPods_RepatchGraceClockOnStuckPod(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResizeRunningPods_UnrecognizedInvalidRejected verifies the handling of a
+// 422 whose cause cpvpa does not recognize: it is a rejection (counted, the
+// cause warned once, no re-PATCH while the desired values stay the same),
+// re-checked when they change, and — carrying no node-fit signal — it does
+// not trigger the node-bound guard, so the fallback can still recreate.
+func TestResizeRunningPods_UnrecognizedInvalidRejected(t *testing.T) {
+	status := metav1.Status{
+		TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"},
+		Status:   metav1.StatusFailure,
+		Message:  "Pod \"pod-a\" is invalid: spec: Forbidden: something new",
+		Reason:   metav1.StatusReasonInvalid,
+		Code:     http.StatusUnprocessableEntity,
+		Details:  &metav1.StatusDetails{Causes: []metav1.StatusCause{{Message: "something new"}}},
+	}
+	statusBody, _ := json.Marshal(&status)
+	newPod := func() v1.Pod {
+		p := makePod("pod-a", v1.PodRunning, nil, cpuReq("100m"))
+		p.Spec.NodeName = "node-1"
+		res := cpuReq("100m")
+		p.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &res)}
+		return p
+	}
+	serve := func(pod *v1.Pod, patches, disruptions *int) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			switch {
+			case req.Method == "GET" && req.URL.Path == "/api/v1/namespaces/test/pods":
+				w.Header().Set("Content-Type", "application/json")
+				w.Write(podListResponse([]v1.Pod{*pod}))
+			case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
+				*patches++
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				w.Write(statusBody)
+			case req.Method == "DELETE", req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/eviction"):
+				*disruptions++
+				w.WriteHeader(http.StatusCreated)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+	}
+
+	t.Run("rejected, warned once, re-checked on change", func(t *testing.T) {
+		var warned []string
+		orig := logWarningf
+		logWarningf = func(format string, args ...interface{}) { warned = append(warned, fmt.Sprintf(format, args...)) }
+		t.Cleanup(func() { logWarningf = orig })
+
+		pod := newPod()
+		var patches, disruptions int
+		server := serve(&pod, &patches, &disruptions)
+		defer server.Close()
+		rig := newResizeRig(t, server)
+
+		for cycle := 0; cycle < 3; cycle++ {
+			r := rig.run(map[string]v1.ResourceRequirements{"main": cpuReq("200m")}, ResizeModeInPlace, stdFallback, false)
+			if r.Rejected != 1 || r.Infeasible != 0 || r.Errors != 0 {
+				t.Errorf("cycle %d: Rejected=%d Infeasible=%d Errors=%d, want 1/0/0", cycle, r.Rejected, r.Infeasible, r.Errors)
+			}
+		}
+		if patches != 1 {
+			t.Errorf("/resize patches over 3 polls = %d, want 1 (not re-sent while desired is unchanged)", patches)
+		}
+		causeLogged := false
+		for _, w := range warned {
+			causeLogged = causeLogged || strings.Contains(w, "something new")
+		}
+		if !causeLogged || len(warned) != 2 {
+			t.Errorf("warnings = %q, want the rejection plus one line with the API cause", warned)
+		}
+		rig.run(map[string]v1.ResourceRequirements{"main": cpuReq("300m")}, ResizeModeInPlace, stdFallback, false)
+		if patches != 2 {
+			t.Errorf("/resize patches after the target changed = %d, want 2 (re-checked)", patches)
+		}
+	})
+
+	t.Run("node-bound target is still recreated", func(t *testing.T) {
+		pod := newPod()
+		var patches, disruptions int
+		server := serve(&pod, &patches, &disruptions)
+		defer server.Close()
+		rig := newResizeRig(t, server)
+		rig.pastGrace("pod-a")
+		fallback := ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionDelete}
+		calls := 0
+		result := runNodeBound(t, rig, false, map[string]v1.ResourceRequirements{"main": cpuReq("200m")}, ResizeModeInPlaceOrRecreate, fallback, &calls)
+		if result.FallbackSkippedNodeBound != 0 || disruptions != 1 {
+			t.Errorf("FallbackSkippedNodeBound=%d disruptions=%d, want 0/1", result.FallbackSkippedNodeBound, disruptions)
+		}
+	})
 }

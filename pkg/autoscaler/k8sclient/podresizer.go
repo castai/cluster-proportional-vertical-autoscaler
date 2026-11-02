@@ -83,6 +83,9 @@ const (
 	rejectPodLevel        resizeRejection = "pod-level-resources"           // pod uses pod-level resources (out of scope)
 	rejectStaticPod       resizeRejection = "static-pod"
 	rejectWindows         resizeRejection = "windows-pod"
+	// rejectInvalidOther: the API server refused the resize as Invalid for a
+	// reason not recognized above. Its cause is logged with the warning.
+	rejectInvalidOther resizeRejection = "invalid-other"
 )
 
 // podStable reports whether the rejection depends only on the pod (and its
@@ -260,11 +263,11 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 		// so InPlaceOrRecreate can converge it via recreation, which does not
 		// depend on in-place support.
 		if reason, rejected := r.tracker.rejection(pod.UID, desiredKey); rejected {
-			r.noteRejection(ctx, pod, reason, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
+			r.noteRejection(ctx, pod, reason, "", now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
 			continue
 		}
 		if reason, rejected := precheckResize(pod, desired); rejected {
-			r.noteRejection(ctx, pod, reason, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
+			r.noteRejection(ctx, pod, reason, "", now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
 			continue
 		}
 
@@ -289,14 +292,12 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 				continue
 			}
 			if apierrors.IsInvalid(patchErr) {
-				if reason := rejectionReasonFromError(patchErr); reason != "" {
-					r.noteRejection(ctx, pod, reason, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
-				} else {
-					glog.V(2).Infof("resize rejected as invalid for pod=%s/%s (e.g. QoS class change); routing to fallback: %v",
-						pod.Namespace, pod.Name, patchErr)
-					r.accountNotResized(ctx, pod, resizeStatusInfeasible, now, selfHealing, desired, nodeBound,
-						ensureTemplate, &evictedThisCycle, &result)
-				}
+				// Every Invalid response is a rejection: the same PATCH would
+				// fail again, and it says nothing about whether the size fits
+				// the node. Unrecognized causes are re-checked when the
+				// desired values change, like other desired-dependent ones.
+				reason, cause := rejectionReasonFromError(patchErr)
+				r.noteRejection(ctx, pod, reason, cause, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
 				continue
 			}
 			result.Errors++
@@ -381,6 +382,7 @@ func (r *podResizer) noteRejection(
 	ctx context.Context,
 	pod *v1.Pod,
 	reason resizeRejection,
+	cause string, // API server message, when the rejection came from a 422
 	now time.Time,
 	selfHeals bool,
 	desired map[string]v1.ResourceRequirements,
@@ -394,6 +396,9 @@ func (r *podResizer) noteRejection(
 		result.Unsupported++
 	}
 	if r.tracker.setRejection(pod.UID, reason, resourcesKey(desired)) {
+		if cause != "" {
+			defer logWarningf("pod=%s/%s resize rejected by the API server: %s", pod.Namespace, pod.Name, cause)
+		}
 		if reason == rejectNodeUnsupported {
 			logWarningf("pod=%s/%s on node %q cannot resize in place: kubelet has no InPlacePodVerticalScaling support",
 				pod.Namespace, pod.Name, pod.Spec.NodeName)
@@ -641,35 +646,42 @@ func podQoS(containers []v1.Container) v1.PodQOSClass {
 	return v1.PodQOSBurstable
 }
 
-// rejectionReasonFromError maps an API Invalid (422) response onto a known
-// permanent rejection reason, mirroring ValidatePodResize's messages.
-// Unknown causes return "" so the caller falls back to generic handling.
-func rejectionReasonFromError(err error) resizeRejection {
+// rejectionReasonFromError maps an API Invalid (422) response onto a
+// rejection reason, mirroring ValidatePodResize's messages, and returns the
+// API server's messages joined for logging. Unrecognized causes map to
+// rejectInvalidOther.
+func rejectionReasonFromError(err error) (resizeRejection, string) {
 	statusErr, ok := err.(apierrors.APIStatus)
 	if !ok {
-		return ""
+		return rejectInvalidOther, err.Error()
 	}
 	st := statusErr.Status()
-	msgs := make([]string, 0, 1+len(st.Details.Causes))
+	msgs := make([]string, 0, 1)
 	if st.Message != "" {
 		msgs = append(msgs, st.Message)
 	}
-	for _, c := range st.Details.Causes {
-		if c.Message != "" {
-			msgs = append(msgs, c.Message)
+	if st.Details != nil {
+		for _, c := range st.Details.Causes {
+			if c.Message != "" {
+				msgs = append(msgs, c.Message)
+			}
 		}
+	}
+	cause := strings.Join(msgs, "; ")
+	if cause == "" {
+		cause = err.Error()
 	}
 	for _, m := range msgs {
 		switch {
 		case strings.Contains(m, "without support for resize"):
-			return rejectNodeUnsupported
+			return rejectNodeUnsupported, cause
 		case strings.Contains(m, "QOS Class may not change"):
-			return rejectQoSChange
+			return rejectQoSChange, cause
 		case strings.Contains(m, "less than or equal to"):
-			return rejectAboveLimit
+			return rejectAboveLimit, cause
 		}
 	}
-	return ""
+	return rejectInvalidOther, cause
 }
 
 // maybeFallbackEvict handles the InPlaceOrRecreate fallback for one not-resized pod.
