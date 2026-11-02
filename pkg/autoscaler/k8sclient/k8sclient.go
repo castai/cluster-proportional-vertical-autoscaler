@@ -30,6 +30,7 @@ import (
 	"github.com/golang/glog"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -397,6 +398,9 @@ type targetClient struct {
 	dryRun    bool
 
 	cachedSpec *targetSpec
+	// rsOwned caches, per ReplicaSet name, whether a Deployment target owns
+	// it (by UID). A targetClient lives for one cycle.
+	rsOwned map[string]bool
 }
 
 // PatchTemplate updates spec.template.spec.containers[].resources on the workload.
@@ -517,7 +521,11 @@ func (t *targetClient) GetOwnedPods(ctx context.Context) ([]v1.Pod, error) {
 	var owned []v1.Pod
 	for i := range list.Items {
 		pod := &list.Items[i]
-		if !t.ownsPod(*spec, pod) {
+		owns, err := t.ownsPod(ctx, *spec, pod)
+		if err != nil {
+			return nil, err
+		}
+		if !owns {
 			continue
 		}
 		owned = append(owned, *pod)
@@ -530,34 +538,57 @@ func (t *targetClient) GetOwnedPods(ctx context.Context) ([]v1.Pod, error) {
 // For ReplicaSet, DaemonSet and StatefulSet targets the pod's controller is
 // the target itself, so it compares UIDs directly.
 //
-// For Deployment targets the pod is owned by a ReplicaSet, which is in turn
-// owned by the Deployment. It relies on the Deployment controller's RS naming
-// convention "<deployment-name>-<pod-template-hash>".
-func (t *targetClient) ownsPod(spec targetSpec, pod *v1.Pod) bool {
+// For Deployment targets the pod is controlled by a ReplicaSet, which must
+// in turn be controlled by the Deployment. The name convention
+// "<deployment>-<pod-template-hash>" is only a cheap first filter: a
+// standalone ReplicaSet or another controller's (e.g. an Argo Rollout with
+// the same name) can match it, so the ReplicaSet's controller UID is checked
+// too, one GET per ReplicaSet per cycle.
+func (t *targetClient) ownsPod(ctx context.Context, spec targetSpec, pod *v1.Pod) (bool, error) {
 	ctrl := metav1.GetControllerOf(pod)
 	if ctrl == nil {
-		return false // orphan or no controlling owner
+		return false, nil // orphan or no controlling owner
 	}
 	ctrlKind := strings.ToLower(ctrl.Kind)
 	switch strings.ToLower(t.meta.Kind) {
 	case "replicaset":
-		return ctrlKind == "replicaset" && spec.UID != "" && ctrl.UID == spec.UID
+		return ctrlKind == "replicaset" && spec.UID != "" && ctrl.UID == spec.UID, nil
 	case "daemonset":
-		return ctrlKind == "daemonset" && spec.UID != "" && ctrl.UID == spec.UID
+		return ctrlKind == "daemonset" && spec.UID != "" && ctrl.UID == spec.UID, nil
 	case "statefulset":
-		return ctrlKind == "statefulset" && spec.UID != "" && ctrl.UID == spec.UID
+		return ctrlKind == "statefulset" && spec.UID != "" && ctrl.UID == spec.UID, nil
 	case "deployment":
-		if ctrlKind != "replicaset" {
-			return false
+		if ctrlKind != "replicaset" || spec.UID == "" {
+			return false, nil
 		}
 		prefix := t.meta.Name + "-"
 		if !strings.HasPrefix(ctrl.Name, prefix) {
-			return false
+			return false, nil
 		}
-		hash := ctrl.Name[len(prefix):]
-		return hash != "" && !strings.Contains(hash, "-")
+		if hash := ctrl.Name[len(prefix):]; hash == "" || strings.Contains(hash, "-") {
+			return false, nil
+		}
+		if owned, ok := t.rsOwned[ctrl.Name]; ok {
+			return owned, nil
+		}
+		rs, err := t.clientset.AppsV1().ReplicaSets(t.meta.Namespace).Get(ctx, ctrl.Name, metav1.GetOptions{})
+		owned := false
+		switch {
+		case apierrors.IsNotFound(err):
+			// Deleted since the pod was listed: the pod is going away too.
+		case err != nil:
+			return false, fmt.Errorf("get ReplicaSet %s/%s: %w", t.meta.Namespace, ctrl.Name, err)
+		default:
+			rsCtrl := metav1.GetControllerOf(rs)
+			owned = rsCtrl != nil && strings.EqualFold(rsCtrl.Kind, "deployment") && rsCtrl.UID == spec.UID
+		}
+		if t.rsOwned == nil {
+			t.rsOwned = make(map[string]bool)
+		}
+		t.rsOwned[ctrl.Name] = owned
+		return owned, nil
 	default:
-		return false
+		return false, nil
 	}
 }
 

@@ -258,6 +258,10 @@ type fakeCluster struct {
 	hasResize     bool           // whether discovery advertises the pods/resize subresource
 	serverVersion string         // GitVersion reported by /version (defaults to v1.34.0)
 	templateDeny  bool           // template PATCH fails with 403 (e.g. RBAC missing patch)
+	// foreignRS names ReplicaSets that look like the Deployment target's
+	// (name "<deployment>-<hash>") but are controlled by something else.
+	// Every other ReplicaSet GET is answered as owned by the target.
+	foreignRS map[string]bool
 }
 
 func ctr(name, cpu string) apiv1.Container {
@@ -489,6 +493,23 @@ func (fc fakeCluster) handler(t *testing.T, rec *requestRecorder) http.HandlerFu
 			default:
 				w.WriteHeader(http.StatusMethodNotAllowed)
 			}
+			return
+		}
+
+		// --- ReplicaSet GET (Deployment ownership check) ---
+		rsPrefix := "/apis/apps/v1/namespaces/" + testNamespace + "/replicasets/"
+		if req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, rsPrefix) {
+			rsName := strings.TrimPrefix(req.URL.Path, rsPrefix)
+			owner := controllerRef("Deployment", name)
+			owner.UID = targetUID(name)
+			if fc.foreignRS[rsName] {
+				owner = controllerRef("Rollout", name)
+				owner.UID = "someone-else"
+			}
+			writeJSON(w, http.StatusOK, &appsv1.ReplicaSet{
+				TypeMeta:   metav1.TypeMeta{Kind: "ReplicaSet", APIVersion: "apps/v1"},
+				ObjectMeta: metav1.ObjectMeta{Name: rsName, Namespace: testNamespace, OwnerReferences: []metav1.OwnerReference{owner}},
+			})
 			return
 		}
 
@@ -1115,5 +1136,31 @@ func TestPollAPIServer_InPlaceTemplateFailureDoesNotBlockResize(t *testing.T) {
 	}
 	if !rec.resizePatched() {
 		t.Error("live pod should still be resized via /resize despite the template failure")
+	}
+}
+
+// TestPollAPIServer_DeploymentOwnershipByUID verifies that a pod whose
+// ReplicaSet matches the Deployment's naming convention but is controlled by
+// something else (here an Argo Rollout of the same name) is neither resized
+// nor recreated; the Deployment's own pod still is resized.
+func TestPollAPIServer_DeploymentOwnershipByUID(t *testing.T) {
+	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+	cluster := fakeCluster{
+		cores:  []int{2, 2, 2, 1},
+		target: deployment("web", ctr("main", "10m")),
+		pods: []apiv1.Pod{
+			ownedPod("web-abc12-mine", "web-abc12", ctr("main", "10m")),
+			ownedPod("web-xyz89-foreign", "web-xyz89", ctr("main", "10m")),
+		},
+		hasResize: true,
+		foreignRS: map[string]bool{"web-xyz89": true},
+	}
+	rec, err := runPoll(t, scenario{cluster: cluster, mode: k8sclient.ResizeModeInPlaceOrRecreate, config: baseConfig})
+	if err != nil {
+		t.Fatalf("pollAPIServer: %v", err)
+	}
+	got := rec.resizedPodNames()
+	if len(got) != 1 || got[0] != "web-abc12-mine" {
+		t.Errorf("resized pods = %v, want [web-abc12-mine] (the foreign ReplicaSet's pod must be skipped)", got)
 	}
 }
