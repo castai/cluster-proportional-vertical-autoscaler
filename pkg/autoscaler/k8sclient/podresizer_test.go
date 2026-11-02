@@ -2765,6 +2765,7 @@ type conflictRig struct {
 	disruptions  int
 	fieldManager []string
 	resizer      *podResizer
+	failPatches  int // the next N /resize PATCHes return 409 Conflict
 }
 
 func newConflictRig(t *testing.T, pod *v1.Pod, policy ConflictPolicy, mode ResizeMode, respond func(body []byte) v1.Pod) *conflictRig {
@@ -2778,6 +2779,13 @@ func newConflictRig(t *testing.T, pod *v1.Pod, policy ConflictPolicy, mode Resiz
 		case req.Method == "PATCH" && strings.HasSuffix(req.URL.Path, "/resize"):
 			cr.patches++
 			cr.fieldManager = append(cr.fieldManager, req.URL.Query().Get("fieldManager"))
+			if cr.failPatches > 0 {
+				cr.failPatches--
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Conflict","code":409}`))
+				return
+			}
 			body, _ := io.ReadAll(req.Body)
 			out := applyResizePatch(pod, body)
 			if respond != nil {
@@ -3036,5 +3044,27 @@ func TestPrecheckResize_QoSCountsInitContainers(t *testing.T) {
 	running(&plain)
 	if reason, rejected := precheckResize(&plain, desired); !rejected || reason != rejectQoSChange {
 		t.Errorf("Guaranteed pod without init containers: (%q, %v), want (%q, true)", reason, rejected, rejectQoSChange)
+	}
+}
+
+// TestResizeRunningPods_TakeBackSurvivesFailedPatch: the one-time take-back
+// after a desired change must not be lost when its PATCH fails (here 409):
+// cpvpa retries on the next poll instead of yielding again under the new
+// desired values.
+func TestResizeRunningPods_TakeBackSurvivesFailedPatch(t *testing.T) {
+	pod := conflictPod(ownedFields(t, "vpa-updater", "resize", "requests.cpu"))
+	cr := newConflictRig(t, &pod, ConflictYield, ResizeModeInPlace, nil)
+
+	cr.run(cpuMem("300m", "64Mi")) // yield
+	cr.failPatches = 1
+	if r := cr.run(cpuMem("400m", "64Mi")); r.Transient != 1 { // take-back PATCH fails
+		t.Fatalf("Transient = %d, want 1", r.Transient)
+	}
+	if r := cr.run(cpuMem("400m", "64Mi")); r.Applied != 1 { // retried, succeeds
+		t.Errorf("retry: Applied = %d, want 1 (take-back must survive a failed PATCH)", r.Applied)
+	}
+	cr.run(cpuMem("400m", "64Mi")) // vpa-updater still owns it: yield again
+	if cr.patches != 2 {
+		t.Errorf("patches = %d, want 2 (failed + retried take-back, then yield)", cr.patches)
 	}
 }

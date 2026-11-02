@@ -358,6 +358,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 			continue
 		} else {
 			result.Applied++
+			r.tracker.finishTakeBack(updated.UID)
 			// The API server accepted the PATCH, but an admission webhook can
 			// still have changed the values. Re-sending would be mutated the
 			// same way every poll; wait for the desired values to change.
@@ -451,14 +452,19 @@ func (r *podResizer) accountNotResized(
 func (r *podResizer) yieldToOtherManager(pod *v1.Pod, desired map[string]v1.ResourceRequirements, desiredKey string, result *resizeResult) bool {
 	yield := r.onConflict != ConflictOverride
 	if e, ok := r.tracker.conflict(pod.UID); ok {
-		if e.desiredKey != desiredKey {
+		switch {
+		case e.takingBack && e.desiredKey == desiredKey:
+			// The take-back PATCH hasn't succeeded yet (conflict, not found,
+			// dry-run): keep trying. A successful PATCH ends it.
+			return false
+		case e.desiredKey != desiredKey && e.manager != admissionManager && yield:
+			r.tracker.startTakeBack(pod.UID, e.manager, desiredKey)
+			glog.Infof("pod=%s/%s: desired resources changed, taking the fields back from %q once",
+				pod.Namespace, pod.Name, e.manager)
+			return false
+		case e.desiredKey != desiredKey:
 			r.tracker.clearConflict(pod.UID)
-			if e.manager != admissionManager && yield {
-				glog.Infof("pod=%s/%s: desired resources changed, taking the fields back from %q once",
-					pod.Namespace, pod.Name, e.manager)
-				return false
-			}
-		} else if e.manager == admissionManager || yield {
+		case e.manager == admissionManager || yield:
 			result.ExternalConflict++
 			r.tracker.clearClock(pod.UID)
 			return true
@@ -1089,6 +1095,7 @@ type rejectionEntry struct {
 type conflictEntry struct {
 	manager    string
 	desiredKey string
+	takingBack bool // desired changed: re-applying once, until a PATCH succeeds
 }
 
 // setConflict records a conflict and reports whether it is new for this pod
@@ -1106,6 +1113,23 @@ func (t *resizeTracker) conflict(uid types.UID) (conflictEntry, bool) {
 	defer t.mu.Unlock()
 	e, ok := t.conflicts[uid]
 	return e, ok
+}
+
+// startTakeBack marks a yielded pod as being taken back for desiredKey.
+func (t *resizeTracker) startTakeBack(uid types.UID, manager, desiredKey string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.conflicts[uid] = conflictEntry{manager: manager, desiredKey: desiredKey, takingBack: true}
+}
+
+// finishTakeBack drops a take-back entry once its PATCH succeeded. Other
+// entries are kept (override mode uses them to warn once).
+func (t *resizeTracker) finishTakeBack(uid types.UID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.conflicts[uid].takingBack {
+		delete(t.conflicts, uid)
+	}
 }
 
 func (t *resizeTracker) clearConflict(uid types.UID) {
