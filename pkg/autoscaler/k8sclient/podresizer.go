@@ -736,7 +736,13 @@ func precheckResize(pod *v1.Pod, desired map[string]v1.ResourceRequirements) (re
 	if requestAboveLimit(pod, desired) {
 		return rejectAboveLimit, true
 	}
-	if podQoS(pod.Spec.Containers) != podQoS(mergedContainers(pod, desired)) {
+	// The QoS class counts init containers too (unchanged by a resize). The
+	// API server compares the new class with the pod's recorded one.
+	oldQoS := pod.Status.QOSClass
+	if oldQoS == "" {
+		oldQoS = podQoS(append(append([]v1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...))
+	}
+	if oldQoS != podQoS(append(append([]v1.Container{}, pod.Spec.InitContainers...), mergedContainers(pod, desired)...)) {
 		return rejectQoSChange, true
 	}
 	return "", false
@@ -792,11 +798,10 @@ func requestAboveLimit(pod *v1.Pod, desired map[string]v1.ResourceRequirements) 
 	return false
 }
 
-// podQoS computes the pod's QoS class (cpu and memory, containers only —
-// init containers are identical on both sides of the comparison) following
-// the upstream algorithm: Guaranteed when every container sets cpu+memory
-// requests equal to limits, BestEffort when nothing is set, Burstable
-// otherwise.
+// podQoS computes a QoS class over the given containers (cpu and memory)
+// following the upstream algorithm: Guaranteed when every container sets
+// cpu+memory requests equal to limits, BestEffort when nothing is set,
+// Burstable otherwise. Callers pass init containers too, as upstream does.
 func podQoS(containers []v1.Container) v1.PodQOSClass {
 	requests, limits := 0, 0
 	isGuaranteed := true

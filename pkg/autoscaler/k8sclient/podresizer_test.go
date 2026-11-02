@@ -3004,3 +3004,37 @@ func TestResizeRunningPods_FallbackSkipsOldSizeRecreation(t *testing.T) {
 		t.Errorf("warnings = %d, want 1", *warnings)
 	}
 }
+
+// TestPrecheckResize_QoSCountsInitContainers: the QoS class includes init
+// containers. An init container without resources makes the pod Burstable
+// whatever its main container does, so a resize from req==lim to req<lim is
+// Burstable→Burstable and must not be rejected as a QoS change; without the
+// init container it is Guaranteed→Burstable and must be.
+func TestPrecheckResize_QoSCountsInitContainers(t *testing.T) {
+	guaranteed := v1.ResourceRequirements{
+		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m"), v1.ResourceMemory: resource.MustParse("64Mi")},
+		Limits:   v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m"), v1.ResourceMemory: resource.MustParse("64Mi")},
+	}
+	desired := map[string]v1.ResourceRequirements{"main": cpuReq("50m")} // cpu request below its limit
+	running := func(p *v1.Pod) {
+		st := guaranteed
+		p.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &st)}
+	}
+
+	withInit := makePod("pod-a", v1.PodRunning, nil, guaranteed)
+	withInit.Spec.InitContainers = []v1.Container{{Name: "init"}}
+	running(&withInit)
+	if reason, rejected := precheckResize(&withInit, desired); rejected {
+		t.Errorf("pod with a resource-less init container: rejected as %q, want accepted (Burstable→Burstable)", reason)
+	}
+	withInit.Status.QOSClass = v1.PodQOSBurstable // as the API server records it
+	if reason, rejected := precheckResize(&withInit, desired); rejected {
+		t.Errorf("with status.qosClass=Burstable: rejected as %q, want accepted", reason)
+	}
+
+	plain := makePod("pod-b", v1.PodRunning, nil, guaranteed)
+	running(&plain)
+	if reason, rejected := precheckResize(&plain, desired); !rejected || reason != rejectQoSChange {
+		t.Errorf("Guaranteed pod without init containers: (%q, %v), want (%q, true)", reason, rejected, rejectQoSChange)
+	}
+}
