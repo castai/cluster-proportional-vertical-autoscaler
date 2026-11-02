@@ -417,12 +417,18 @@ type fakeResizeTarget struct {
 	ownsPod   func(pod *v1.Pod) bool
 	clientset clientset.Interface
 	nodeBound bool
+	// recreatesOld simulates a paused Deployment / partitioned StatefulSet.
+	recreatesOld bool
 	// templateAlreadyCurrent makes PatchTemplate report changed == false,
 	// simulating a workload template that already matches desired.
 	templateAlreadyCurrent bool
 }
 
 func (f *fakeResizeTarget) NodeBound() bool { return f.nodeBound }
+
+func (f *fakeResizeTarget) RecreatesAtNewSize(ctx context.Context) (bool, error) {
+	return !f.recreatesOld, nil
+}
 
 func (f *fakeResizeTarget) OwnsPod(pod *v1.Pod) bool {
 	if f.ownsPod != nil {
@@ -2951,5 +2957,50 @@ func TestResizeRunningPods_MutatedOnAdmission(t *testing.T) {
 				t.Errorf("patches after the desired change = %d, want 2", cr.patches)
 			}
 		})
+	}
+}
+
+// TestResizeRunningPods_FallbackSkipsOldSizeRecreation: when the controller
+// would recreate a pod at the old size (paused Deployment, partitioned
+// StatefulSet), the fallback neither disrupts it nor patches the template,
+// counts it, and warns once.
+func TestResizeRunningPods_FallbackSkipsOldSizeRecreation(t *testing.T) {
+	warnings := countWarnings(t)
+	pod := makePod("pod-a", v1.PodRunning, infeasibleConds(), cpuReq("200m"))
+	pod.Spec.NodeName = "node-1"
+	old := cpuReq("100m")
+	pod.Status.ContainerStatuses = []v1.ContainerStatus{runningStatus("main", &old)}
+	var patches, disruptions, templatePatches int
+	server := recordingPodServer(&pod, &patches, &disruptions)
+	defer server.Close()
+	rig := newResizeRig(t, server)
+	rig.pastGrace("pod-a")
+	for _, selfHeals := range []bool{false, true} {
+		target := &fakeResizeTarget{
+			selector: rig.selector, namespace: "test", clientset: rig.client,
+			selfHeals:    func(context.Context) bool { return selfHeals },
+			patcher:      func(map[string]v1.ResourceRequirements) error { templatePatches++; return nil },
+			recreatesOld: true,
+		}
+		r := &podResizer{
+			resizeMode:     ResizeModeInPlaceOrRecreate,
+			fallbackConfig: ResizeFallbackConfig{GracePeriod: 5 * time.Minute, MaxPodsPerCycle: 1, DisruptionMethod: FallbackDisruptionEviction},
+			clock:          clock.RealClock{}, clientset: rig.client, tracker: rig.tracker,
+		}
+		for cycle := 0; cycle < 2; cycle++ {
+			result, err := r.resizeRunningPods(context.Background(), target, map[string]v1.ResourceRequirements{"main": cpuReq("200m")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.FallbackSkippedOldSize != 1 {
+				t.Errorf("selfHeals=%v cycle %d: FallbackSkippedOldSize = %d, want 1", selfHeals, cycle, result.FallbackSkippedOldSize)
+			}
+		}
+	}
+	if disruptions != 0 || templatePatches != 0 {
+		t.Errorf("disruptions=%d templatePatches=%d, want 0/0", disruptions, templatePatches)
+	}
+	if *warnings != 1 {
+		t.Errorf("warnings = %d, want 1", *warnings)
 	}
 }

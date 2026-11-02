@@ -150,6 +150,16 @@ type resizeTarget interface {
 	// (DaemonSet semantics): a recreated pod asks the SAME node for the same
 	// resources, so recreation cannot fix a pod that does not fit.
 	NodeBound() bool
+	// RecreatesAtNewSize reports whether a pod deleted by the fallback is
+	// recreated from the current template (false for a paused Deployment or
+	// a partitioned StatefulSet).
+	RecreatesAtNewSize(ctx context.Context) (bool, error)
+}
+
+// targetTraits are the per-target facts the fallback needs.
+type targetTraits struct {
+	nodeBound    bool // pods are recreated on the same node
+	recreatesNew bool // a deleted pod comes back from the current template
 }
 
 // podResizer orchestrates in-place pod resizing and recreation fallback.
@@ -176,6 +186,7 @@ type resizeResult struct {
 	RecreateStuck            int // self-healing pods still not resized though the template already matches desired (rollout wedged, likely unschedulable)
 	EvictionBlocked          int // pods whose eviction was blocked by PDB
 	FallbackSkippedNodeBound int // pods whose fallback disruption was skipped: node-bound target + Deferred/Infeasible (recreation cannot fix them)
+	FallbackSkippedOldSize   int // pods whose fallback disruption was skipped: the controller would recreate them at the old size (paused Deployment, partitioned StatefulSet)
 	ExternalConflict         int // pods whose managed fields another manager (or an admission webhook) set to other values
 	Rejected                 int // pods whose resize was skipped: permanently rejected (see tracker rejection reasons)
 	Unsupported              int // subset of Rejected: pods on nodes whose kubelet lacks InPlacePodVerticalScaling
@@ -206,7 +217,13 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 			return result, fmt.Errorf("self-heal check: %w", err)
 		}
 	}
-	nodeBound := target.NodeBound()
+	traits := targetTraits{nodeBound: target.NodeBound(), recreatesNew: true}
+	if r.resizeMode == ResizeModeInPlaceOrRecreate {
+		traits.recreatesNew, err = target.RecreatesAtNewSize(ctx)
+		if err != nil {
+			return result, fmt.Errorf("recreate check: %w", err)
+		}
+	}
 	desiredKey := resourcesKey(desired)
 
 	templatePatched := false
@@ -266,7 +283,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 					firstSeen := r.tracker.markNotResized(pod.UID, now)
 					age := now.Sub(firstSeen)
 					glog.V(2).Infof("pod=%s/%s actuation mismatch (not resized for %s)", pod.Namespace, pod.Name, age)
-					r.maybeFallbackEvict(ctx, pod, now, age, selfHealing, resizeStatusOK, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
+					r.maybeFallbackEvict(ctx, pod, now, age, selfHealing, resizeStatusOK, desired, traits, ensureTemplate, &evictedThisCycle, &result)
 				case actuationUnknown:
 					// A running container with nil status.resources: the node's
 					// kubelet has no in-place support, so it cannot confirm
@@ -279,7 +296,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 					r.tracker.clear(pod.UID)
 				}
 			} else {
-				r.accountNotResized(ctx, pod, status, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
+				r.accountNotResized(ctx, pod, status, now, selfHealing, desired, traits, ensureTemplate, &evictedThisCycle, &result)
 			}
 			continue
 		}
@@ -298,11 +315,11 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 		// so InPlaceOrRecreate can converge it via recreation, which does not
 		// depend on in-place support.
 		if reason, rejected := r.tracker.rejection(pod.UID, desiredKey); rejected {
-			r.noteRejection(ctx, pod, reason, "", now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
+			r.noteRejection(ctx, pod, reason, "", now, selfHealing, desired, traits, ensureTemplate, &evictedThisCycle, &result)
 			continue
 		}
 		if reason, rejected := precheckResize(pod, desired); rejected {
-			r.noteRejection(ctx, pod, reason, "", now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
+			r.noteRejection(ctx, pod, reason, "", now, selfHealing, desired, traits, ensureTemplate, &evictedThisCycle, &result)
 			continue
 		}
 
@@ -332,7 +349,7 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 				// the node. Unrecognized causes are re-checked when the
 				// desired values change, like other desired-dependent ones.
 				reason, cause := rejectionReasonFromError(patchErr)
-				r.noteRejection(ctx, pod, reason, cause, now, selfHealing, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
+				r.noteRejection(ctx, pod, reason, cause, now, selfHealing, desired, traits, ensureTemplate, &evictedThisCycle, &result)
 				continue
 			}
 			result.Errors++
@@ -376,14 +393,14 @@ func (r *podResizer) resizeRunningPods(ctx context.Context, target resizeTarget,
 				firstSeen := r.tracker.markNotResized(updated.UID, now)
 				age := now.Sub(firstSeen)
 				glog.V(2).Infof("pod=%s/%s actuation mismatch (not resized for %s)", updated.Namespace, updated.Name, age)
-				r.maybeFallbackEvict(ctx, updated, now, age, selfHealing, resizeStatusOK, desired, nodeBound, ensureTemplate, &evictedThisCycle, &result)
+				r.maybeFallbackEvict(ctx, updated, now, age, selfHealing, resizeStatusOK, desired, traits, ensureTemplate, &evictedThisCycle, &result)
 			case actuationUnknown:
 				// Spec now matches desired; see the unpatched-pod case above.
 				result.ActuationUnknown++
 				r.tracker.clear(updated.UID)
 			}
 		} else {
-			r.accountNotResized(ctx, updated, status, now, selfHealing, desired, nodeBound,
+			r.accountNotResized(ctx, updated, status, now, selfHealing, desired, traits,
 				ensureTemplate, &evictedThisCycle, &result)
 		}
 	}
@@ -399,7 +416,7 @@ func (r *podResizer) accountNotResized(
 	now time.Time,
 	selfHeals bool,
 	desired map[string]v1.ResourceRequirements,
-	nodeBound bool,
+	traits targetTraits,
 	ensureTemplate func() (bool, error),
 	evictedThisCycle *int,
 	result *resizeResult,
@@ -417,7 +434,7 @@ func (r *podResizer) accountNotResized(
 	firstSeen := r.tracker.markNotResized(pod.UID, now)
 	age := now.Sub(firstSeen)
 	glog.V(2).Infof("pod=%s/%s resize %s (not resized for %s)", pod.Namespace, pod.Name, status, age)
-	r.maybeFallbackEvict(ctx, pod, now, age, selfHeals, status, desired, nodeBound, ensureTemplate, evictedThisCycle, result)
+	r.maybeFallbackEvict(ctx, pod, now, age, selfHeals, status, desired, traits, ensureTemplate, evictedThisCycle, result)
 }
 
 // yieldToOtherManager handles a pod whose fields cpvpa wants to change were
@@ -548,7 +565,7 @@ func (r *podResizer) noteRejection(
 	now time.Time,
 	selfHeals bool,
 	desired map[string]v1.ResourceRequirements,
-	nodeBound bool,
+	traits targetTraits,
 	ensureTemplate func() (bool, error),
 	evictedThisCycle *int,
 	result *resizeResult,
@@ -572,7 +589,7 @@ func (r *podResizer) noteRejection(
 				pod.Namespace, pod.Name, reason)
 		}
 	}
-	r.accountNotResized(ctx, pod, resizeStatusRejected, now, selfHeals, desired, nodeBound, ensureTemplate, evictedThisCycle, result)
+	r.accountNotResized(ctx, pod, resizeStatusRejected, now, selfHeals, desired, traits, ensureTemplate, evictedThisCycle, result)
 }
 
 // hasActuationError reports whether the kubelet reported a resize actuation
@@ -855,7 +872,7 @@ func (r *podResizer) maybeFallbackEvict(
 	selfHeals bool,
 	status resizeStatus,
 	desired map[string]v1.ResourceRequirements,
-	nodeBound bool,
+	traits targetTraits,
 	ensureTemplate func() (bool, error),
 	evictedThisCycle *int,
 	result *resizeResult,
@@ -869,10 +886,10 @@ func (r *podResizer) maybeFallbackEvict(
 	// current allocation already fits the node, so the replacement can start.
 	// So are rejections (resizeStatusRejected), e.g. a kubelet without
 	// in-place support: recreation is the only way such a pod converges.
-	if nodeBound && (status == resizeStatusDeferred ||
+	if traits.nodeBound && (status == resizeStatusDeferred ||
 		(status == resizeStatusInfeasible && !hasActuationError(pod))) {
 		result.FallbackSkippedNodeBound++
-		if r.tracker.warnedNodeBound(pod.UID) {
+		if r.tracker.firstFallbackSkip(pod.UID) {
 			msg := fmt.Sprintf("pod=%s/%s on node-bound target: not recreating %s pod on node %q — "+
 				"the replacement would ask the same node for the same resources (desired %s) and stay Pending",
 				pod.Namespace, pod.Name, status, pod.Spec.NodeName, formatResourceRequests(desired))
@@ -881,6 +898,20 @@ func (r *podResizer) maybeFallbackEvict(
 					node.Status.Allocatable.Cpu().String(), node.Status.Allocatable.Memory().String())
 			}
 			glog.Error(msg)
+		}
+		return
+	}
+	// A paused Deployment or a partitioned StatefulSet would recreate the
+	// pod from the old template (old ReplicaSet / current revision): it
+	// would come back at the old size and be disrupted again every grace
+	// period. And patching the template would roll pods when the rollout is
+	// resumed. Leave it to whoever paused it.
+	if !traits.recreatesNew {
+		result.FallbackSkippedOldSize++
+		if r.tracker.firstFallbackSkip(pod.UID) {
+			logWarningf("pod=%s/%s not resized for %s, but not recreating it: the target is paused or partitioned, "+
+				"so its controller would recreate it at the old size (desired %s)",
+				pod.Namespace, pod.Name, age, formatResourceRequests(desired))
 		}
 		return
 	}
@@ -1122,9 +1153,10 @@ func (t *resizeTracker) rejection(uid types.UID, desiredKey string) (resizeRejec
 	return e.reason, true
 }
 
-// warnedNodeBound reports (once per pod UID) whether the node-bound fallback
-// skip warning has already been emitted, recording it when it has not.
-func (t *resizeTracker) warnedNodeBound(uid types.UID) bool {
+// firstFallbackSkip reports, once per pod UID, that the fallback declined to
+// disrupt the pod (node-bound or paused/partitioned target), so the reason
+// is logged once instead of every poll.
+func (t *resizeTracker) firstFallbackSkip(uid types.UID) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.fallbackWarned[uid] {

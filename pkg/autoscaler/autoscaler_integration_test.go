@@ -1007,74 +1007,65 @@ func TestPollAPIServer_RequestAboveLimit(t *testing.T) {
 	}
 }
 
-// TestPollAPIServer_Fallback_PausedDeploymentEvicts verifies that a paused
-// Deployment accepts template patches but never rolls, so it must be treated
-// as non-self-healing — the fallback disrupts the stuck pod directly instead
-// of waiting for a rollout that will not happen.
-func TestPollAPIServer_Fallback_PausedDeploymentEvicts(t *testing.T) {
+// TestPollAPIServer_PausedOrPartitionedTargetsLeftAlone verifies that cpvpa
+// never touches the template of a paused Deployment (it would roll every pod
+// on resume) or a partitioned StatefulSet (it would roll the ordinals at or
+// above the partition right away), and that the fallback doesn't disrupt
+// their stuck pods: the controller would recreate them from the old template,
+// at the old size, and they would be disrupted again every grace period.
+// Covers both in-place modes; live pods are still resized in place.
+func TestPollAPIServer_PausedOrPartitionedTargetsLeftAlone(t *testing.T) {
 	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
 	const grace = 5 * time.Minute
-
-	dep := deployment("test-dep", ctr("main", "10m"))
-	dep.Spec.Paused = true
 	stuck := apiv1.PodCondition{Type: apiv1.PodResizePending, Status: apiv1.ConditionTrue, Reason: apiv1.PodReasonInfeasible}
 
-	cluster := fakeCluster{
-		cores:     []int{2, 2, 2, 1},
-		target:    dep,
-		pods:      []apiv1.Pod{ownedPod("test-dep-abc-def", "test-dep-abc", ctr("main", "17m"), stuck)},
-		hasResize: true,
+	paused := func() fakeCluster {
+		dep := deployment("test-dep", ctr("main", "10m"))
+		dep.Spec.Paused = true
+		return fakeCluster{
+			cores:     []int{2, 2, 2, 1},
+			target:    dep,
+			pods:      []apiv1.Pod{ownedPod("test-dep-abc-def", "test-dep-abc", ctr("main", "17m"), stuck)},
+			hasResize: true,
+		}
 	}
-	rec, err := runPoll(t, scenario{
-		cluster:  cluster,
-		mode:     k8sclient.ResizeModeInPlaceOrRecreate,
-		fallback: k8sclient.ResizeFallbackConfig{GracePeriod: grace, MaxPodsPerCycle: 1, DisruptionMethod: k8sclient.FallbackDisruptionEviction},
-		config:   baseConfig,
-		cycles:   2,
-		advance:  grace + time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("pollAPIServer: %v", err)
+	partitioned := func() fakeCluster {
+		partition := int32(2)
+		ss := statefulset("test-ss", appsv1.RollingUpdateStatefulSetStrategyType, ctr("main", "10m"))
+		ss.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{Partition: &partition}
+		return fakeCluster{
+			cores:     []int{2, 2, 2, 1},
+			target:    ss,
+			pods:      []apiv1.Pod{directlyOwnedPod(t, "test-ss-pod", ss, ctr("main", "17m"), stuck)},
+			hasResize: true,
+		}
 	}
-	if rec.evictionCount() != 1 {
-		t.Errorf("eviction count = %d, want 1 (paused Deployment must take the direct-disruption path)", rec.evictionCount())
-	}
-	if rec.deleteCount() != 0 {
-		t.Errorf("delete count = %d, want 0 (eviction configured)", rec.deleteCount())
-	}
-}
-
-// TestPollAPIServer_Fallback_PartitionedStatefulSetEvicts verifies that a
-// RollingUpdate StatefulSet with partition > 0 only rolls pods at or above the
-// partition, so pods below it must take the direct-disruption path.
-func TestPollAPIServer_Fallback_PartitionedStatefulSetEvicts(t *testing.T) {
-	const baseConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
-	const grace = 5 * time.Minute
-
-	partition := int32(2)
-	ss := statefulset("test-ss", appsv1.RollingUpdateStatefulSetStrategyType, ctr("main", "10m"))
-	ss.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{Partition: &partition}
-	stuck := apiv1.PodCondition{Type: apiv1.PodResizePending, Status: apiv1.ConditionTrue, Reason: apiv1.PodReasonInfeasible}
-
-	cluster := fakeCluster{
-		cores:     []int{2, 2, 2, 1},
-		target:    ss,
-		pods:      []apiv1.Pod{directlyOwnedPod(t, "test-ss-pod", ss, ctr("main", "17m"), stuck)},
-		hasResize: true,
-	}
-	rec, err := runPoll(t, scenario{
-		cluster:  cluster,
-		mode:     k8sclient.ResizeModeInPlaceOrRecreate,
-		fallback: k8sclient.ResizeFallbackConfig{GracePeriod: grace, MaxPodsPerCycle: 1, DisruptionMethod: k8sclient.FallbackDisruptionEviction},
-		config:   baseConfig,
-		cycles:   2,
-		advance:  grace + time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("pollAPIServer: %v", err)
-	}
-	if rec.evictionCount() != 1 {
-		t.Errorf("eviction count = %d, want 1 (partitioned StatefulSet must take the direct-disruption path)", rec.evictionCount())
+	for _, target := range []struct {
+		name    string
+		cluster func() fakeCluster
+	}{{"paused Deployment", paused}, {"partitioned StatefulSet", partitioned}} {
+		for _, mode := range []k8sclient.ResizeMode{k8sclient.ResizeModeInPlace, k8sclient.ResizeModeInPlaceOrRecreate} {
+			t.Run(target.name+"/"+string(mode), func(t *testing.T) {
+				rec, err := runPoll(t, scenario{
+					cluster:  target.cluster(),
+					mode:     mode,
+					fallback: k8sclient.ResizeFallbackConfig{GracePeriod: grace, MaxPodsPerCycle: 1, DisruptionMethod: k8sclient.FallbackDisruptionEviction},
+					config:   baseConfig,
+					cycles:   3,
+					advance:  grace + time.Minute,
+				})
+				if err != nil {
+					t.Fatalf("pollAPIServer: %v", err)
+				}
+				if rec.templatePatched() {
+					t.Error("template must not be patched (it would roll pods on resume / above the partition)")
+				}
+				if rec.evictionCount() != 0 || rec.deleteCount() != 0 {
+					t.Errorf("evictions=%d deletes=%d, want 0/0 (the pod would come back at the old size)",
+						rec.evictionCount(), rec.deleteCount())
+				}
+			})
+		}
 	}
 }
 

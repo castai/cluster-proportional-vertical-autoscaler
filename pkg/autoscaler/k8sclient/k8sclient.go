@@ -373,6 +373,16 @@ type targetSpec struct {
 	UID           types.UID
 	PodSelector   labels.Selector
 	IsSelfHealing bool
+	// TemplatePatchSafe: patching the template never rolls pods, now or
+	// later (bare ReplicaSets, OnDelete DaemonSets/StatefulSets). Not true
+	// for a paused Deployment (it rolls on resume) or a partitioned
+	// StatefulSet (it rolls the ordinals at or above the partition).
+	TemplatePatchSafe bool
+	// RecreatesAtNewSize: a pod deleted by the fallback is recreated from
+	// the current template. False for a paused Deployment (its old
+	// ReplicaSet recreates it) and a partitioned StatefulSet (ordinals below
+	// the partition come back at the current revision).
+	RecreatesAtNewSize bool
 	// TemplateResources is the current per-container resources in the
 	// workload's pod template, captured when the spec is fetched. It lets
 	// PatchTemplate detect when a template patch would be a no-op.
@@ -574,9 +584,10 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		}
 		selector = dep.Spec.Selector
 		spec.UID = dep.UID
-		// A paused Deployment never rolls, so a template patch alone would
-		// leave stuck pods stuck forever.
+		// A paused Deployment neither rolls on a template patch nor
+		// recreates pods from the new template (its old ReplicaSet does).
 		spec.IsSelfHealing = !dep.Spec.Paused
+		spec.RecreatesAtNewSize = !dep.Spec.Paused
 		spec.TemplateResources = containerResources(dep.Spec.Template.Spec.Containers)
 	case "daemonset":
 		ds, err := t.clientset.AppsV1().DaemonSets(t.meta.Namespace).Get(ctx, t.meta.Name, metav1.GetOptions{})
@@ -585,7 +596,10 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		}
 		selector = ds.Spec.Selector
 		spec.UID = ds.UID
-		spec.IsSelfHealing = ds.Spec.UpdateStrategy.Type != appsv1.OnDeleteDaemonSetStrategyType
+		onDelete := ds.Spec.UpdateStrategy.Type == appsv1.OnDeleteDaemonSetStrategyType
+		spec.IsSelfHealing = !onDelete
+		spec.TemplatePatchSafe = onDelete
+		spec.RecreatesAtNewSize = true
 		spec.TemplateResources = containerResources(ds.Spec.Template.Spec.Containers)
 	case "replicaset":
 		rs, err := t.clientset.AppsV1().ReplicaSets(t.meta.Namespace).Get(ctx, t.meta.Name, metav1.GetOptions{})
@@ -594,6 +608,8 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		}
 		selector = rs.Spec.Selector
 		spec.UID = rs.UID
+		spec.TemplatePatchSafe = true
+		spec.RecreatesAtNewSize = true
 		spec.TemplateResources = containerResources(rs.Spec.Template.Spec.Containers)
 	case "statefulset":
 		ss, err := t.clientset.AppsV1().StatefulSets(t.meta.Namespace).Get(ctx, t.meta.Name, metav1.GetOptions{})
@@ -602,11 +618,14 @@ func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {
 		}
 		selector = ss.Spec.Selector
 		spec.UID = ss.UID
-		// A partitioned rollout only touches pods at or above the partition
-		// ordinal; pods below it would never be recreated by the controller.
+		// A partitioned rollout only rolls ordinals at or above the
+		// partition; pods below it are recreated at the current revision.
+		onDelete := ss.Spec.UpdateStrategy.Type == appsv1.OnDeleteStatefulSetStrategyType
 		ru := ss.Spec.UpdateStrategy.RollingUpdate
-		spec.IsSelfHealing = ss.Spec.UpdateStrategy.Type == appsv1.RollingUpdateStatefulSetStrategyType &&
-			(ru == nil || ru.Partition == nil || *ru.Partition <= 0)
+		partitioned := !onDelete && ru != nil && ru.Partition != nil && *ru.Partition > 0
+		spec.IsSelfHealing = !onDelete && !partitioned
+		spec.TemplatePatchSafe = onDelete
+		spec.RecreatesAtNewSize = !partitioned
 		spec.TemplateResources = containerResources(ss.Spec.Template.Spec.Containers)
 	default:
 		return nil, fmt.Errorf("unknown target kind: %s", t.meta.Kind)
@@ -631,6 +650,26 @@ func (t *targetClient) IsSelfHealing(ctx context.Context) (bool, error) {
 	return spec.IsSelfHealing, nil
 }
 
+// TemplatePatchSafe reports whether patching the template never rolls pods,
+// now or later.
+func (t *targetClient) TemplatePatchSafe(ctx context.Context) (bool, error) {
+	spec, err := t.trySyncSpec(ctx)
+	if err != nil {
+		return false, err
+	}
+	return spec.TemplatePatchSafe, nil
+}
+
+// RecreatesAtNewSize reports whether a pod deleted by the fallback comes back
+// from the current template.
+func (t *targetClient) RecreatesAtNewSize(ctx context.Context) (bool, error) {
+	spec, err := t.trySyncSpec(ctx)
+	if err != nil {
+		return false, err
+	}
+	return spec.RecreatesAtNewSize, nil
+}
+
 // NodeBound reports whether the target's pods are pinned to their node
 // (DaemonSet): a recreated pod asks the same node for the same resources, so
 // recreation cannot fix a pod that does not fit its node.
@@ -642,7 +681,7 @@ func (t *targetClient) NodeBound() bool {
 // Each underlying pod is already logged once when it first shows up; the
 // summary repeats the totals.
 type cycleProblems struct {
-	Rejected, Unsupported, FallbackSkippedNodeBound, ExternalConflict, Errors int
+	Rejected, Unsupported, FallbackSkippedNodeBound, FallbackSkippedOldSize, ExternalConflict, Errors int
 }
 
 // logCycle logs the cycle summary at V(1), raised to Warning when the
@@ -653,6 +692,7 @@ func (k *k8sClient) logCycle(result resizeResult) {
 		Rejected:                 result.Rejected,
 		Unsupported:              result.Unsupported,
 		FallbackSkippedNodeBound: result.FallbackSkippedNodeBound,
+		FallbackSkippedOldSize:   result.FallbackSkippedOldSize,
 		ExternalConflict:         result.ExternalConflict,
 		Errors:                   result.Errors,
 	}
@@ -712,21 +752,22 @@ func (k *k8sClient) UpdateResources(ctx context.Context, resources map[string]v1
 		return err
 	}
 
-	// Non-self-healing targets (bare ReplicaSets, OnDelete DaemonSets and
-	// StatefulSets) leave existing pods alone on a template change, so patch
-	// the template before resizing pods: every pod created afterwards starts
-	// at the right size instead of waiting to be resized in place. The call
-	// is a no-op once the template matches desired. Self-healing targets
-	// keep the original template until the fallback deliberately triggers a
-	// rollout. A failed template patch (RBAC, conflict, request above limit)
-	// must not block in-place resizing of the live pods: it is reported
-	// after the resize pass instead.
-	selfHeals, err := target.IsSelfHealing(ctx)
+	// Targets whose template patch never rolls pods (bare ReplicaSets,
+	// OnDelete DaemonSets and StatefulSets) get the template patched before
+	// pods are resized: every pod created afterwards starts at the right
+	// size instead of waiting to be resized in place. The call is a no-op
+	// once the template matches desired. All other targets keep the
+	// original template (InPlace never triggers a rollout, including a
+	// deferred one on resuming a paused Deployment); only the
+	// InPlaceOrRecreate fallback may change it. A failed template patch
+	// (RBAC, conflict, request above limit) must not block in-place
+	// resizing of the live pods: it is reported after the resize pass.
+	patchSafe, err := target.TemplatePatchSafe(ctx)
 	if err != nil {
-		return fmt.Errorf("self-heal check: %w", err)
+		return fmt.Errorf("template check: %w", err)
 	}
 	var templateErr error
-	if !selfHeals {
+	if patchSafe {
 		if _, err := target.PatchTemplate(ctx, resources); err != nil {
 			templateErr = fmt.Errorf("template patch: %w", err)
 		}
