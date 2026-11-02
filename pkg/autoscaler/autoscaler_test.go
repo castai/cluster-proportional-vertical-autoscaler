@@ -357,3 +357,43 @@ func TestPollAPIServer_CycleDeadlineFloor(t *testing.T) {
 		}
 	}
 }
+
+// failingK8sClient fails every UpdateResources call and counts them.
+type failingK8sClient struct{ updates int }
+
+func (c *failingK8sClient) GetClusterSize(context.Context) (*realk8sclient.ClusterSize, error) {
+	return &realk8sclient.ClusterSize{Nodes: 1, Cores: 1}, nil
+}
+
+func (c *failingK8sClient) UpdateResources(context.Context, map[string]apiv1.ResourceRequirements, bool) error {
+	c.updates++
+	return fmt.Errorf("template patch: forbidden")
+}
+
+// TestPollAPIServer_UpdateLoggedOncePerValue: while UpdateResources keeps
+// failing, the update is still retried every poll, but the "Updating
+// resource" block is logged once per distinct computed value.
+func TestPollAPIServer_UpdateLoggedOncePerValue(t *testing.T) {
+	logged := 0
+	orig := logResourceUpdate
+	logResourceUpdate = func(*realk8sclient.ClusterSize, map[string]apiv1.ResourceRequirements) { logged++ }
+	defer func() { logResourceUpdate = orig }()
+
+	cfg := ScaleConfig{}
+	if err := json.Unmarshal([]byte(`{"main":{"requests":{"cpu":{"base":"10m"}}}}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	client := &failingK8sClient{}
+	as := &AutoScaler{k8sClient: client, defaultConfig: cfg, pollPeriod: 5 * time.Second}
+	for i := 0; i < 3; i++ {
+		if err := as.pollAPIServer(context.Background()); err == nil {
+			t.Fatal("expected the update error to be returned")
+		}
+	}
+	if client.updates != 3 {
+		t.Errorf("UpdateResources calls = %d, want 3 (still retried every poll)", client.updates)
+	}
+	if logged != 1 {
+		t.Errorf("update logged %d times, want 1", logged)
+	}
+}

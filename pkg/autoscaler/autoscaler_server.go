@@ -44,7 +44,8 @@ type AutoScaler struct {
 	lastFileInfo  os.FileInfo
 	currentConfig ScaleConfig
 	lastReqs      map[string]apiv1.ResourceRequirements
-	lastInvalid   string // last logged config violation, so it is logged once
+	lastInvalid   string                                // last logged config violation, so it is logged once
+	lastLogged    map[string]apiv1.ResourceRequirements // last values logged as "Updating resource"
 	pollPeriod    time.Duration
 	clock         clock.WithTicker
 	stopCh        chan struct{}
@@ -190,10 +191,12 @@ func (s *AutoScaler) pollAPIServer(ctx context.Context) error {
 
 	reqsChanged := !reflect.DeepEqual(s.lastReqs, newReqs)
 
-	if reqsChanged {
-		glog.V(0).Infof("Updating resource for nodes: %d, cores: %d",
-			clusterSize.Nodes, clusterSize.Cores)
-		logRequirements(newReqs)
+	// Logged once per distinct value. reqsChanged stays true while
+	// UpdateResources keeps failing (so Recreate retries the patch), which
+	// would otherwise repeat this block every poll.
+	if !reflect.DeepEqual(s.lastLogged, newReqs) {
+		logResourceUpdate(clusterSize, newReqs)
+		s.lastLogged = newReqs
 	}
 
 	// UpdateResources is called every cycle for the in-place modes (so newly
@@ -217,6 +220,13 @@ func cycleTimeout(pollPeriod time.Duration) time.Duration {
 		return minCycleTimeout
 	}
 	return pollPeriod
+}
+
+// logResourceUpdate logs new computed resources; a variable so tests can
+// count calls.
+var logResourceUpdate = func(cluster *k8sclient.ClusterSize, reqs map[string]apiv1.ResourceRequirements) {
+	glog.V(0).Infof("Updating resource for nodes: %d, cores: %d", cluster.Nodes, cluster.Cores)
+	logRequirements(reqs)
 }
 
 func logRequirements(reqs map[string]apiv1.ResourceRequirements) {
