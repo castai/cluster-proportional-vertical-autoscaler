@@ -322,3 +322,38 @@ func TestPollAPIServer_ComputedRequestAboveLimit(t *testing.T) {
 		t.Errorf("UpdateResources calls = %v, want %v", client.calls, want)
 	}
 }
+
+// deadlineK8sClient records the deadline each call sees.
+type deadlineK8sClient struct{ remaining time.Duration }
+
+func (c *deadlineK8sClient) GetClusterSize(ctx context.Context) (*realk8sclient.ClusterSize, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		c.remaining = time.Until(dl)
+	}
+	return &realk8sclient.ClusterSize{Nodes: 1, Cores: 1}, nil
+}
+
+func (c *deadlineK8sClient) UpdateResources(context.Context, map[string]apiv1.ResourceRequirements, bool) error {
+	return nil
+}
+
+// TestPollAPIServer_CycleDeadlineFloor: a short poll period must not shrink
+// the cycle deadline below minCycleTimeout (master had no deadline at all;
+// a 1s deadline would time out the node LIST on large clusters every poll).
+func TestPollAPIServer_CycleDeadlineFloor(t *testing.T) {
+	for _, tc := range []struct {
+		period, wantAtLeast time.Duration
+	}{
+		{time.Second, minCycleTimeout - time.Second},
+		{2 * time.Minute, 2*time.Minute - time.Second},
+	} {
+		client := &deadlineK8sClient{}
+		as := &AutoScaler{k8sClient: client, pollPeriod: tc.period, defaultConfig: ScaleConfig{}}
+		if err := as.pollAPIServer(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if client.remaining < tc.wantAtLeast {
+			t.Errorf("poll period %s: cycle deadline %s, want at least %s", tc.period, client.remaining, tc.wantAtLeast)
+		}
+	}
+}

@@ -216,7 +216,7 @@ Only when using `--resize-fallback-disruption=delete` instead: add `pods: [delet
 
 Both `InPlace` and `InPlaceOrRecreate` need the in-place RBAC add-on.
 
-In the in-place modes, `--poll-period-seconds` also bounds how long one resize cycle may run: cpvpa tries to resize every matching pod within a single poll period and resumes on the next poll if it can't finish. Already-resized pods are skipped without any API calls, so large workloads converge over a few cycles. For very large workloads, raise the poll period rather than expecting a single cycle to process everything.
+In the in-place modes, `--poll-period-seconds` also bounds how long one resize cycle may run (never less than 30s): cpvpa tries to resize every matching pod within that time and resumes on the next poll if it can't finish. Already-resized pods are skipped without any API calls, so large workloads converge over a few cycles. For very large workloads, raise the poll period rather than expecting a single cycle to process everything.
 
 ### Flags
 

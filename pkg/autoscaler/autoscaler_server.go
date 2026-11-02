@@ -117,9 +117,12 @@ func (s *AutoScaler) Run() {
 }
 
 func (s *AutoScaler) pollAPIServer(ctx context.Context) error {
-	// Bound one poll cycle (cluster-size read + resize) by the poll period;
-	// shutdown cancellation is inherited from the ctx passed by Run.
-	ctx, cancel := context.WithTimeout(ctx, s.pollPeriod)
+	// Bound one poll cycle (cluster-size read + resize) by the poll period,
+	// but never below minCycleTimeout: with a short poll period on a large
+	// cluster, listing the nodes alone could otherwise time out every poll.
+	// Cycles can't overlap either way (one goroutine; the ticker drops ticks
+	// while a cycle runs). Shutdown cancellation is inherited from Run's ctx.
+	ctx, cancel := context.WithTimeout(ctx, cycleTimeout(s.pollPeriod))
 	defer cancel()
 
 	// Query the apiserver for the cluster status --- number of nodes and cores
@@ -203,6 +206,17 @@ func (s *AutoScaler) pollAPIServer(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// minCycleTimeout is the shortest deadline a poll cycle gets.
+const minCycleTimeout = 30 * time.Second
+
+// cycleTimeout is the deadline for one poll cycle.
+func cycleTimeout(pollPeriod time.Duration) time.Duration {
+	if pollPeriod < minCycleTimeout {
+		return minCycleTimeout
+	}
+	return pollPeriod
 }
 
 func logRequirements(reqs map[string]apiv1.ResourceRequirements) {
