@@ -84,3 +84,56 @@ func TestIsTargetFormatValid(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateFlags(t *testing.T) {
+	t.Run("valid config", func(t *testing.T) {
+		c := NewAutoScalerConfig()
+		c.Target = "deployment/thing"
+		c.Namespace = "default"
+		c.DefaultConfig = `{"main":{"requests":{"cpu":{"base":"10m","step":"1m","coresPerStep":1}}}}`
+		if err := c.ValidateFlags(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("invalid grace period", func(t *testing.T) {
+		c := NewAutoScalerConfig()
+		c.Target = "deployment/thing"
+		c.Namespace = "default"
+		c.DefaultConfig = `{"main":{"requests":{"cpu":{"base":"10m"}}}}`
+		c.ResizeFallbackGracePeriod = 0
+		if err := c.ValidateFlags(); err == nil {
+			t.Fatal("expected error for zero grace period")
+		}
+	})
+
+	t.Run("invalid max pods per cycle", func(t *testing.T) {
+		c := NewAutoScalerConfig()
+		c.Target = "deployment/thing"
+		c.Namespace = "default"
+		c.DefaultConfig = `{"main":{"requests":{"cpu":{"base":"10m"}}}}`
+		c.ResizeFallbackMaxPodsPerCycle = 0
+		if err := c.ValidateFlags(); err == nil {
+			t.Fatal("expected error for zero max pods per cycle")
+		}
+	})
+}
+
+func TestValidateFlags_ResizeOnConflict(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		wantErr bool
+	}{{"yield", false}, {"override", false}, {"", true}, {"fight", true}} {
+		c := NewAutoScalerConfig()
+		c.Target = "deployment/thing"
+		c.Namespace = "default"
+		c.DefaultConfig = `{"main":{"requests":{"cpu":{"base":"10m"}}}}`
+		c.ResizeOnConflict = tc.value
+		if err := c.ValidateFlags(); (err != nil) != tc.wantErr {
+			t.Errorf("--resize-on-conflict=%q: err = %v, wantErr %v", tc.value, err, tc.wantErr)
+		}
+	}
+	if got := NewAutoScalerConfig().ResizeOnConflict; got != "yield" {
+		t.Errorf("default --resize-on-conflict = %q, want yield", got)
+	}
+}

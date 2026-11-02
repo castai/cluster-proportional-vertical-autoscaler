@@ -17,13 +17,16 @@ limitations under the License.
 package autoscaler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"testing"
 	"time"
 
+	realk8sclient "github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/autoscaler/k8sclient"
 	k8sclient "github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/autoscaler/k8sclient/testing"
+	apiv1 "k8s.io/api/core/v1"
 	clocktesting "k8s.io/utils/clock/testing"
 )
 
@@ -153,7 +156,7 @@ func TestCalculatePerCores(t *testing.T) {
 			t.Fatalf("invalid default config: %v", err)
 		}
 
-		sz, err := mockK8s.GetClusterSize()
+		sz, err := mockK8s.GetClusterSize(context.Background())
 		if err != nil {
 			t.Errorf("failed to get cluster size")
 		}
@@ -250,7 +253,7 @@ func TestCalculatePerNodes(t *testing.T) {
 			t.Fatalf("invalid default config: %v", err)
 		}
 
-		sz, err := mockK8s.GetClusterSize()
+		sz, err := mockK8s.GetClusterSize(context.Background())
 		if err != nil {
 			t.Errorf("failed to get cluster size")
 		}
@@ -258,5 +261,139 @@ func TestCalculatePerNodes(t *testing.T) {
 		if val != tt.expVal {
 			t.Errorf("expected %d got %d", tt.expVal, val)
 		}
+	}
+}
+
+// recordingK8sClient is a K8sClient whose cluster size can change between
+// polls and which records every UpdateResources call.
+type recordingK8sClient struct {
+	nodes int
+	calls []recordedUpdate
+}
+
+type recordedUpdate struct {
+	cpuRequest string
+	changed    bool
+}
+
+func (c *recordingK8sClient) GetClusterSize(ctx context.Context) (*realk8sclient.ClusterSize, error) {
+	return &realk8sclient.ClusterSize{Nodes: c.nodes, Cores: c.nodes}, nil
+}
+
+func (c *recordingK8sClient) UpdateResources(ctx context.Context, resources map[string]apiv1.ResourceRequirements, reqsChanged bool) error {
+	q := resources["main"].Requests[apiv1.ResourceCPU]
+	c.calls = append(c.calls, recordedUpdate{cpuRequest: q.String(), changed: reqsChanged})
+	return nil
+}
+
+// TestPollAPIServer_ComputedRequestAboveLimit verifies that a config whose
+// computed request outgrows its computed limit is never applied: the last
+// valid resources are kept (and still passed on, so in-place modes keep
+// converging), nothing is applied before a valid value exists, and the
+// update resumes once the computed values are valid again.
+func TestPollAPIServer_ComputedRequestAboveLimit(t *testing.T) {
+	// request: 100m + 100m per node; limit: fixed 300m.
+	const cfgJSON = `{"main":{
+		"requests":{"cpu":{"base":"100m","step":"100m","nodesPerStep":1}},
+		"limits":{"cpu":{"base":"300m"}}}}`
+	cfg := ScaleConfig{}
+	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	client := &recordingK8sClient{}
+	as := &AutoScaler{k8sClient: client, defaultConfig: cfg, pollPeriod: 5 * time.Second}
+	poll := func(nodes int) {
+		t.Helper()
+		client.nodes = nodes
+		if err := as.pollAPIServer(context.Background()); err != nil {
+			t.Fatalf("nodes=%d: %v", nodes, err)
+		}
+	}
+
+	poll(3) // 400m > 300m on the very first poll: nothing valid to apply
+	if len(client.calls) != 0 {
+		t.Fatalf("first poll invalid: UpdateResources called %v, want no call", client.calls)
+	}
+	poll(1) // 200m: valid
+	poll(3) // 400m: invalid, keep 200m
+	poll(2) // 300m: valid again
+	want := []recordedUpdate{{"200m", true}, {"200m", false}, {"300m", true}}
+	if fmt.Sprint(client.calls) != fmt.Sprint(want) {
+		t.Errorf("UpdateResources calls = %v, want %v", client.calls, want)
+	}
+}
+
+// deadlineK8sClient records the deadline each call sees.
+type deadlineK8sClient struct{ remaining time.Duration }
+
+func (c *deadlineK8sClient) GetClusterSize(ctx context.Context) (*realk8sclient.ClusterSize, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		c.remaining = time.Until(dl)
+	}
+	return &realk8sclient.ClusterSize{Nodes: 1, Cores: 1}, nil
+}
+
+func (c *deadlineK8sClient) UpdateResources(context.Context, map[string]apiv1.ResourceRequirements, bool) error {
+	return nil
+}
+
+// TestPollAPIServer_CycleDeadlineFloor: a short poll period must not shrink
+// the cycle deadline below minCycleTimeout (master had no deadline at all;
+// a 1s deadline would time out the node LIST on large clusters every poll).
+func TestPollAPIServer_CycleDeadlineFloor(t *testing.T) {
+	for _, tc := range []struct {
+		period, wantAtLeast time.Duration
+	}{
+		{time.Second, minCycleTimeout - time.Second},
+		{2 * time.Minute, 2*time.Minute - time.Second},
+	} {
+		client := &deadlineK8sClient{}
+		as := &AutoScaler{k8sClient: client, pollPeriod: tc.period, defaultConfig: ScaleConfig{}}
+		if err := as.pollAPIServer(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if client.remaining < tc.wantAtLeast {
+			t.Errorf("poll period %s: cycle deadline %s, want at least %s", tc.period, client.remaining, tc.wantAtLeast)
+		}
+	}
+}
+
+// failingK8sClient fails every UpdateResources call and counts them.
+type failingK8sClient struct{ updates int }
+
+func (c *failingK8sClient) GetClusterSize(context.Context) (*realk8sclient.ClusterSize, error) {
+	return &realk8sclient.ClusterSize{Nodes: 1, Cores: 1}, nil
+}
+
+func (c *failingK8sClient) UpdateResources(context.Context, map[string]apiv1.ResourceRequirements, bool) error {
+	c.updates++
+	return fmt.Errorf("template patch: forbidden")
+}
+
+// TestPollAPIServer_UpdateLoggedOncePerValue: while UpdateResources keeps
+// failing, the update is still retried every poll, but the "Updating
+// resource" block is logged once per distinct computed value.
+func TestPollAPIServer_UpdateLoggedOncePerValue(t *testing.T) {
+	logged := 0
+	orig := logResourceUpdate
+	logResourceUpdate = func(*realk8sclient.ClusterSize, map[string]apiv1.ResourceRequirements) { logged++ }
+	defer func() { logResourceUpdate = orig }()
+
+	cfg := ScaleConfig{}
+	if err := json.Unmarshal([]byte(`{"main":{"requests":{"cpu":{"base":"10m"}}}}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	client := &failingK8sClient{}
+	as := &AutoScaler{k8sClient: client, defaultConfig: cfg, pollPeriod: 5 * time.Second}
+	for i := 0; i < 3; i++ {
+		if err := as.pollAPIServer(context.Background()); err == nil {
+			t.Fatal("expected the update error to be returned")
+		}
+	}
+	if client.updates != 3 {
+		t.Errorf("UpdateResources calls = %d, want 3 (still retried every poll)", client.updates)
+	}
+	if logged != 1 {
+		t.Errorf("update logged %d times, want 1", logged)
 	}
 }
