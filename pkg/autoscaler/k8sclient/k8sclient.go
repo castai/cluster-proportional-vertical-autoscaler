@@ -414,7 +414,7 @@ func (t *targetClient) PatchTemplate(ctx context.Context, resources map[string]v
 		if templateMatches(t.cachedSpec.TemplateResources, resources) {
 			return false, nil // already at desired; patching would be a no-op
 		}
-		if reason := requestAboveTemplateLimit(t.cachedSpec.TemplateResources, resources); reason != "" {
+		if reason := RequestAboveLimit(t.cachedSpec.TemplateResources, resources); reason != "" {
 			// Replicate the API server's request<=limit validation locally:
 			// a template that would ship requests above limits is Invalid and
 			// would 422 every poll. Only possible when the template has
@@ -554,22 +554,6 @@ func (t *targetClient) trySyncSpec(ctx context.Context) (*targetSpec, error) {
 
 	t.cachedSpec = spec
 	return spec, nil
-}
-
-// requestAboveTemplateLimit returns a non-empty reason when `desired`
-// requests would exceed the limits the merged pod template ends up with
-// (desired limits win over template limits; resources with no limit impose
-// nothing). Used to reject template patches the API server would 422.
-func requestAboveTemplateLimit(template, desired map[string]v1.ResourceRequirements) string {
-	for name, want := range desired {
-		lims := mergeResourceList(template[name].Limits, want.Limits)
-		for res, r := range want.Requests {
-			if l, ok := lims[res]; ok && r.Cmp(l) > 0 {
-				return fmt.Sprintf("container %q request %s=%s exceeds its limit %s", name, res, r.String(), l.String())
-			}
-		}
-	}
-	return ""
 }
 
 func (t *targetClient) fetchSpec(ctx context.Context) (*targetSpec, error) {

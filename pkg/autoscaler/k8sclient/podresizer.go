@@ -739,7 +739,7 @@ func precheckResize(pod *v1.Pod, desired map[string]v1.ResourceRequirements) (re
 	if !resizeSupportedOnNode(pod) {
 		return rejectNodeUnsupported, true
 	}
-	if requestAboveLimit(pod, desired) {
+	if RequestAboveLimit(containerResources(pod.Spec.Containers), desired) != "" {
 		return rejectAboveLimit, true
 	}
 	// The QoS class counts init containers too (unchanged by a resize). The
@@ -784,24 +784,34 @@ func mergeResourceList(have, want v1.ResourceList) v1.ResourceList {
 	return out
 }
 
-// requestAboveLimit reports whether, after merging `desired` over the pod's
-// current resources, any managed container request would exceed its limit.
-func requestAboveLimit(pod *v1.Pod, desired map[string]v1.ResourceRequirements) bool {
-	for i := range pod.Spec.Containers {
-		c := &pod.Spec.Containers[i]
-		want, managed := desired[c.Name]
-		if !managed {
-			continue
+// RequestAboveLimit merges desired over current per container (requests and
+// limits alike; desired wins) and returns a description of the first managed
+// container resource, in sorted order, whose merged request exceeds its
+// merged limit, or "" if there is none. The API server rejects such values
+// for the template and /resize alike. current may be nil to check desired on
+// its own.
+func RequestAboveLimit(current, desired map[string]v1.ResourceRequirements) string {
+	names := make([]string, 0, len(desired))
+	for name := range desired {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		reqs := mergeResourceList(current[name].Requests, desired[name].Requests)
+		lims := mergeResourceList(current[name].Limits, desired[name].Limits)
+		resNames := make([]string, 0, len(reqs))
+		for res := range reqs {
+			resNames = append(resNames, string(res))
 		}
-		reqs := mergeResourceList(c.Resources.Requests, want.Requests)
-		lims := mergeResourceList(c.Resources.Limits, want.Limits)
-		for name, r := range reqs {
-			if l, ok := lims[name]; ok && r.Cmp(l) > 0 {
-				return true
+		sort.Strings(resNames)
+		for _, res := range resNames {
+			r := reqs[v1.ResourceName(res)]
+			if l, ok := lims[v1.ResourceName(res)]; ok && r.Cmp(l) > 0 {
+				return fmt.Sprintf("container %q request %s=%s above its limit %s", name, res, r.String(), l.String())
 			}
 		}
 	}
-	return false
+	return ""
 }
 
 // podQoS computes a QoS class over the given containers (cpu and memory)

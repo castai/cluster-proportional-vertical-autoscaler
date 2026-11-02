@@ -27,7 +27,6 @@ import (
 	realk8sclient "github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/autoscaler/k8sclient"
 	k8sclient "github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler/pkg/autoscaler/k8sclient/testing"
 	apiv1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	clocktesting "k8s.io/utils/clock/testing"
 )
 
@@ -321,33 +320,5 @@ func TestPollAPIServer_ComputedRequestAboveLimit(t *testing.T) {
 	want := []recordedUpdate{{"200m", true}, {"200m", false}, {"300m", true}}
 	if fmt.Sprint(client.calls) != fmt.Sprint(want) {
 		t.Errorf("UpdateResources calls = %v, want %v", client.calls, want)
-	}
-}
-
-func TestComputedRequestAboveLimit(t *testing.T) {
-	rr := func(req, lim string) apiv1.ResourceRequirements {
-		r := apiv1.ResourceRequirements{Requests: apiv1.ResourceList{}, Limits: apiv1.ResourceList{}}
-		if req != "" {
-			r.Requests[apiv1.ResourceCPU] = resource.MustParse(req)
-		}
-		if lim != "" {
-			r.Limits[apiv1.ResourceCPU] = resource.MustParse(lim)
-		}
-		return r
-	}
-	for _, tc := range []struct {
-		name    string
-		reqs    map[string]apiv1.ResourceRequirements
-		wantBad bool
-	}{
-		{"below", map[string]apiv1.ResourceRequirements{"a": rr("100m", "200m")}, false},
-		{"equal", map[string]apiv1.ResourceRequirements{"a": rr("200m", "200m")}, false},
-		{"no limit", map[string]apiv1.ResourceRequirements{"a": rr("5", "")}, false},
-		{"limit only", map[string]apiv1.ResourceRequirements{"a": rr("", "1m")}, false},
-		{"above", map[string]apiv1.ResourceRequirements{"a": rr("100m", "200m"), "b": rr("300m", "200m")}, true},
-	} {
-		if got := computedRequestAboveLimit(tc.reqs); (got != "") != tc.wantBad {
-			t.Errorf("%s: got %q, want violation=%v", tc.name, got, tc.wantBad)
-		}
 	}
 }

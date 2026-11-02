@@ -3068,3 +3068,42 @@ func TestResizeRunningPods_TakeBackSurvivesFailedPatch(t *testing.T) {
 		t.Errorf("patches = %d, want 2 (failed + retried take-back, then yield)", cr.patches)
 	}
 }
+
+// TestRequestAboveLimit covers the one request<=limit check used for the
+// computed config values, the template, and the pod: desired is merged over
+// current for requests and limits alike.
+func TestRequestAboveLimit(t *testing.T) {
+	rr := func(req, lim string) v1.ResourceRequirements {
+		r := v1.ResourceRequirements{Requests: v1.ResourceList{}, Limits: v1.ResourceList{}}
+		if req != "" {
+			r.Requests[v1.ResourceCPU] = resource.MustParse(req)
+		}
+		if lim != "" {
+			r.Limits[v1.ResourceCPU] = resource.MustParse(lim)
+		}
+		return r
+	}
+	m := func(r v1.ResourceRequirements) map[string]v1.ResourceRequirements {
+		return map[string]v1.ResourceRequirements{"a": r}
+	}
+	for _, tc := range []struct {
+		name             string
+		current, desired map[string]v1.ResourceRequirements
+		wantBad          bool
+	}{
+		{"desired alone below", nil, m(rr("100m", "200m")), false},
+		{"desired alone equal", nil, m(rr("200m", "200m")), false},
+		{"desired alone, no limit", nil, m(rr("5", "")), false},
+		{"desired alone above", nil, map[string]v1.ResourceRequirements{"a": rr("100m", "200m"), "b": rr("300m", "200m")}, true},
+		{"desired request above current limit", m(rr("100m", "200m")), m(rr("300m", "")), true},
+		{"desired limit raises current limit", m(rr("100m", "200m")), m(rr("300m", "400m")), false},
+		// The case the earlier template check missed: only the limit is
+		// managed, and it drops below the current (fixed) request.
+		{"desired limit below current request", m(rr("500m", "1")), m(rr("", "200m")), true},
+		{"unmanaged container ignored", map[string]v1.ResourceRequirements{"x": rr("5", "1")}, m(rr("100m", "200m")), false},
+	} {
+		if got := RequestAboveLimit(tc.current, tc.desired); (got != "") != tc.wantBad {
+			t.Errorf("%s: got %q, want violation=%v", tc.name, got, tc.wantBad)
+		}
+	}
+}
