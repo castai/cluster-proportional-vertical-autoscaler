@@ -30,7 +30,12 @@ ALL_PLATFORMS ?= linux/amd64 linux/arm linux/arm64 linux/ppc64le linux/s390x
 
 # The "FROM" part of the Dockerfile.  This should be a manifest-list which
 # supports all of the platforms listed in ALL_PLATFORMS.
-BASE_IMAGE ?= gcr.io/distroless/static:nonroot
+# Pinned to the current digest of gcr.io/distroless/static:nonroot, which
+# ships ca-certificates 20250419+deb13u1 - the Debian security update that
+# blacklists the distrusted "emSign ECC Root CA - G3" (eMudhra incident,
+# CVE-2026-111943 / CVE-2026-111944).  Do not resolve to a tag older than
+# ca-certificates 20250419+deb13u1 (the Debian 12 variant is not fixed).
+BASE_IMAGE ?= gcr.io/distroless/static@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
 
 # Where to push the docker images.
 REGISTRY ?= gcr.io/k8s-staging-cpa
@@ -64,7 +69,7 @@ ARCH := $(if $(GOARCH),$(GOARCH),$(shell GOTOOLCHAIN=local go env GOARCH))
 
 TAG := $(VERSION)__$(OS)_$(ARCH)
 
-GO_VERSION := 1.26.10
+GO_VERSION := 1.26.11
 BUILD_IMAGE := golang:$(GO_VERSION)-alpine
 
 BIN_EXTENSION :=
