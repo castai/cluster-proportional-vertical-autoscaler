@@ -1,6 +1,6 @@
 module github.com/thockin/go-build-template/tools
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/estesp/manifest-tool/v2 v2.2.2
