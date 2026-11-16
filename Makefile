@@ -26,16 +26,20 @@ BINS ?= cpvpa
 
 # The platforms we support.  In theory this can be used for Windows platforms,
 # too, but they require specific base images, which we do not have.
-ALL_PLATFORMS ?= linux/amd64 linux/arm linux/arm64 linux/ppc64le linux/s390x
+# Limited to the platforms published by the base image below.
+ALL_PLATFORMS ?= linux/amd64 linux/arm64
 
 # The "FROM" part of the Dockerfile.  This should be a manifest-list which
 # supports all of the platforms listed in ALL_PLATFORMS.
-# Pinned to the current digest of gcr.io/distroless/static:nonroot, which
-# ships ca-certificates 20250419+deb13u1 - the Debian security update that
-# blacklists the distrusted "emSign ECC Root CA - G3" (eMudhra incident,
-# CVE-2026-111943 / CVE-2026-111944).  Do not resolve to a tag older than
-# ca-certificates 20250419+deb13u1 (the Debian 12 variant is not fixed).
-BASE_IMAGE ?= gcr.io/distroless/static@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
+# Pinned to the current digest of cgr.dev/chainguard/static:latest, which
+# ships ca-certificates-bundle 20261020-r0.  Debian-based images (including
+# gcr.io/distroless/static, ca-certificates 20250419+deb13u1) only distrust
+# "emSign ECC Root CA - G3" and still ship "emSign Root CA - C1" and
+# "emSign ECC Root CA - C3", which Mozilla removed after the eMudhra incident
+# (CVE-2026-111943 / CVE-2026-111944).  The Chainguard bundle drops all three;
+# only "emSign Root CA - G1" remains.  Do not move to a digest whose
+# ca-certificates-bundle is older than 20260909-r3.
+BASE_IMAGE ?= cgr.dev/chainguard/static@sha256:fc42af33e643f20d08baf03cddcc1c02ba57052dfb02edb0d79f3fc47bcea8d9
 
 # Where to push the docker images.
 REGISTRY ?= gcr.io/k8s-staging-cpa
