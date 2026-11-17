@@ -32,7 +32,8 @@ ARG HASH_BINARY=0
 # Add the platform-specific binary.
 COPY bin/{ARG_OS}_{ARG_ARCH}/{ARG_BIN} /{ARG_BIN}
 
-# This would be nicer as `nobody:nobody` but distroless has no such entries.
+# This would be nicer as `nobody:nobody` but the static base image has no such
+# entries.
 USER 65535:65535
 ENV HOME=/
 
